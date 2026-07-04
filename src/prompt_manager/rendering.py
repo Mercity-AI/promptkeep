@@ -1,0 +1,110 @@
+"""Template rendering with `{placeholder}` syntax.
+
+Lenient by default: placeholders without a matching variable are left intact
+in the output (so JSON snippets and code braces inside prompts survive), and
+templates that can't be parsed at all are returned unchanged with a warning.
+Strict mode raises instead.
+"""
+
+from __future__ import annotations
+
+import logging
+from string import Formatter
+from typing import Iterable, Mapping, Optional, Set
+
+logger = logging.getLogger("prompt_manager")
+
+_formatter = Formatter()
+
+
+class MissingVariableError(KeyError):
+    """Raised in strict mode when a placeholder has no matching variable."""
+
+    def __init__(self, missing: Iterable[str]):
+        self.missing = sorted(set(missing))
+        super().__init__(
+            "Missing variables for placeholders: " + ", ".join(repr(m) for m in self.missing)
+        )
+
+    def __str__(self) -> str:  # KeyError repr-quotes its message otherwise
+        return self.args[0]
+
+
+class TemplateParseError(ValueError):
+    """Raised in strict mode when the template is not valid format syntax."""
+
+
+def _base_name(field_name: str) -> str:
+    return field_name.split(".")[0].split("[")[0]
+
+
+def _rebuild_placeholder(field_name: str, conversion: Optional[str], spec: Optional[str]) -> str:
+    out = "{" + field_name
+    if conversion:
+        out += "!" + conversion
+    if spec:
+        out += ":" + spec
+    return out + "}"
+
+
+def extract_placeholders(template: str) -> Set[str]:
+    """Return the set of variable names referenced by the template.
+
+    `{user[name]}` and `{user.name}` both report `user`. Positional
+    placeholders (`{}` / `{0}`) are not supported and are ignored here.
+    """
+    names: Set[str] = set()
+    try:
+        for _literal, field_name, _spec, _conv in _formatter.parse(template):
+            if field_name:
+                base = _base_name(field_name)
+                if base and not base.isdigit():
+                    names.add(base)
+    except ValueError:
+        return set()
+    return names
+
+
+def render(template: str, variables: Optional[Mapping] = None, strict: bool = False) -> str:
+    """Substitute variables into the template.
+
+    Lenient (default): unknown placeholders stay as literal `{name}` text and
+    unparseable templates are returned as-is. Strict: raises
+    MissingVariableError / TemplateParseError instead.
+    """
+    variables = variables or {}
+    try:
+        parsed = list(_formatter.parse(template))
+    except ValueError as exc:
+        if strict:
+            raise TemplateParseError(f"Invalid template syntax: {exc}") from exc
+        logger.warning(
+            "prompt_manager: template could not be parsed (%s); returning it unrendered", exc
+        )
+        return template
+
+    out = []
+    missing = []
+    for literal, field_name, spec, conversion in parsed:
+        out.append(literal)
+        if field_name is None:
+            continue
+        base = _base_name(field_name)
+        if base and not base.isdigit() and base in variables:
+            try:
+                value, _ = _formatter.get_field(field_name, (), variables)
+                if conversion:
+                    value = _formatter.convert_field(value, conversion)
+                out.append(format(value, spec or ""))
+                continue
+            except Exception:
+                if strict:
+                    raise
+                # Lookup or format-spec failed (e.g. `{user[missing]}` or a
+                # JSON-ish spec); keep the placeholder literal instead.
+        missing.append(field_name)
+        out.append(_rebuild_placeholder(field_name, conversion, spec))
+
+    if strict and missing:
+        raise MissingVariableError(missing)
+    return "".join(out)
