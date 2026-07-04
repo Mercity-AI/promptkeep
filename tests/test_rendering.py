@@ -6,6 +6,7 @@ from promptkeep.rendering import (
     MissingVariableError,
     TemplateParseError,
     extract_placeholders,
+    normalize_template,
     render,
 )
 
@@ -79,6 +80,52 @@ class TestRender:
     def test_strict_ok_when_all_present(self):
         """Strict mode is silent when every placeholder resolves."""
         assert render("{a}", {"a": 1}, strict=True) == "1"
+
+
+class TestNormalizeTemplate:
+    """normalize_template(): the canonical form behind version matching."""
+
+    def test_renamed_variable_same_form(self):
+        """Only static text matters — {var1} and {x} normalize identically."""
+        assert normalize_template("xyz, {var1}") == normalize_template("xyz, {x}")
+
+    def test_different_static_text_differs(self):
+        """Changing the words around a placeholder changes the form."""
+        assert normalize_template("xyz, {a}") != normalize_template("abc, {a}")
+
+    def test_repetition_pattern_preserved(self):
+        """{a}..{a} (one value twice) is not the same prompt as {a}..{b}."""
+        assert normalize_template("{a} then {a}") == normalize_template("{x} then {x}")
+        assert normalize_template("{a} then {a}") != normalize_template("{a} then {b}")
+
+    def test_order_of_first_appearance(self):
+        """Tokens are assigned by first appearance, so swapped roles still match."""
+        assert normalize_template("{a} vs {b}") == normalize_template("{b} vs {a}")
+
+    def test_format_spec_and_conversion_preserved(self):
+        """Specs/conversions are structure: renaming matches, respeccing doesn't."""
+        assert normalize_template("{x:03d}") == normalize_template("{y:03d}")
+        assert normalize_template("{x:03d}") != normalize_template("{x:04d}")
+        assert normalize_template("{x!r}") != normalize_template("{x}")
+
+    def test_attribute_and_index_tails_preserved(self):
+        """{user.name} matches {u.name} but not {user.age}."""
+        assert normalize_template("{user.name}") == normalize_template("{u.name}")
+        assert normalize_template("{user.name}") != normalize_template("{user.age}")
+
+    def test_escaped_braces_are_static_text(self):
+        """{{literal}} content is text, not a variable — it must not normalize."""
+        assert normalize_template("{{a}}") != normalize_template("{{b}}")
+        assert normalize_template("{{a}} {x}") == normalize_template("{{a}} {y}")
+
+    def test_idempotent(self):
+        """Normalizing an already-normalized template is a no-op."""
+        once = normalize_template("Hi {name}, meet {name} and {other}.")
+        assert normalize_template(once) == once
+
+    def test_unparseable_normalizes_to_itself(self):
+        """Broken syntax falls back to the raw text."""
+        assert normalize_template("bad } brace") == "bad } brace"
 
 
 class TestExtractPlaceholders:

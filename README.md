@@ -21,7 +21,9 @@ prompt.version  # 1 — bumps automatically whenever the template text changes
 ```
 
 Same `name` + edited text ⇒ a new version row in SQLite (deduplicated by content hash).
-Variables are *run data*, never versions — change them freely.
+Variables are *run data*, never versions — change them freely. Matching ignores placeholder
+*names* too: renaming `{var1}` to `{x}` is not a new version — only the static text and the
+placeholder structure (positions, repetitions, format specs) count.
 
 Rendering is lenient by default: unknown `{placeholders}` and JSON braces in the template
 pass through untouched. Use `strict=True` (per prompt or via `configure`) to raise instead.

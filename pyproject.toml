@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "promptkeep"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prompts as first-class objects: versioned templates, SQLite lineage tracking, and OpenAI run tracking."
 readme = "README.md"
 requires-python = ">=3.9"

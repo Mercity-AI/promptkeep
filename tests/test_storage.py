@@ -35,6 +35,21 @@ class TestLineage:
         assert Prompt("same text", name="DEDUP").version == 1
         assert Prompt("new text", name="DEDUP").version == 2
 
+    def test_renamed_variable_is_same_version(self):
+        """Renaming a placeholder ({var1} -> {x}) must not create a version."""
+        assert Prompt("review this: {var1}", name="NORM").version == 1
+        assert Prompt("review this: {x}", name="NORM").version == 1
+        assert len(history.versions("NORM")) == 1
+        # But changing the static text around it is a real new version.
+        assert Prompt("review that: {x}", name="NORM").version == 2
+
+    def test_repetition_pattern_is_a_real_difference(self):
+        """Same static text, different variable structure -> distinct versions."""
+        assert Prompt("{a} and then {a}", name="NORMREP").version == 1
+        assert Prompt("{a} and then {b}", name="NORMREP").version == 2
+        # Renaming either still dedups to its structural twin.
+        assert Prompt("{z} and then {z}", name="NORMREP").version == 1
+
     def test_names_are_independent_lineages(self):
         """Two prompts sharing text but not name version independently."""
         assert Prompt("shared text", name="A").version == 1

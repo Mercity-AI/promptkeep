@@ -25,7 +25,7 @@ import peewee as pw
 
 logger = logging.getLogger("promptkeep")
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
@@ -122,8 +122,15 @@ def _utcnow() -> str:
 
 
 def template_hash(text: str) -> str:
-    """Content hash used as a template's version identity."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """Content hash used as a template's version identity.
+
+    Hashes the *normalized* template (variable names canonicalized to
+    positional tokens), so renaming a placeholder — {var1} -> {x} — resolves
+    to the same version; only static text and placeholder structure matter.
+    """
+    from .rendering import normalize_template
+
+    return hashlib.sha256(normalize_template(text).encode("utf-8")).hexdigest()
 
 
 def _json_or_none(obj: Any) -> Optional[str]:
@@ -171,7 +178,22 @@ def _migrate(database: pw.SqliteDatabase) -> None:
     (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
     if user_version < 1:
         database.create_tables(_MODELS, safe=True)
-    # Future steps: `if user_version < 2:` apply playhouse.migrate operations.
+    if 1 <= user_version < 2:
+        # v2: template_hash became a hash of the *normalized* template
+        # (variable names canonicalized). Recompute stored hashes so old
+        # rows keep deduping correctly against new registrations.
+        for row in PromptVersionRecord.select():
+            new_hash = template_hash(row.template)
+            if new_hash != row.template_hash:
+                try:
+                    PromptVersionRecord.update(template_hash=new_hash).where(
+                        PromptVersionRecord.id == row.id
+                    ).execute()
+                except pw.IntegrityError:
+                    # Two old versions differing only in variable names now
+                    # collide; keep the older row normalized, leave this one.
+                    pass
+    # Future steps: `if user_version < 3:` apply playhouse.migrate operations.
     if user_version < _SCHEMA_VERSION:
         database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 

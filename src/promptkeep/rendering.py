@@ -51,6 +51,40 @@ def _rebuild_placeholder(field_name: str, conversion: Optional[str], spec: Optio
     return out + "}"
 
 
+def normalize_template(template: str) -> str:
+    """Canonical form used for version matching: placeholder *names* are
+    replaced by positional tokens ({v0}, {v1}, ... in order of first
+    appearance) so renaming a variable doesn't change a prompt's identity.
+
+    Everything that affects the prompt structurally is preserved: static
+    text, placeholder positions, repetition patterns ({a}..{a} vs {a}..{b}),
+    attribute/index paths, conversions, and format specs. Unparseable
+    templates normalize to themselves.
+    """
+    try:
+        parsed = list(_formatter.parse(template))
+    except ValueError:
+        return template
+    mapping: dict = {}
+    out = []
+    for literal, field_name, spec, conversion in parsed:
+        # parse() unescapes {{ }}; re-escape so literal braces stay literal.
+        out.append(literal.replace("{", "{{").replace("}", "}}"))
+        if field_name is None:
+            continue
+        base = _base_name(field_name)
+        if base and not base.isdigit():
+            # Same variable -> same token everywhere; keep any .attr/[idx] tail.
+            if base not in mapping:
+                mapping[base] = f"v{len(mapping)}"
+            canonical = mapping[base] + field_name[len(base) :]
+        else:
+            # Positional/empty fields are not named variables; leave untouched.
+            canonical = field_name
+        out.append(_rebuild_placeholder(canonical, conversion, spec))
+    return "".join(out)
+
+
 def extract_placeholders(template: str) -> Set[str]:
     """Return the set of variable names referenced by the template.
 

@@ -21,9 +21,12 @@ design doc, kept as history; don't update it to match code changes.
 ## Architecture
 
 Three-entity data model, strictly layered: **Prompt** (`name` = permanent identity) →
-**Version** (one template text under a name, deduplicated by sha256 content hash, numbered
-sequentially) → **Run** (one LLM execution: variables + rendered text + response metadata).
-Variables are run data, never version identity — changing variables must never create a version.
+**Version** (one template text under a name, deduplicated by sha256 of the *normalized*
+template, numbered sequentially) → **Run** (one LLM execution: variables + rendered text +
+response metadata). Variables are run data, never version identity — changing variables must
+never create a version. Normalization (`rendering.normalize_template`) canonicalizes
+placeholder names to `{v0}`, `{v1}`, ... so renaming `{var1}` → `{x}` dedups to the same
+version; static text, repetition patterns, and format specs still distinguish versions.
 
 Flow between modules: `prompts.Prompt.render()` → lazily registers its template via
 `storage.register_version()` (memoized per object *and* per process) → integrations wrapper

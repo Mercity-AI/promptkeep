@@ -134,5 +134,35 @@ assert run.version == 1 and run.variables == {"focus": "security"}
 
 print()
 print("=" * 70)
-print("ALL CHECKS PASSED — lineage, dedup-on-revert, and run tracking all work.")
+print("8) RENAMING A VARIABLE IS *NOT* A NEW VERSION")
+print("   (matching ignores placeholder names — only static text counts)")
+print("=" * 70)
+
+r1 = Prompt("Grade this essay on {var1}. Reply in {var2}.", name="GRADER")
+print(f"original names {{var1}}/{{var2}}:      v{r1.version}")
+
+r2 = Prompt("Grade this essay on {x}. Reply in {y}.", name="GRADER")
+print(f"renamed to {{x}}/{{y}}:                v{r2.version}  (same version!)")
+assert r2.version == r1.version == 1
+
+r3 = Prompt("Grade this essay on {topic}. Reply in {language}.", name="GRADER")
+print(f"renamed to {{topic}}/{{language}}:     v{r3.version}  (still the same)")
+assert r3.version == 1
+
+# But structure is respected: same words, different repetition pattern.
+s1 = Prompt("Compare {a} with {a}.", name="COMPARE")
+s2 = Prompt("Compare {a} with {b}.", name="COMPARE")
+print(f"'{{a}} with {{a}}' vs '{{a}} with {{b}}':  v{s1.version} vs v{s2.version}  (different — one value twice != two values)")
+assert (s1.version, s2.version) == (1, 2)
+
+# And actual wording changes still bump the version, of course.
+r4 = Prompt("Grade this essay harshly on {topic}. Reply in {language}.", name="GRADER")
+print(f"actually changed wording:          v{r4.version}")
+assert r4.version == 2
+print(f"GRADER lineage: {len(history.versions('GRADER'))} versions (3 renames collapsed into v1)")
+
+print()
+print("=" * 70)
+print("ALL CHECKS PASSED — lineage, dedup-on-revert, rename-immunity,")
+print("and run tracking all work.")
 print("=" * 70)
