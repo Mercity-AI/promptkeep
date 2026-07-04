@@ -1,8 +1,8 @@
-"""prompt-manager: versioned prompt templates with lineage and run tracking.
+"""promptkeep: versioned prompt templates with lineage and run tracking.
 
 Public API:
 
-    from prompt_manager import Prompt, prompt, wrap, configure, history
+    from promptkeep import Prompt, prompt, wrap, configure, history
 """
 
 from . import history

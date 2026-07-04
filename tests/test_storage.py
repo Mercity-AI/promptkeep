@@ -2,10 +2,10 @@
 
 import threading
 
-import prompt_manager
-from prompt_manager import Prompt, history
-from prompt_manager import config as pm_config
-from prompt_manager import storage, tracking
+import promptkeep
+from promptkeep import Prompt, history
+from promptkeep import config as pm_config
+from promptkeep import storage, tracking
 
 
 class TestLineage:
@@ -31,7 +31,7 @@ class TestLineage:
         assert Prompt("same text", name="DEDUP").version == 1
         # Simulate a new process: drop in-memory caches, keep the same DB file.
         storage.reset_caches()
-        prompt_manager.configure(db_path=isolated_db)
+        promptkeep.configure(db_path=isolated_db)
         assert Prompt("same text", name="DEDUP").version == 1
         assert Prompt("new text", name="DEDUP").version == 2
 
@@ -45,7 +45,7 @@ class TestLineage:
     def test_disabled_creates_no_db_file(self, tmp_path):
         """Disabled tracking must do zero filesystem I/O."""
         pm_config.reset()
-        prompt_manager.configure(db_path=tmp_path / "nope.db", enabled=False)
+        promptkeep.configure(db_path=tmp_path / "nope.db", enabled=False)
         p = Prompt("hi {x}", {"x": 1}, name="X")
         assert p.text == "hi 1"
         assert p.version is None

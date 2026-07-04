@@ -2,7 +2,7 @@
 
 import pytest
 
-from prompt_manager.rendering import (
+from promptkeep.rendering import (
     MissingVariableError,
     TemplateParseError,
     extract_placeholders,

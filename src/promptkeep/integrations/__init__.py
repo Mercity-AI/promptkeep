@@ -8,7 +8,7 @@ def wrap(target):
     message content and every call is recorded as a run.
 
         from openai import OpenAI
-        from prompt_manager import wrap
+        from promptkeep import wrap
 
         OpenAI = wrap(OpenAI)          # wrap the class...
         client = OpenAI(api_key=...)   # ...then use it exactly as before

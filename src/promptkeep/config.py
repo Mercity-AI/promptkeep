@@ -2,7 +2,7 @@
 
 Settings are resolved fresh on every access with a simple precedence:
 explicit ``configure()`` overrides win, then environment variables
-(``PROMPT_MANAGER_DB``, ``PROMPT_MANAGER_DISABLED``), then defaults.
+(``PROMPTKEEP_DB``, ``PROMPTKEEP_DISABLED``), then defaults.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-DEFAULT_DB_FILENAME = ".prompts.db"
+DEFAULT_DB_FILENAME = ".promptkeep.db"
 
 # configure() overrides live here; guarded by a lock since wrapped clients
 # may resolve settings from multiple threads.
@@ -37,10 +37,10 @@ def configure(
 ) -> None:
     """Override library settings. Only the arguments you pass are changed.
 
-    - db_path: where the SQLite database lives (default: ./.prompts.db,
-      or the PROMPT_MANAGER_DB env var).
+    - db_path: where the SQLite database lives (default: ./.promptkeep.db,
+      or the PROMPTKEEP_DB env var).
     - enabled: turn persistence on/off entirely (default: on, unless
-      PROMPT_MANAGER_DISABLED is set). Rendering works either way.
+      PROMPTKEEP_DISABLED is set). Rendering works either way.
     - strict: raise on missing variables instead of leaving `{name}` literal
       (default: False).
     """
@@ -56,16 +56,16 @@ def configure(
 def get_settings() -> Settings:
     """Resolve the current settings: configure() overrides > env vars > defaults."""
     with _lock:
-        # DB path: explicit override, then $PROMPT_MANAGER_DB, then ./.prompts.db.
+        # DB path: explicit override, then $PROMPTKEEP_DB, then ./.promptkeep.db.
         db_path = _overrides.get("db_path")
         if db_path is None:
-            env_path = os.environ.get("PROMPT_MANAGER_DB")
+            env_path = os.environ.get("PROMPTKEEP_DB")
             db_path = Path(env_path) if env_path else Path.cwd() / DEFAULT_DB_FILENAME
 
-        # Tracking: on by default; $PROMPT_MANAGER_DISABLED=1/true/yes/on kills it.
+        # Tracking: on by default; $PROMPTKEEP_DISABLED=1/true/yes/on kills it.
         enabled = _overrides.get("enabled")
         if enabled is None:
-            disabled = os.environ.get("PROMPT_MANAGER_DISABLED", "").strip().lower()
+            disabled = os.environ.get("PROMPTKEEP_DISABLED", "").strip().lower()
             enabled = disabled not in ("1", "true", "yes", "on")
 
         # Rendering strictness: lenient unless explicitly opted in.

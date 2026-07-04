@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from prompt_manager import Prompt, history, storage, wrap
+from promptkeep import Prompt, history, storage, wrap
 from tests.fakes import (
     FakeAsyncClient,
     FakeClient,

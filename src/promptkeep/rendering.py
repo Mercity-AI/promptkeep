@@ -12,7 +12,7 @@ import logging
 from string import Formatter
 from typing import Iterable, Mapping, Optional, Set
 
-logger = logging.getLogger("prompt_manager")
+logger = logging.getLogger("promptkeep")
 
 # One shared Formatter gives us stdlib-compatible parsing of {field:spec!conv}.
 _formatter = Formatter()
@@ -86,7 +86,7 @@ def render(template: str, variables: Optional[Mapping] = None, strict: bool = Fa
         if strict:
             raise TemplateParseError(f"Invalid template syntax: {exc}") from exc
         logger.warning(
-            "prompt_manager: template could not be parsed (%s); returning it unrendered", exc
+            "promptkeep: template could not be parsed (%s); returning it unrendered", exc
         )
         return template
 

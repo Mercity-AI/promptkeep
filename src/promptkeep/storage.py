@@ -23,7 +23,7 @@ from typing import Any, Optional, Tuple
 
 import peewee as pw
 
-logger = logging.getLogger("prompt_manager")
+logger = logging.getLogger("promptkeep")
 
 _SCHEMA_VERSION = 1
 
@@ -225,9 +225,7 @@ def register_version(
             return None
         result = _register(name, template, content_hash, source, fn_source_hash)
     except Exception:
-        logger.warning(
-            "prompt_manager: failed to register version for prompt %r", name, exc_info=True
-        )
+        logger.warning("promptkeep: failed to register version for prompt %r", name, exc_info=True)
         return None
     with _reg_lock:
         _registration_cache[cache_key] = result
@@ -321,7 +319,7 @@ def record_run(
             created_at=_utcnow(),
         )
     except Exception:
-        logger.warning("prompt_manager: failed to record run", exc_info=True)
+        logger.warning("promptkeep: failed to record run", exc_info=True)
 
 
 # --- reads (raise on real errors) ---------------------------------------------

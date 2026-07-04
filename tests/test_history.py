@@ -2,7 +2,7 @@
 
 import pytest
 
-from prompt_manager import Prompt, history, tracking
+from promptkeep import Prompt, history, tracking
 
 
 def _run(prompt, **overrides):

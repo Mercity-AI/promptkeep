@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..prompts import Prompt, RenderedText
 from ..tracking import record_prompt_run
 
-logger = logging.getLogger("prompt_manager")
+logger = logging.getLogger("promptkeep")
 
 # (prompt, variables used, rendered text) — everything a run row needs
 # from the request side.
@@ -168,7 +168,7 @@ def _record_runs(tracked, kwargs, response, latency_ms, status="ok", error=None)
                 output_text = content
         request_params = {k: v for k, v in kwargs.items() if k != "messages"}
     except Exception:
-        logger.warning("prompt_manager: failed to extract response metadata", exc_info=True)
+        logger.warning("promptkeep: failed to extract response metadata", exc_info=True)
         return
     for prompt_obj, variables, rendered in tracked:
         record_prompt_run(

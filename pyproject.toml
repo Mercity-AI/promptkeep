@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "prompt-manager"
+name = "promptkeep"
 version = "0.1.0"
 description = "Prompt management: versioned prompt templates, lineage tracking in SQLite, and OpenAI run tracking."
 readme = "README.md"
@@ -19,7 +19,7 @@ openai = ["openai>=1.0"]
 dev = ["pytest>=8", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/prompt_manager"]
+packages = ["src/promptkeep"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

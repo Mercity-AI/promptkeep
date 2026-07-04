@@ -1,4 +1,4 @@
-# prompt-manager
+# promptkeep
 
 Prompts as first-class objects: named, versioned templates with lineage tracked in SQLite,
 variable rendering, a decorator for computed prompts, and a transparent OpenAI SDK wrapper
@@ -7,7 +7,7 @@ that records every run (prompt version + variables + output + usage).
 ## The basics
 
 ```python
-from prompt_manager import Prompt
+from promptkeep import Prompt
 
 prompt = Prompt(
     text="You are a code reviewer. Focus on {var1}.",
@@ -29,7 +29,7 @@ pass through untouched. Use `strict=True` (per prompt or via `configure`) to rai
 ## Computed prompts
 
 ```python
-from prompt_manager import prompt
+from promptkeep import prompt
 
 @prompt(name="REVIEW_SYSTEM")
 def review_sys_prompt(var1="some value", n_examples=3):
@@ -45,7 +45,7 @@ The function returns the raw template; the call's arguments become the variables
 
 ```python
 from openai import OpenAI
-from prompt_manager import wrap
+from promptkeep import wrap
 
 OpenAI = wrap(OpenAI)                 # or: client = wrap(OpenAI(...))
 client = OpenAI()
@@ -67,7 +67,7 @@ break the API call. Unwrapped clients work too — just pass `prompt.text`.
 ## History
 
 ```python
-from prompt_manager import history
+from promptkeep import history
 
 history.versions("REVIEW_SYSTEM")            # lineage, oldest first
 print(history.diff("REVIEW_SYSTEM", 1, 3))   # unified diff between versions
@@ -77,11 +77,11 @@ history.runs("REVIEW_SYSTEM", version=3)     # recorded runs, newest first
 ## Configuration
 
 ```python
-import prompt_manager
+import promptkeep
 
-prompt_manager.configure(
-    db_path="path/to/prompts.db",   # default: ./.prompts.db (or $PROMPT_MANAGER_DB)
-    enabled=True,                   # $PROMPT_MANAGER_DISABLED=1 turns tracking off
+promptkeep.configure(
+    db_path="path/to/prompts.db",   # default: ./.promptkeep.db (or $PROMPTKEEP_DB)
+    enabled=True,                   # $PROMPTKEEP_DISABLED=1 turns tracking off
     strict=False,                   # raise on missing variables
 )
 ```

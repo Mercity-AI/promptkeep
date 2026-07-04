@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-import prompt_manager
-from prompt_manager import Prompt, RenderedText
+import promptkeep
+from promptkeep import Prompt, RenderedText
 
 
 class TestConstruction:
@@ -83,14 +83,14 @@ class TestRenderingBehavior:
     def test_per_prompt_strict(self):
         """strict=True on one Prompt raises on missing variables."""
         p = Prompt("Hello {who}", name="GREET", strict=True)
-        with pytest.raises(prompt_manager.MissingVariableError):
+        with pytest.raises(promptkeep.MissingVariableError):
             _ = p.text
 
     def test_global_strict_via_configure(self):
         """configure(strict=True) flips the default for all prompts."""
-        prompt_manager.configure(strict=True)
+        promptkeep.configure(strict=True)
         p = Prompt("Hello {who}", name="GREET")
-        with pytest.raises(prompt_manager.MissingVariableError):
+        with pytest.raises(promptkeep.MissingVariableError):
             _ = p.text
 
     def test_placeholders(self):
@@ -177,7 +177,7 @@ class TestVersioning:
 
     def test_disabled_tracking_gives_none(self, tmp_path):
         """With tracking off, rendering works and version is None."""
-        prompt_manager.configure(enabled=False)
+        promptkeep.configure(enabled=False)
         p = Prompt("hi {x}", name="VTEST")
         assert p.version is None
         assert p.text == "hi {x}"  # rendering still works

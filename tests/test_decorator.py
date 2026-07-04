@@ -2,7 +2,7 @@
 
 import pytest
 
-from prompt_manager import Prompt, history, prompt
+from promptkeep import Prompt, history, prompt
 
 
 class TestDecorator:

@@ -319,7 +319,7 @@ wheels = [
 ]
 
 [[package]]
-name = "prompt-manager"
+name = "promptkeep"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

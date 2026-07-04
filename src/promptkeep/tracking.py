@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from .prompts import Prompt
 
-logger = logging.getLogger("prompt_manager")
+logger = logging.getLogger("promptkeep")
 
 
 def record_prompt_run(
@@ -61,4 +61,4 @@ def record_prompt_run(
             error=error,
         )
     except Exception:
-        logger.warning("prompt_manager: failed to record run", exc_info=True)
+        logger.warning("promptkeep: failed to record run", exc_info=True)
