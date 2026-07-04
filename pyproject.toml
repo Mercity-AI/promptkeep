@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Prompt management: versioned prompt templates, lineage tracking in SQLite, and OpenAI run tracking."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = [
+    "peewee>=3.17",
+]
 
 [project.optional-dependencies]
 openai = ["openai>=1.0"]

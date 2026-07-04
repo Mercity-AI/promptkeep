@@ -301,6 +301,15 @@ wheels = [
 ]
 
 [[package]]
+name = "peewee"
+version = "4.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/bf/6bbce77d98d2239b0be427f1c41af039388b6288b93ac1ec0123479eda8a/peewee-4.1.1.tar.gz", hash = "sha256:6fb1782252046e088599ed005342d7db6d17d48cacea27bc3c9a74f04646224d", size = 772233, upload-time = "2026-06-28T13:52:49.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/ab/fc0f2f735acb85aa1707b9bde9f21c2a9a64d3c80b5076c3b56c3865431e/peewee-4.1.1-py3-none-any.whl", hash = "sha256:f9a2d16463d5c9208ac7c6eb8aa64cddd98e2f4da8ced8983d4869d5202aa0ce", size = 170332, upload-time = "2026-06-28T13:52:48.166Z" },
+]
+
+[[package]]
 name = "pluggy"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -313,6 +322,9 @@ wheels = [
 name = "prompt-manager"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "peewee" },
+]
 
 [package.optional-dependencies]
 openai = [
@@ -327,7 +339,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "openai", marker = "extra == 'openai'", specifier = ">=1.0" }]
+requires-dist = [
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0" },
+    { name = "peewee", specifier = ">=3.17" },
+]
 provides-extras = ["openai"]
 
 [package.metadata.requires-dev]

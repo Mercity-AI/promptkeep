@@ -1,9 +1,14 @@
-"""SQLite persistence: prompts, versions (lineage), runs.
+"""SQLite persistence via peewee: prompts, versions (lineage), runs.
 
 All write paths that run implicitly (version registration on first render,
 run recording inside a wrapped OpenAI call) are exception-shielded: a broken
 DB loses telemetry, never a completion. Read paths (history queries) raise
 normally.
+
+Schema evolution: the DB carries a schema number in ``PRAGMA user_version``.
+``_migrate`` applies forward-only steps for anything below the current
+``_SCHEMA_VERSION``; future changes bump the constant and add a step using
+``playhouse.migrate`` operations (ships with peewee).
 """
 
 from __future__ import annotations
@@ -11,60 +16,90 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+import peewee as pw
+
 logger = logging.getLogger("prompt_manager")
 
-_local = threading.local()
+_SCHEMA_VERSION = 1
+
+_proxy = pw.DatabaseProxy()
+_db_lock = threading.Lock()
+_current_path: Optional[str] = None
+
 _registration_cache: dict = {}
 _reg_lock = threading.Lock()
-_connect_lock = threading.Lock()
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS prompts (
-    id          INTEGER PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    created_at  TEXT NOT NULL
-);
+_PRAGMAS = {
+    "journal_mode": "wal",
+    "foreign_keys": 1,
+    "busy_timeout": 5000,
+}
 
-CREATE TABLE IF NOT EXISTS prompt_versions (
-    id             INTEGER PRIMARY KEY,
-    prompt_id      INTEGER NOT NULL REFERENCES prompts(id),
-    version        INTEGER NOT NULL,
-    template       TEXT NOT NULL,
-    template_hash  TEXT NOT NULL,
-    source         TEXT NOT NULL,
-    fn_source_hash TEXT,
-    created_at     TEXT NOT NULL,
-    UNIQUE (prompt_id, template_hash),
-    UNIQUE (prompt_id, version)
-);
 
-CREATE TABLE IF NOT EXISTS runs (
-    id                INTEGER PRIMARY KEY,
-    version_id        INTEGER NOT NULL REFERENCES prompt_versions(id),
-    variables         TEXT,
-    rendered_text     TEXT NOT NULL,
-    provider          TEXT NOT NULL,
-    model             TEXT,
-    request_params    TEXT,
-    response_id       TEXT,
-    output_text       TEXT,
-    prompt_tokens     INTEGER,
-    completion_tokens INTEGER,
-    total_tokens      INTEGER,
-    latency_ms        INTEGER,
-    status            TEXT NOT NULL,
-    error             TEXT,
-    created_at        TEXT NOT NULL
-);
+# --- models -------------------------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS idx_runs_version ON runs(version_id, created_at);
-"""
+
+class BaseModel(pw.Model):
+    class Meta:
+        database = _proxy
+
+
+class PromptRecord(BaseModel):
+    name = pw.TextField(unique=True)
+    created_at = pw.TextField()
+
+    class Meta:
+        table_name = "prompts"
+
+
+class PromptVersionRecord(BaseModel):
+    prompt = pw.ForeignKeyField(PromptRecord, column_name="prompt_id", backref="versions")
+    version = pw.IntegerField()
+    template = pw.TextField()
+    template_hash = pw.TextField()
+    source = pw.TextField()
+    fn_source_hash = pw.TextField(null=True)
+    created_at = pw.TextField()
+
+    class Meta:
+        table_name = "prompt_versions"
+        indexes = (
+            (("prompt", "template_hash"), True),
+            (("prompt", "version"), True),
+        )
+
+
+class RunRecord(BaseModel):
+    version = pw.ForeignKeyField(PromptVersionRecord, column_name="version_id", backref="runs")
+    variables = pw.TextField(null=True)
+    rendered_text = pw.TextField()
+    provider = pw.TextField()
+    model = pw.TextField(null=True)
+    request_params = pw.TextField(null=True)
+    response_id = pw.TextField(null=True)
+    output_text = pw.TextField(null=True)
+    prompt_tokens = pw.IntegerField(null=True)
+    completion_tokens = pw.IntegerField(null=True)
+    total_tokens = pw.IntegerField(null=True)
+    latency_ms = pw.IntegerField(null=True)
+    status = pw.TextField()
+    error = pw.TextField(null=True)
+    created_at = pw.TextField()
+
+    class Meta:
+        table_name = "runs"
+        indexes = ((("version", "created_at"), False),)
+
+
+_MODELS = [PromptRecord, PromptVersionRecord, RunRecord]
+
+
+# --- helpers -------------------------------------------------------------------
 
 
 def _utcnow() -> str:
@@ -81,59 +116,58 @@ def _json_or_none(obj: Any) -> Optional[str]:
     return json.dumps(obj, ensure_ascii=False, default=repr)
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    conns = getattr(_local, "conns", None)
-    if conns is None:
-        conns = _local.conns = {}
-    key = str(path)
-    conn = conns.get(key)
-    if conn is None:
-        # Serialize setup: switching a fresh DB into WAL needs an exclusive
-        # lock, which concurrent first-connections would fight over.
-        with _connect_lock:
-            if path.parent and not path.parent.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(key, timeout=5.0)
-            conn.row_factory = sqlite3.Row
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError:
-                pass  # WAL is an optimization; default journal mode works too
-            conn.execute("PRAGMA foreign_keys=ON")
-            _migrate(conn)
-        conns[key] = conn
-    return conn
+# --- database lifecycle ----------------------------------------------------------
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    (user_version,) = conn.execute("PRAGMA user_version").fetchone()
-    if user_version < 1:
-        conn.executescript(_SCHEMA)
-        conn.execute("PRAGMA user_version = 1")
-        conn.commit()
+def _get_db() -> Optional[pw.DatabaseProxy]:
+    """Bind the proxy to the configured DB (once), or None when disabled.
 
-
-def connection() -> Optional[sqlite3.Connection]:
-    """Connection for the configured DB, or None when tracking is disabled."""
+    First-time setup (connect, WAL switch, table creation) runs under a lock:
+    concurrent first-connections to a fresh file would otherwise fight over
+    the exclusive lock the WAL switch needs. Peewee keeps per-thread
+    connection state, so normal queries need no locking here.
+    """
     from .config import get_settings
 
     settings = get_settings()
     if not settings.enabled:
         return None
-    return _connect(Path(settings.db_path))
+    path = str(Path(settings.db_path))
+    global _current_path
+    if _current_path != path:
+        with _db_lock:
+            if _current_path != path:
+                parent = Path(path).parent
+                if parent and not parent.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+                database = pw.SqliteDatabase(path, pragmas=_PRAGMAS, timeout=5)
+                _proxy.initialize(database)
+                database.connect(reuse_if_open=True)
+                _migrate(database)
+                _current_path = path
+    return _proxy
+
+
+def _migrate(database: pw.SqliteDatabase) -> None:
+    (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
+    if user_version < 1:
+        database.create_tables(_MODELS, safe=True)
+    # Future steps: `if user_version < 2:` apply playhouse.migrate operations.
+    if user_version < _SCHEMA_VERSION:
+        database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
 def reset_caches() -> None:
+    global _current_path
     with _reg_lock:
         _registration_cache.clear()
-    conns = getattr(_local, "conns", None)
-    if conns:
-        for conn in conns.values():
+    with _db_lock:
+        if _current_path is not None:
             try:
-                conn.close()
+                _proxy.close()
             except Exception:
                 pass
-        conns.clear()
+            _current_path = None
 
 
 # --- writes (shielded) -------------------------------------------------------
@@ -163,8 +197,9 @@ def register_version(
     if cached is not None:
         return cached
     try:
-        conn = _connect(Path(settings.db_path))
-        result = _register(conn, name, template, content_hash, source, fn_source_hash)
+        if _get_db() is None:
+            return None
+        result = _register(name, template, content_hash, source, fn_source_hash)
     except Exception:
         logger.warning(
             "prompt_manager: failed to register version for prompt %r", name, exc_info=True
@@ -175,40 +210,44 @@ def register_version(
     return result
 
 
-def _register(conn, name, template, content_hash, source, fn_source_hash) -> Tuple[int, int]:
+def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int, int]:
     now = _utcnow()
     # Retry: two writers can race on the same next-version number; the
-    # UNIQUE(prompt_id, version) constraint rejects the loser, who re-reads.
+    # unique (prompt, version) index rejects the loser, who re-reads.
+    # BEGIN IMMEDIATE takes the write lock up front — a deferred transaction
+    # would read first and SQLite refuses to wait on read->write upgrades.
     for _ in range(5):
         try:
-            with conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO prompts (name, created_at) VALUES (?, ?)",
-                    (name, now),
+            with _proxy.atomic("IMMEDIATE"):
+                prompt_row, _created = PromptRecord.get_or_create(
+                    name=name, defaults={"created_at": now}
                 )
-                (prompt_id,) = conn.execute(
-                    "SELECT id FROM prompts WHERE name = ?", (name,)
-                ).fetchone()
-                row = conn.execute(
-                    "SELECT id, version FROM prompt_versions"
-                    " WHERE prompt_id = ? AND template_hash = ?",
-                    (prompt_id, content_hash),
-                ).fetchone()
-                if row is not None:
-                    return (row["id"], row["version"])
-                (next_version,) = conn.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE prompt_id = ?",
-                    (prompt_id,),
-                ).fetchone()
-                cursor = conn.execute(
-                    "INSERT INTO prompt_versions"
-                    " (prompt_id, version, template, template_hash, source,"
-                    "  fn_source_hash, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (prompt_id, next_version, template, content_hash, source, fn_source_hash, now),
+                existing = (
+                    PromptVersionRecord.select(PromptVersionRecord.id, PromptVersionRecord.version)
+                    .where(
+                        (PromptVersionRecord.prompt == prompt_row)
+                        & (PromptVersionRecord.template_hash == content_hash)
+                    )
+                    .first()
                 )
-                return (cursor.lastrowid, next_version)
-        except sqlite3.IntegrityError:
+                if existing is not None:
+                    return (existing.id, existing.version)
+                max_version = (
+                    PromptVersionRecord.select(pw.fn.MAX(PromptVersionRecord.version))
+                    .where(PromptVersionRecord.prompt == prompt_row)
+                    .scalar()
+                ) or 0
+                row = PromptVersionRecord.create(
+                    prompt=prompt_row,
+                    version=max_version + 1,
+                    template=template,
+                    template_hash=content_hash,
+                    source=source,
+                    fn_source_hash=fn_source_hash,
+                    created_at=now,
+                )
+                return (row.id, row.version)
+        except (pw.IntegrityError, pw.OperationalError):
             continue
     raise RuntimeError(f"could not register a version for prompt {name!r} after retries")
 
@@ -230,37 +269,26 @@ def record_run(
     status: str = "ok",
     error: Optional[str] = None,
 ) -> None:
-    from .config import get_settings
-
-    settings = get_settings()
-    if not settings.enabled:
-        return
     try:
-        conn = _connect(Path(settings.db_path))
-        with conn:
-            conn.execute(
-                "INSERT INTO runs (version_id, variables, rendered_text, provider, model,"
-                " request_params, response_id, output_text, prompt_tokens,"
-                " completion_tokens, total_tokens, latency_ms, status, error, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    version_id,
-                    _json_or_none(variables),
-                    rendered_text,
-                    provider,
-                    model,
-                    _json_or_none(request_params),
-                    response_id,
-                    output_text,
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    latency_ms,
-                    status,
-                    error,
-                    _utcnow(),
-                ),
-            )
+        if _get_db() is None:
+            return
+        RunRecord.create(
+            version=version_id,
+            variables=_json_or_none(variables),
+            rendered_text=rendered_text,
+            provider=provider,
+            model=model,
+            request_params=_json_or_none(request_params),
+            response_id=response_id,
+            output_text=output_text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+            status=status,
+            error=error,
+            created_at=_utcnow(),
+        )
     except Exception:
         logger.warning("prompt_manager: failed to record run", exc_info=True)
 
@@ -269,36 +297,53 @@ def record_run(
 
 
 def fetch_versions(name: str) -> list:
-    conn = connection()
-    if conn is None:
+    if _get_db() is None:
         return []
-    return conn.execute(
-        "SELECT v.version, v.template, v.template_hash, v.source, v.fn_source_hash,"
-        " v.created_at"
-        " FROM prompt_versions v JOIN prompts p ON v.prompt_id = p.id"
-        " WHERE p.name = ? ORDER BY v.version",
-        (name,),
-    ).fetchall()
+    query = (
+        PromptVersionRecord.select(
+            PromptVersionRecord.version,
+            PromptVersionRecord.template,
+            PromptVersionRecord.template_hash,
+            PromptVersionRecord.source,
+            PromptVersionRecord.fn_source_hash,
+            PromptVersionRecord.created_at,
+        )
+        .join(PromptRecord)
+        .where(PromptRecord.name == name)
+        .order_by(PromptVersionRecord.version)
+        .dicts()
+    )
+    return list(query)
 
 
 def fetch_runs(name: str, version: Optional[int] = None, limit: int = 50) -> list:
-    conn = connection()
-    if conn is None:
+    if _get_db() is None:
         return []
     query = (
-        "SELECT r.id, p.name AS prompt_name, v.version, r.variables, r.rendered_text,"
-        " r.provider, r.model, r.request_params, r.response_id, r.output_text,"
-        " r.prompt_tokens, r.completion_tokens, r.total_tokens, r.latency_ms,"
-        " r.status, r.error, r.created_at"
-        " FROM runs r"
-        " JOIN prompt_versions v ON r.version_id = v.id"
-        " JOIN prompts p ON v.prompt_id = p.id"
-        " WHERE p.name = ?"
+        RunRecord.select(
+            RunRecord.id,
+            PromptRecord.name.alias("prompt_name"),
+            PromptVersionRecord.version.alias("version"),
+            RunRecord.variables,
+            RunRecord.rendered_text,
+            RunRecord.provider,
+            RunRecord.model,
+            RunRecord.request_params,
+            RunRecord.response_id,
+            RunRecord.output_text,
+            RunRecord.prompt_tokens,
+            RunRecord.completion_tokens,
+            RunRecord.total_tokens,
+            RunRecord.latency_ms,
+            RunRecord.status,
+            RunRecord.error,
+            RunRecord.created_at,
+        )
+        .join(PromptVersionRecord)
+        .join(PromptRecord)
+        .where(PromptRecord.name == name)
     )
-    params: list = [name]
     if version is not None:
-        query += " AND v.version = ?"
-        params.append(version)
-    query += " ORDER BY r.id DESC LIMIT ?"
-    params.append(limit)
-    return conn.execute(query, params).fetchall()
+        query = query.where(PromptVersionRecord.version == version)
+    query = query.order_by(RunRecord.id.desc()).limit(limit).dicts()
+    return list(query)
