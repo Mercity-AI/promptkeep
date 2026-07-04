@@ -63,6 +63,7 @@ class Prompt:
         "_template",
         "_variables",
         "_strict",
+        "_exact_match",
         "_source",
         "_fn_source_hash",
         "_registration",
@@ -75,11 +76,17 @@ class Prompt:
         variables: Optional[Dict[str, Any]] = None,
         name: Optional[str] = None,
         strict: Optional[bool] = None,
+        exact_match: bool = False,
         source: str = "literal",
         fn_source_hash: Optional[str] = None,
     ):
         """Validate inputs and freeze the instance (source/fn_source_hash are
-        internal, set by the @prompt decorator)."""
+        internal, set by the @prompt decorator).
+
+        exact_match=True opts out of normalized version matching: the raw
+        template text (including placeholder names) becomes the version
+        identity, so renaming {var1} -> {x} DOES create a new version.
+        """
         # Validate the two identity-critical inputs up front.
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Prompt text must be a non-empty string")
@@ -98,6 +105,7 @@ class Prompt:
         object.__setattr__(self, "_template", text)
         object.__setattr__(self, "_variables", dict(variables))
         object.__setattr__(self, "_strict", strict)
+        object.__setattr__(self, "_exact_match", bool(exact_match))
         object.__setattr__(self, "_source", source)
         object.__setattr__(self, "_fn_source_hash", fn_source_hash)
         object.__setattr__(self, "_registration", _UNSET)
@@ -147,6 +155,11 @@ class Prompt:
         """Hash of the @prompt function's source code (None for literal prompts)."""
         return self._fn_source_hash
 
+    @property
+    def exact_match(self) -> bool:
+        """True when version identity includes placeholder names (opt-in)."""
+        return self._exact_match
+
     # --- rendering ----------------------------------------------------------
 
     def render(self, **overrides: Any) -> RenderedText:
@@ -169,6 +182,7 @@ class Prompt:
             {**self._variables, **overrides},
             name=self._name,
             strict=self._strict,
+            exact_match=self._exact_match,
             source=self._source,
             fn_source_hash=self._fn_source_hash,
         )
@@ -194,7 +208,11 @@ class Prompt:
             from . import storage
 
             registration = storage.register_version(
-                self._name, self._template, self._source, self._fn_source_hash
+                self._name,
+                self._template,
+                self._source,
+                self._fn_source_hash,
+                exact_match=self._exact_match,
             )
             object.__setattr__(self, "_registration", registration)
         return registration

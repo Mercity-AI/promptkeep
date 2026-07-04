@@ -27,7 +27,7 @@ def _function_source_hash(fn: Callable) -> Optional[str]:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def prompt(name: str, strict: Optional[bool] = None):
+def prompt(name: str, strict: Optional[bool] = None, exact_match: bool = False):
     """Turn a template-building function into a Prompt factory.
 
         @prompt(name="REVIEW_SYSTEM")
@@ -38,9 +38,11 @@ def prompt(name: str, strict: Optional[bool] = None):
         p.raw    # the template the function returned
         p.text   # rendered with the call's arguments
 
-    The version identity is the returned template text (content-hash dedup);
-    a hash of the function's source is stored alongside each version so
-    history can tell "code changed" apart from "same code, different output".
+    The version identity is the returned template text (content-hash dedup,
+    normalized so placeholder renames don't create versions; exact_match=True
+    opts into raw-text identity). A hash of the function's source is stored
+    alongside each version so history can tell "code changed" apart from
+    "same code, different output".
     """
     # Catch the bare-decorator mistake (@prompt without parentheses) early.
     if callable(name):
@@ -87,6 +89,7 @@ def prompt(name: str, strict: Optional[bool] = None):
                 variables,
                 name=name,
                 strict=strict,
+                exact_match=exact_match,
                 source="decorator",
                 fn_source_hash=fn_hash,
             )

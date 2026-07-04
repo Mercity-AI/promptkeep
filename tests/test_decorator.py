@@ -143,6 +143,20 @@ class TestDecoratorVersioning:
         assert version.fn_source_hash is not None
         assert len(version.fn_source_hash) == 64  # sha256 hex
 
+    def test_exact_match_passes_through(self):
+        """@prompt(exact_match=True) makes renames version-bumping."""
+
+        @prompt(name="DECOEXACT", exact_match=True)
+        def make_a():
+            return "grade {var1}"
+
+        @prompt(name="DECOEXACT", exact_match=True)
+        def make_b():
+            return "grade {x}"
+
+        assert make_a().version == 1
+        assert make_b().version == 2  # rename counts under exact matching
+
     def test_literal_prompts_have_no_fn_hash(self):
         """Class-constructed prompts are marked 'literal' with no fn hash."""
         Prompt("hi", name="LIT").version

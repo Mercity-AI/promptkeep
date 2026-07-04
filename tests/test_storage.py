@@ -50,6 +50,21 @@ class TestLineage:
         # Renaming either still dedups to its structural twin.
         assert Prompt("{z} and then {z}", name="NORMREP").version == 1
 
+    def test_exact_match_opts_out_of_normalization(self):
+        """exact_match=True makes placeholder names part of the identity."""
+        assert Prompt("review this: {var1}", name="EXACT", exact_match=True).version == 1
+        # Rename -> a genuinely new version under exact matching.
+        assert Prompt("review this: {x}", name="EXACT", exact_match=True).version == 2
+        # And re-registering an existing spelling still dedups to its row.
+        assert Prompt("review this: {var1}", name="EXACT", exact_match=True).version == 1
+        assert len(history.versions("EXACT")) == 2
+
+    def test_exact_match_survives_format(self):
+        """.format() derivatives keep the parent's matching mode."""
+        p = Prompt("hi {a}", {"a": 1}, name="EXACTFMT", exact_match=True)
+        assert p.format(a=2).exact_match is True
+        assert p.format(a=2).version == p.version
+
     def test_names_are_independent_lineages(self):
         """Two prompts sharing text but not name version independently."""
         assert Prompt("shared text", name="A").version == 1

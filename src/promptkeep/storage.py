@@ -121,16 +121,20 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def template_hash(text: str) -> str:
+def template_hash(text: str, exact: bool = False) -> str:
     """Content hash used as a template's version identity.
 
-    Hashes the *normalized* template (variable names canonicalized to
-    positional tokens), so renaming a placeholder — {var1} -> {x} — resolves
-    to the same version; only static text and placeholder structure matter.
+    Default: hashes the *normalized* template (variable names canonicalized
+    to positional tokens), so renaming a placeholder — {var1} -> {x} —
+    resolves to the same version; only static text and placeholder structure
+    matter. With exact=True the raw text is hashed, making placeholder names
+    part of the identity.
     """
-    from .rendering import normalize_template
+    if not exact:
+        from .rendering import normalize_template
 
-    return hashlib.sha256(normalize_template(text).encode("utf-8")).hexdigest()
+        text = normalize_template(text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _json_or_none(obj: Any) -> Optional[str]:
@@ -220,12 +224,14 @@ def register_version(
     template: str,
     source: str = "literal",
     fn_source_hash: Optional[str] = None,
+    exact_match: bool = False,
 ) -> Optional[Tuple[int, int]]:
     """Idempotently record (name, template) and return (version_id, version).
 
-    Deduplicated by template content hash: re-registering identical text
-    returns the existing version. Returns None when tracking is disabled or
-    the write fails (never raises).
+    Deduplicated by template content hash (normalized by default; raw text
+    when exact_match=True): re-registering matching text returns the existing
+    version. Returns None when tracking is disabled or the write fails
+    (never raises).
     """
     from .config import get_settings
 
@@ -234,7 +240,7 @@ def register_version(
         return None
 
     # Cheap path: this exact template was already registered this process.
-    content_hash = template_hash(template)
+    content_hash = template_hash(template, exact=exact_match)
     cache_key = (str(settings.db_path), name, content_hash)
     with _reg_lock:
         cached = _registration_cache.get(cache_key)

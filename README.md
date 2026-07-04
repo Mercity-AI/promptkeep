@@ -21,9 +21,22 @@ prompt.version  # 1 — bumps automatically whenever the template text changes
 ```
 
 Same `name` + edited text ⇒ a new version row in SQLite (deduplicated by content hash).
-Variables are *run data*, never versions — change them freely. Matching ignores placeholder
-*names* too: renaming `{var1}` to `{x}` is not a new version — only the static text and the
-placeholder structure (positions, repetitions, format specs) count.
+Variables are *run data*, never versions — change them freely.
+
+### How version matching works
+
+By default, matching ignores placeholder *names*: renaming `{var1}` to `{x}` is **not** a new
+version — only the static text and the placeholder structure count. Structure still matters:
+positions, repetition patterns (`{a}..{a}` is one value used twice, so it differs from
+`{a}..{b}`), attribute paths, and format specs all distinguish versions.
+
+If you *want* renames to count — say, variable names carry meaning in your workflow — opt out
+per prompt with `exact_match=True` (works on the decorator too):
+
+```python
+p = Prompt("Grade the essay on {var1}.", name="GRADER", exact_match=True)
+# now "Grade the essay on {x}." registers as a NEW version under GRADER
+```
 
 Rendering is lenient by default: unknown `{placeholders}` and JSON braces in the template
 pass through untouched. Use `strict=True` (per prompt or via `configure`) to raise instead.
