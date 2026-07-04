@@ -14,6 +14,7 @@ from typing import Iterable, Mapping, Optional, Set
 
 logger = logging.getLogger("prompt_manager")
 
+# One shared Formatter gives us stdlib-compatible parsing of {field:spec!conv}.
 _formatter = Formatter()
 
 
@@ -26,7 +27,8 @@ class MissingVariableError(KeyError):
             "Missing variables for placeholders: " + ", ".join(repr(m) for m in self.missing)
         )
 
-    def __str__(self) -> str:  # KeyError repr-quotes its message otherwise
+    def __str__(self) -> str:
+        """Return the plain message (KeyError repr-quotes its args otherwise)."""
         return self.args[0]
 
 
@@ -35,10 +37,12 @@ class TemplateParseError(ValueError):
 
 
 def _base_name(field_name: str) -> str:
+    """Extract the variable name from a field: `user.name` / `user[0]` -> `user`."""
     return field_name.split(".")[0].split("[")[0]
 
 
 def _rebuild_placeholder(field_name: str, conversion: Optional[str], spec: Optional[str]) -> str:
+    """Reassemble a parsed placeholder into its original `{field!conv:spec}` text."""
     out = "{" + field_name
     if conversion:
         out += "!" + conversion
@@ -61,6 +65,7 @@ def extract_placeholders(template: str) -> Set[str]:
                 if base and not base.isdigit():
                     names.add(base)
     except ValueError:
+        # Unparseable template: report no placeholders rather than blow up.
         return set()
     return names
 
@@ -73,6 +78,8 @@ def render(template: str, variables: Optional[Mapping] = None, strict: bool = Fa
     MissingVariableError / TemplateParseError instead.
     """
     variables = variables or {}
+
+    # Parse up front so a syntax error surfaces before any output is built.
     try:
         parsed = list(_formatter.parse(template))
     except ValueError as exc:
@@ -83,6 +90,8 @@ def render(template: str, variables: Optional[Mapping] = None, strict: bool = Fa
         )
         return template
 
+    # Walk the parsed segments: emit literal text as-is, substitute known
+    # variables, and keep unknown placeholders literal (or collect for strict).
     out = []
     missing = []
     for literal, field_name, spec, conversion in parsed:
@@ -92,6 +101,7 @@ def render(template: str, variables: Optional[Mapping] = None, strict: bool = Fa
         base = _base_name(field_name)
         if base and not base.isdigit() and base in variables:
             try:
+                # Full stdlib semantics: attribute/index access, !r/!s, :specs.
                 value, _ = _formatter.get_field(field_name, (), variables)
                 if conversion:
                     value = _formatter.convert_field(value, conversion)

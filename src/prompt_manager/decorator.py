@@ -18,6 +18,8 @@ from .prompts import Prompt
 
 
 def _function_source_hash(fn: Callable) -> Optional[str]:
+    """Hash the function's source so history can tell code changes apart from
+    same-code output changes. None when source isn't available (e.g. REPL)."""
     try:
         source = textwrap.dedent(inspect.getsource(fn))
     except (OSError, TypeError):
@@ -40,6 +42,7 @@ def prompt(name: str, strict: Optional[bool] = None):
     a hash of the function's source is stored alongside each version so
     history can tell "code changed" apart from "same code, different output".
     """
+    # Catch the bare-decorator mistake (@prompt without parentheses) early.
     if callable(name):
         raise TypeError(
             '@prompt requires a name: use @prompt(name="MY_PROMPT") — '
@@ -49,22 +52,30 @@ def prompt(name: str, strict: Optional[bool] = None):
         raise ValueError("@prompt requires a non-empty name string")
 
     def decorate(fn: Callable[..., str]):
+        """Wrap fn so each call yields a Prompt built from its return value."""
+        # Computed once at decoration time; identical for every call.
         fn_hash = _function_source_hash(fn)
         signature = inspect.signature(fn)
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Prompt:
+            """Call fn, then package its returned template into a Prompt."""
+            # Capture the full call (including defaults) as the variables dict.
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             variables: dict = {}
             for param_name, value in bound.arguments.items():
                 kind = signature.parameters[param_name].kind
                 if kind is inspect.Parameter.VAR_KEYWORD:
+                    # **kwargs entries become top-level variables.
                     variables.update(value)
                 elif kind is inspect.Parameter.VAR_POSITIONAL:
+                    # *args recorded as a list under the parameter's name.
                     variables[param_name] = list(value)
                 else:
                     variables[param_name] = value
+
+            # The function's return value is the raw template.
             template = fn(*args, **kwargs)
             if not isinstance(template, str):
                 raise TypeError(

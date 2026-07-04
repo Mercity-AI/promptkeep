@@ -1,4 +1,8 @@
-"""Query the lineage and run history of a prompt by name."""
+"""Query the lineage and run history of a prompt by name.
+
+The read-side API: storage returns raw dict rows; this module shapes them
+into typed, immutable dataclasses that are pleasant to work with.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ from . import storage
 
 @dataclass(frozen=True)
 class VersionInfo:
+    """One version of a prompt's template, as recorded in the lineage."""
+
     version: int
     template: str
     template_hash: str
@@ -22,6 +28,8 @@ class VersionInfo:
 
 @dataclass(frozen=True)
 class RunInfo:
+    """One recorded execution: which version ran, with what, and what came back."""
+
     id: int
     prompt_name: str
     version: int
@@ -42,6 +50,7 @@ class RunInfo:
 
 
 def _load_json(value: Optional[str]):
+    """Decode a stored JSON column; malformed/missing data becomes None."""
     if value is None:
         return None
     try:
@@ -67,6 +76,7 @@ def versions(name: str) -> List[VersionInfo]:
 
 def diff(name: str, old: int, new: int) -> str:
     """Unified diff between two versions of a prompt's template."""
+    # Load the lineage once and validate both requested versions exist.
     by_number = {v.version: v for v in versions(name)}
     for wanted in (old, new):
         if wanted not in by_number:

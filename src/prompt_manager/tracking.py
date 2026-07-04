@@ -1,4 +1,9 @@
-"""Provider-agnostic run recording. Never raises into the caller's request path."""
+"""Provider-agnostic run recording: the bridge between an integration wrapper
+(which knows about requests/responses) and storage (which knows about rows).
+
+Never raises into the caller's request path — losing telemetry is always
+preferable to breaking an LLM call.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +32,13 @@ def record_prompt_run(
     status: str = "ok",
     error: Optional[str] = None,
 ) -> None:
+    """Record one execution of a prompt: resolve its version, insert a run row.
+
+    Silently skips when tracking is disabled; swallows (and logs) all errors.
+    """
     try:
+        # Resolve the prompt to its version row; None means tracking is off
+        # or registration failed — either way there's nothing to attach to.
         registration = prompt._ensure_registered()
         if registration is None:
             return

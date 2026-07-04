@@ -1,3 +1,5 @@
+"""Tests for the storage layer: lineage semantics, concurrency, run recording."""
+
 import threading
 
 import prompt_manager
@@ -7,7 +9,10 @@ from prompt_manager import storage, tracking
 
 
 class TestLineage:
+    """Version registration: sequencing, dedup, isolation, concurrency."""
+
     def test_versions_are_sequential(self):
+        """Each distinct template under one name gets the next version number."""
         for i in range(3):
             Prompt(f"template revision {i}", name="SEQ").version
         recorded = history.versions("SEQ")
@@ -16,11 +21,13 @@ class TestLineage:
         assert recorded[2].template == "template revision 2"
 
     def test_dedup_by_content_hash(self):
+        """Registering identical text twice creates exactly one version."""
         Prompt("same text", name="DEDUP").version
         Prompt("same text", name="DEDUP").version
         assert len(history.versions("DEDUP")) == 1
 
     def test_dedup_survives_cache_reset(self, isolated_db):
+        """Dedup relies on the DB, not the in-process cache."""
         assert Prompt("same text", name="DEDUP").version == 1
         # Simulate a new process: drop in-memory caches, keep the same DB file.
         storage.reset_caches()
@@ -29,12 +36,14 @@ class TestLineage:
         assert Prompt("new text", name="DEDUP").version == 2
 
     def test_names_are_independent_lineages(self):
+        """Two prompts sharing text but not name version independently."""
         assert Prompt("shared text", name="A").version == 1
         assert Prompt("shared text", name="B").version == 1
         assert Prompt("other text", name="A").version == 2
         assert len(history.versions("B")) == 1
 
     def test_disabled_creates_no_db_file(self, tmp_path):
+        """Disabled tracking must do zero filesystem I/O."""
         pm_config.reset()
         prompt_manager.configure(db_path=tmp_path / "nope.db", enabled=False)
         p = Prompt("hi {x}", {"x": 1}, name="X")
@@ -43,9 +52,12 @@ class TestLineage:
         assert not (tmp_path / "nope.db").exists()
 
     def test_concurrent_registration_from_threads(self):
+        """Eight threads registering distinct texts must produce versions 1..8
+        with no errors — exercises the IMMEDIATE-transaction retry path."""
         errors = []
 
         def register(i):
+            """Register one distinct template from a worker thread."""
             try:
                 version = Prompt(f"threaded text {i}", name="THREADED").version
                 assert version is not None
@@ -64,7 +76,10 @@ class TestLineage:
 
 
 class TestRunRecording:
+    """record_prompt_run -> runs table round-trips."""
+
     def test_record_and_read_back(self):
+        """Every field written to a run row survives the read back intact."""
         p = Prompt("hi {x}", {"x": 1}, name="RUNS")
         tracking.record_prompt_run(
             p,
@@ -95,6 +110,7 @@ class TestRunRecording:
         assert run.error is None
 
     def test_non_json_variables_do_not_crash(self):
+        """Unserializable variable values degrade to repr(), not exceptions."""
         p = Prompt("hi {x}", name="RUNS")
         tracking.record_prompt_run(
             p, {"x": object()}, "hi ...", provider="openai", model="gpt-test"
@@ -103,9 +119,11 @@ class TestRunRecording:
         assert "object" in run.variables["x"]  # stored via repr fallback
 
     def test_recording_failure_is_swallowed(self, monkeypatch):
+        """A DB explosion during recording must never propagate to the caller."""
         p = Prompt("hi {x}", name="RUNS")
 
         def boom(**kwargs):
+            """Stand-in for a storage layer that is completely broken."""
             raise RuntimeError("db exploded")
 
         monkeypatch.setattr(storage, "record_run", boom)

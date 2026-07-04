@@ -1,4 +1,9 @@
-"""Fake OpenAI-shaped clients for wrapper tests. No network, no openai dep."""
+"""Fake OpenAI-shaped clients for wrapper tests. No network, no openai dep.
+
+Mirrors the SDK surface the wrapper touches: `client.chat.completions.create`
+returning either a response object, a stream of chunks, or raising — in both
+sync and async flavors.
+"""
 
 from types import SimpleNamespace
 
@@ -6,6 +11,7 @@ from types import SimpleNamespace
 def make_response(
     content="hello!", model="gpt-test", response_id="resp_1", prompt_tokens=10, completion_tokens=5
 ):
+    """Build a chat-completion response shaped like the real SDK's object."""
     return SimpleNamespace(
         id=response_id,
         model=model,
@@ -19,6 +25,7 @@ def make_response(
 
 
 def make_chunk(content=None, model="gpt-test", response_id="resp_s", usage=None):
+    """Build one streaming chunk (delta content, optionally final usage)."""
     return SimpleNamespace(
         id=response_id,
         model=model,
@@ -28,6 +35,8 @@ def make_chunk(content=None, model="gpt-test", response_id="resp_s", usage=None)
 
 
 class FakeStream:
+    """Iterable + context-manager stand-in for the SDK's sync Stream."""
+
     def __init__(self, chunks):
         self._chunks = list(chunks)
         self.entered = False
@@ -46,6 +55,8 @@ class FakeStream:
 
 
 class FakeAsyncStream:
+    """Async-iterable stand-in for the SDK's AsyncStream."""
+
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
@@ -61,6 +72,8 @@ class FakeAsyncStream:
 
 
 class FakeCompletions:
+    """Records every create() call and replays a canned response/stream/error."""
+
     def __init__(self, response=None, error=None, stream_chunks=None):
         self.response = response if response is not None else make_response()
         self.error = error
@@ -68,6 +81,7 @@ class FakeCompletions:
         self.calls = []
 
     def create(self, **kwargs):
+        """Mimic chat.completions.create: record kwargs, then respond as configured."""
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
@@ -77,6 +91,8 @@ class FakeCompletions:
 
 
 class FakeAsyncCompletions(FakeCompletions):
+    """Async variant — the wrapper must detect the coroutine and await it."""
+
     async def create(self, **kwargs):
         self.calls.append(kwargs)
         if self.error is not None:
@@ -101,8 +117,11 @@ class FakeClient:
 
     @property
     def calls(self):
+        """Shortcut to the recorded create() calls."""
         return self.chat.completions.calls
 
 
 class FakeAsyncClient(FakeClient):
+    """Mimics openai.AsyncOpenAI by swapping in the async completions."""
+
     completions_cls = FakeAsyncCompletions

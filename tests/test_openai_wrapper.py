@@ -1,9 +1,11 @@
+"""Tests for wrap(): substitution, run tracking, streaming, async — all against
+the fake OpenAI-shaped clients in tests/fakes.py (no network)."""
+
 import asyncio
 
 import pytest
 
-from prompt_manager import Prompt, history, wrap
-from prompt_manager import storage
+from prompt_manager import Prompt, history, storage, wrap
 from tests.fakes import (
     FakeAsyncClient,
     FakeClient,
@@ -13,11 +15,15 @@ from tests.fakes import (
 
 
 def make_prompt(name="WRAP_SYS", focus="brevity"):
+    """A small tracked prompt to embed in request messages."""
     return Prompt("You are helpful. Focus on {focus}.", {"focus": focus}, name=name)
 
 
 class TestWrapDispatch:
+    """wrap() accepting classes, instances, and rejecting everything else."""
+
     def test_wrap_class_keeps_name_and_behavior(self):
+        """Wrapping a class preserves its name, constructor, and isinstance."""
         Wrapped = wrap(FakeClient)
         assert Wrapped.__name__ == "FakeClient"
         client = Wrapped(api_key="sk-test")
@@ -25,14 +31,17 @@ class TestWrapDispatch:
         assert client.api_key == "sk-test"
 
     def test_wrap_instance_returns_same_object(self):
+        """Wrapping an instance instruments it in place."""
         client = FakeClient()
         assert wrap(client) is client
 
     def test_wrap_rejects_non_clients(self):
+        """Objects without chat.completions.create are a usage error."""
         with pytest.raises(TypeError, match="OpenAI client"):
             wrap(42)
 
     def test_double_wrap_is_idempotent(self):
+        """Wrapping twice must not double-substitute or double-record."""
         client = wrap(wrap(FakeClient()))
         client.chat.completions.create(
             model="gpt-test", messages=[{"role": "user", "content": make_prompt()}]
@@ -42,7 +51,10 @@ class TestWrapDispatch:
 
 
 class TestSubstitution:
+    """Prompt objects in messages become plain strings on the wire."""
+
     def test_prompt_object_becomes_plain_string(self):
+        """The API receives rendered str content, other messages untouched."""
         client = wrap(FakeClient())
         p = make_prompt()
         client.chat.completions.create(
@@ -59,6 +71,7 @@ class TestSubstitution:
         assert call["messages"][1]["content"] == "How do I check isinstance?"
 
     def test_rendered_text_also_substituted_and_tracked(self):
+        """Passing prompt.text (not the Prompt) still tracks via provenance."""
         client = wrap(FakeClient())
         p = make_prompt(focus="detail")
         client.chat.completions.create(
@@ -70,6 +83,7 @@ class TestSubstitution:
         assert run.variables == {"focus": "detail"}
 
     def test_original_message_dicts_not_mutated(self):
+        """The caller's message list must come back exactly as they built it."""
         client = wrap(FakeClient())
         p = make_prompt()
         messages = [{"role": "developer", "content": p}]
@@ -77,6 +91,7 @@ class TestSubstitution:
         assert messages[0]["content"] is p  # user's list untouched
 
     def test_content_block_lists(self):
+        """Prompts inside multi-part content blocks are substituted too."""
         client = wrap(FakeClient())
         p = make_prompt()
         client.chat.completions.create(
@@ -98,6 +113,7 @@ class TestSubstitution:
         assert len(history.runs("WRAP_SYS")) == 1
 
     def test_plain_string_messages_pass_through_untracked(self):
+        """Ordinary string content is neither altered nor recorded."""
         client = wrap(FakeClient())
         client.chat.completions.create(
             model="gpt-test", messages=[{"role": "user", "content": "just a string"}]
@@ -108,7 +124,10 @@ class TestSubstitution:
 
 
 class TestRunTracking:
+    """Run rows written by the interceptor for non-streaming calls."""
+
     def test_run_recorded_with_response_metadata(self):
+        """Model, usage, output, params, and latency all land on the run row."""
         response = make_response(
             content="the answer",
             model="gpt-5.5",
@@ -137,6 +156,7 @@ class TestRunTracking:
         assert "messages" not in run.request_params
 
     def test_two_prompts_two_runs(self):
+        """Each tracked prompt in one call gets its own run row."""
         client = wrap(FakeClient())
         client.chat.completions.create(
             model="gpt-test",
@@ -149,6 +169,7 @@ class TestRunTracking:
         assert len(history.runs("WRAP_USER")) == 1
 
     def test_api_error_recorded_and_reraised(self):
+        """API failures produce an error run and re-raise unchanged."""
         client = wrap(FakeClient(error=RuntimeError("rate limited")))
         with pytest.raises(RuntimeError, match="rate limited"):
             client.chat.completions.create(
@@ -160,7 +181,10 @@ class TestRunTracking:
         assert run.output_text is None
 
     def test_tracking_failure_never_breaks_the_call(self, monkeypatch):
+        """A dead DB loses telemetry but the completion still returns."""
+
         def boom(**kwargs):
+            """Stand-in for a storage layer that is completely broken."""
             raise RuntimeError("db exploded")
 
         monkeypatch.setattr(storage, "record_run", boom)
@@ -172,7 +196,10 @@ class TestRunTracking:
 
 
 class TestStreaming:
+    """The stream proxy: pass-through chunks, deferred run recording."""
+
     def _chunks(self):
+        """Two content deltas plus a final usage-bearing chunk."""
         from types import SimpleNamespace
 
         return [
@@ -184,6 +211,7 @@ class TestStreaming:
         ]
 
     def test_chunks_pass_through_and_run_recorded_at_end(self):
+        """Chunks arrive untouched; the run is written only after exhaustion."""
         client = wrap(FakeClient(stream_chunks=self._chunks()))
         stream = client.chat.completions.create(
             model="gpt-test",
@@ -199,6 +227,7 @@ class TestStreaming:
         assert run.status == "ok"
 
     def test_context_manager_records_on_exit(self):
+        """`with ... as stream:` records when the context closes."""
         client = wrap(FakeClient(stream_chunks=self._chunks()))
         with client.chat.completions.create(
             model="gpt-test",
@@ -211,6 +240,7 @@ class TestStreaming:
         assert run.output_text == "Hello!"
 
     def test_stream_without_prompts_is_not_proxied(self):
+        """Untracked streams are returned raw — zero proxy overhead."""
         from tests.fakes import FakeStream
 
         client = wrap(FakeClient(stream_chunks=self._chunks()))
@@ -223,10 +253,14 @@ class TestStreaming:
 
 
 class TestAsync:
+    """The async interceptor and async stream proxy."""
+
     def test_async_create_tracked(self):
+        """Awaiting a wrapped async create substitutes and records."""
         client = wrap(FakeAsyncClient())
 
         async def go():
+            """Drive one async completion call."""
             return await client.chat.completions.create(
                 model="gpt-test",
                 messages=[{"role": "developer", "content": make_prompt()}],
@@ -240,6 +274,7 @@ class TestAsync:
         assert run.status == "ok"
 
     def test_async_streaming(self):
+        """`async for` streams pass through and record on exhaustion."""
         from types import SimpleNamespace
 
         chunks = [
@@ -250,6 +285,7 @@ class TestAsync:
         client = wrap(FakeAsyncClient(stream_chunks=chunks))
 
         async def go():
+            """Consume the async stream fully and collect its chunks."""
             stream = await client.chat.completions.create(
                 model="gpt-test",
                 stream=True,
@@ -264,9 +300,11 @@ class TestAsync:
         assert run.total_tokens == 6
 
     def test_async_error_recorded(self):
+        """Async API failures record an error run and re-raise."""
         client = wrap(FakeAsyncClient(error=RuntimeError("boom")))
 
         async def go():
+            """Drive one failing async completion call."""
             await client.chat.completions.create(
                 model="gpt-test",
                 messages=[{"role": "developer", "content": make_prompt()}],

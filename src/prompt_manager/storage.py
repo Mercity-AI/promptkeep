@@ -27,13 +27,18 @@ logger = logging.getLogger("prompt_manager")
 
 _SCHEMA_VERSION = 1
 
+# The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
 _db_lock = threading.Lock()
 _current_path: Optional[str] = None
 
+# Registration results memoized per (db, name, template-hash) so repeated
+# renders of the same prompt cost zero DB round-trips.
 _registration_cache: dict = {}
 _reg_lock = threading.Lock()
 
+# WAL for concurrent reader/writer access; busy_timeout so contending
+# writers wait instead of failing instantly.
 _PRAGMAS = {
     "journal_mode": "wal",
     "foreign_keys": 1,
@@ -45,11 +50,15 @@ _PRAGMAS = {
 
 
 class BaseModel(pw.Model):
+    """Base for all tables; binds them to the runtime-configured database."""
+
     class Meta:
         database = _proxy
 
 
 class PromptRecord(BaseModel):
+    """A prompt's stable identity — one row per unique name."""
+
     name = pw.TextField(unique=True)
     created_at = pw.TextField()
 
@@ -58,6 +67,8 @@ class PromptRecord(BaseModel):
 
 
 class PromptVersionRecord(BaseModel):
+    """One concrete template text under a prompt name; the unit of lineage."""
+
     prompt = pw.ForeignKeyField(PromptRecord, column_name="prompt_id", backref="versions")
     version = pw.IntegerField()
     template = pw.TextField()
@@ -68,6 +79,7 @@ class PromptVersionRecord(BaseModel):
 
     class Meta:
         table_name = "prompt_versions"
+        # Dedup by content, and keep version numbers unique per prompt.
         indexes = (
             (("prompt", "template_hash"), True),
             (("prompt", "version"), True),
@@ -75,6 +87,8 @@ class PromptVersionRecord(BaseModel):
 
 
 class RunRecord(BaseModel):
+    """One execution of a prompt version: variables in, model output back."""
+
     version = pw.ForeignKeyField(PromptVersionRecord, column_name="version_id", backref="runs")
     variables = pw.TextField(null=True)
     rendered_text = pw.TextField()
@@ -103,14 +117,17 @@ _MODELS = [PromptRecord, PromptVersionRecord, RunRecord]
 
 
 def _utcnow() -> str:
+    """Current UTC time as an ISO-8601 string (how all timestamps are stored)."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def template_hash(text: str) -> str:
+    """Content hash used as a template's version identity."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _json_or_none(obj: Any) -> Optional[str]:
+    """Serialize to JSON for storage; non-serializable values fall back to repr()."""
     if obj is None:
         return None
     return json.dumps(obj, ensure_ascii=False, default=repr)
@@ -134,6 +151,7 @@ def _get_db() -> Optional[pw.DatabaseProxy]:
         return None
     path = str(Path(settings.db_path))
     global _current_path
+    # Double-checked locking: fast path skips the lock once bound.
     if _current_path != path:
         with _db_lock:
             if _current_path != path:
@@ -149,6 +167,7 @@ def _get_db() -> Optional[pw.DatabaseProxy]:
 
 
 def _migrate(database: pw.SqliteDatabase) -> None:
+    """Apply forward-only schema steps until the DB reaches _SCHEMA_VERSION."""
     (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
     if user_version < 1:
         database.create_tables(_MODELS, safe=True)
@@ -158,6 +177,7 @@ def _migrate(database: pw.SqliteDatabase) -> None:
 
 
 def reset_caches() -> None:
+    """Drop memoized registrations and close the DB binding. Mainly for tests."""
     global _current_path
     with _reg_lock:
         _registration_cache.clear()
@@ -190,12 +210,16 @@ def register_version(
     settings = get_settings()
     if not settings.enabled:
         return None
+
+    # Cheap path: this exact template was already registered this process.
     content_hash = template_hash(template)
     cache_key = (str(settings.db_path), name, content_hash)
     with _reg_lock:
         cached = _registration_cache.get(cache_key)
     if cached is not None:
         return cached
+
+    # Slow path: hit the DB, shielded so a broken DB can't break rendering.
     try:
         if _get_db() is None:
             return None
@@ -211,17 +235,22 @@ def register_version(
 
 
 def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int, int]:
+    """Insert the prompt/version rows, deduping and racing safely.
+
+    Retry: two writers can race on the same next-version number; the unique
+    (prompt, version) index rejects the loser, who re-reads. BEGIN IMMEDIATE
+    takes the write lock up front — a deferred transaction would read first
+    and SQLite refuses to wait on read->write upgrades.
+    """
     now = _utcnow()
-    # Retry: two writers can race on the same next-version number; the
-    # unique (prompt, version) index rejects the loser, who re-reads.
-    # BEGIN IMMEDIATE takes the write lock up front — a deferred transaction
-    # would read first and SQLite refuses to wait on read->write upgrades.
     for _ in range(5):
         try:
             with _proxy.atomic("IMMEDIATE"):
+                # Ensure the identity row exists.
                 prompt_row, _created = PromptRecord.get_or_create(
                     name=name, defaults={"created_at": now}
                 )
+                # Same template text already registered? Return that version.
                 existing = (
                     PromptVersionRecord.select(PromptVersionRecord.id, PromptVersionRecord.version)
                     .where(
@@ -232,6 +261,7 @@ def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int
                 )
                 if existing is not None:
                     return (existing.id, existing.version)
+                # New text: claim the next sequential version number.
                 max_version = (
                     PromptVersionRecord.select(pw.fn.MAX(PromptVersionRecord.version))
                     .where(PromptVersionRecord.prompt == prompt_row)
@@ -269,6 +299,7 @@ def record_run(
     status: str = "ok",
     error: Optional[str] = None,
 ) -> None:
+    """Insert one run row for a prompt version. Shielded: never raises."""
     try:
         if _get_db() is None:
             return
@@ -297,6 +328,7 @@ def record_run(
 
 
 def fetch_versions(name: str) -> list:
+    """All version rows for a prompt name as dicts, oldest first."""
     if _get_db() is None:
         return []
     query = (
@@ -317,8 +349,10 @@ def fetch_versions(name: str) -> list:
 
 
 def fetch_runs(name: str, version: Optional[int] = None, limit: int = 50) -> list:
+    """Run rows for a prompt (optionally one version) as dicts, newest first."""
     if _get_db() is None:
         return []
+    # Join through versions to prompts so callers filter by name, not ids.
     query = (
         RunRecord.select(
             RunRecord.id,

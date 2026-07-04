@@ -1,3 +1,5 @@
+"""Shared pytest fixtures: every test runs against an isolated, fresh DB."""
+
 import pytest
 
 import prompt_manager
