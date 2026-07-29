@@ -554,6 +554,37 @@ def write_batch(rows: list) -> None:
 
 # --- reads (raise on real errors) ---------------------------------------------
 
+# The run/turn projection, defined once. Every run-shaped read selects these
+# same columns and differs only in joins/filters/order; listing them per
+# function meant a new `runs` column had to be threaded into three places by
+# hand. Reusing aliased column objects across queries is safe — building a
+# query never mutates them. history._run_info_from_row reads results by key,
+# so column order here is irrelevant to callers.
+_RUN_COLUMNS = (
+    RunRecord.id,
+    PromptRecord.name.alias("prompt_name"),
+    PromptVersionRecord.version.alias("version"),
+    RunRecord.variables,
+    RunRecord.rendered_text,
+    RunRecord.provider,
+    RunRecord.model,
+    RunRecord.request_params,
+    RunRecord.response_id,
+    RunRecord.output_text,
+    RunRecord.prompt_tokens,
+    RunRecord.completion_tokens,
+    RunRecord.total_tokens,
+    RunRecord.latency_ms,
+    RunRecord.status,
+    RunRecord.error,
+    RunRecord.created_at,
+    RunRecord.turn_index,
+    RunRecord.input_text,
+)
+# Appended only where the caller filters across conversations and needs to
+# know which one each run belongs to (fetch_conversation_turns already knows).
+_CONVERSATION_ID_COLUMN = ConversationRecord.external_id.alias("conversation_id")
+
 
 def fetch_versions(name: str) -> list:
     """All version rows for a prompt name as dicts, oldest first."""
@@ -582,28 +613,7 @@ def fetch_runs(name: str, version: Optional[int] = None, limit: int = 50) -> lis
         return []
     # Join through versions to prompts so callers filter by name, not ids.
     query = (
-        RunRecord.select(
-            RunRecord.id,
-            PromptRecord.name.alias("prompt_name"),
-            PromptVersionRecord.version.alias("version"),
-            RunRecord.variables,
-            RunRecord.rendered_text,
-            RunRecord.provider,
-            RunRecord.model,
-            RunRecord.request_params,
-            RunRecord.response_id,
-            RunRecord.output_text,
-            RunRecord.prompt_tokens,
-            RunRecord.completion_tokens,
-            RunRecord.total_tokens,
-            RunRecord.latency_ms,
-            RunRecord.status,
-            RunRecord.error,
-            RunRecord.created_at,
-            RunRecord.turn_index,
-            RunRecord.input_text,
-            ConversationRecord.external_id.alias("conversation_id"),
-        )
+        RunRecord.select(*_RUN_COLUMNS, _CONVERSATION_ID_COLUMN)
         .join(PromptVersionRecord)
         .join(PromptRecord)
         .switch(RunRecord)
@@ -626,28 +636,7 @@ def fetch_all_runs(limit: int = 100) -> list:
     if _get_db() is None:
         return []
     query = (
-        RunRecord.select(
-            RunRecord.id,
-            PromptRecord.name.alias("prompt_name"),
-            PromptVersionRecord.version.alias("version"),
-            RunRecord.variables,
-            RunRecord.rendered_text,
-            RunRecord.provider,
-            RunRecord.model,
-            RunRecord.request_params,
-            RunRecord.response_id,
-            RunRecord.output_text,
-            RunRecord.prompt_tokens,
-            RunRecord.completion_tokens,
-            RunRecord.total_tokens,
-            RunRecord.latency_ms,
-            RunRecord.status,
-            RunRecord.error,
-            RunRecord.created_at,
-            RunRecord.turn_index,
-            RunRecord.input_text,
-            ConversationRecord.external_id.alias("conversation_id"),
-        )
+        RunRecord.select(*_RUN_COLUMNS, _CONVERSATION_ID_COLUMN)
         .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
         .join(PromptRecord, pw.JOIN.LEFT_OUTER)
         .switch(RunRecord)
@@ -725,28 +714,9 @@ def fetch_conversation_turns(external_id: str) -> list:
     """
     if _get_db() is None:
         return []
+    # No conversation_id column: the caller already knows which conversation.
     query = (
-        RunRecord.select(
-            RunRecord.id,
-            PromptRecord.name.alias("prompt_name"),
-            PromptVersionRecord.version.alias("version"),
-            RunRecord.turn_index,
-            RunRecord.input_text,
-            RunRecord.variables,
-            RunRecord.rendered_text,
-            RunRecord.provider,
-            RunRecord.model,
-            RunRecord.request_params,
-            RunRecord.response_id,
-            RunRecord.output_text,
-            RunRecord.prompt_tokens,
-            RunRecord.completion_tokens,
-            RunRecord.total_tokens,
-            RunRecord.latency_ms,
-            RunRecord.status,
-            RunRecord.error,
-            RunRecord.created_at,
-        )
+        RunRecord.select(*_RUN_COLUMNS)
         .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
         .join(PromptRecord, pw.JOIN.LEFT_OUTER)
         .switch(RunRecord)
