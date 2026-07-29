@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} · promptkeep{% endblock %}
+{% block content %}
+<div class="crumb"><a href="/prompts">← Prompts</a></div>
+<div class="page-head">
+  <h1>{{ name }}</h1>
+  <div class="sub">{{ versions|length }} version{{ 's' if versions|length != 1 }} · <a href="/runs?prompt={{ name }}">view runs →</a></div>
+</div>
+
+{% if versions|length > 1 %}
+<form class="inline" action="/prompts/{{ name }}/diff" method="get">
+  <span class="muted">Diff</span>
+  <select name="old">
+    {% for v in versions %}<option value="{{ v.version }}">v{{ v.version }}</option>{% endfor %}
+  </select>
+  <span class="muted">vs</span>
+  <select name="new">
+    {% for v in versions %}<option value="{{ v.version }}" {% if loop.last %}selected{% endif %}>v{{ v.version }}</option>{% endfor %}
+  </select>
+  <button type="submit">Compare</button>
+</form>
+{% endif %}
+
+<div class="card">
+<table>
+<thead><tr><th>Version</th><th>Template</th><th>Source</th><th>Created</th></tr></thead>
+<tbody>
+{% for v in versions|reverse %}
+<tr>
+  <td><span class="badge">v{{ v.version }}</span></td>
+  <td class="mono">{{ v.template }}</td>
+  <td class="muted">{{ v.source }}</td>
+  <td class="muted mono">{{ v.created_at[:19] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endblock %}
