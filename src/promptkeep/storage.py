@@ -37,6 +37,16 @@ _current_path: Optional[str] = None
 _registration_cache: dict = {}
 _reg_lock = threading.Lock()
 
+# Conversations memoized per (db, external_id) the same way, and turn numbers
+# handed out from in-process counters per (db, conversation_id): the DB's
+# MAX(turn_index) goes stale the moment rows sit in the background write
+# queue, so within a process the counter is the source of truth. (Two
+# *processes* driving one conversation concurrently can still race — same
+# caveat as before, now confined to the cross-process case.)
+_conversation_cache: dict = {}
+_turn_counters: dict = {}
+_convo_lock = threading.Lock()
+
 # WAL for concurrent reader/writer access; busy_timeout so contending
 # writers wait instead of failing instantly.
 _PRAGMAS = {
@@ -258,10 +268,17 @@ def _migrate(database: pw.SqliteDatabase) -> None:
 
 
 def reset_caches() -> None:
-    """Drop memoized registrations and close the DB binding. Mainly for tests."""
+    """Drop memoized registrations, conversation/turn caches, anything still
+    queued in the background writer, and the DB binding. Mainly for tests."""
     global _current_path
+    from . import writer
+
+    writer.reset()
     with _reg_lock:
         _registration_cache.clear()
+    with _convo_lock:
+        _conversation_cache.clear()
+        _turn_counters.clear()
     with _db_lock:
         if _current_path is not None:
             try:
@@ -371,9 +388,21 @@ def get_or_create_conversation(
     """Idempotently resolve a conversation by its caller-supplied id.
 
     Creates the row on first sight (the "never break the caller" rule
-    extends to conversations: an unrecognized id is not an error). Returns
-    None when tracking is disabled or the write fails.
+    extends to conversations: an unrecognized id is not an error) and
+    memoizes the result, so a long conversation costs one DB round-trip,
+    not one per turn. Returns None when tracking is disabled or the write
+    fails.
     """
+    from .config import get_settings
+
+    settings = get_settings()
+    if not settings.enabled:
+        return None
+    cache_key = (str(settings.db_path), external_id)
+    with _convo_lock:
+        cached = _conversation_cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         if _get_db() is None:
             return None
@@ -387,26 +416,37 @@ def get_or_create_conversation(
                 "updated_at": now,
             },
         )
+        with _convo_lock:
+            _conversation_cache[cache_key] = row.id
         return row.id
     except Exception:
         logger.warning("promptkeep: failed to resolve conversation %r", external_id, exc_info=True)
         return None
 
 
-def next_turn_index(conversation_id: int) -> int:
-    """This conversation's next turn number (0 if it has none yet).
+def reserve_turn_index(conversation_id: int) -> int:
+    """Claim this conversation's next turn number (0 for its first turn).
 
-    Not race-protected like version numbering: a conversation is normally
-    driven by one caller working through it sequentially, so an occasional
-    lost race under heavy concurrent use costs ordering precision, not
-    correctness — created_at still sorts turns correctly if that happens.
+    Backed by an in-process counter seeded from the DB on first use: the
+    DB's MAX(turn_index) can't be trusted directly while rows sit in the
+    background write queue, and the counter also closes the read-then-write
+    race two threads had in sync mode. Each call *reserves* — calling twice
+    claims two turns.
     """
-    max_turn = (
-        RunRecord.select(pw.fn.MAX(RunRecord.turn_index))
-        .where(RunRecord.conversation == conversation_id)
-        .scalar()
-    )
-    return 0 if max_turn is None else max_turn + 1
+    from .config import get_settings
+
+    key = (str(get_settings().db_path), conversation_id)
+    with _convo_lock:
+        current = _turn_counters.get(key)
+        if current is None:
+            max_turn = (
+                RunRecord.select(pw.fn.MAX(RunRecord.turn_index))
+                .where(RunRecord.conversation == conversation_id)
+                .scalar()
+            )
+            current = 0 if max_turn is None else max_turn + 1
+        _turn_counters[key] = current + 1
+        return current
 
 
 def record_run(
@@ -429,7 +469,12 @@ def record_run(
     turn_index: Optional[int] = None,
     input_text: Optional[str] = None,
 ) -> None:
-    """Insert one run row. Shielded: never raises.
+    """Record one run row, honoring the configured write_mode. Never raises.
+
+    "sync" inserts before returning; "background" builds the complete row
+    (timestamps and turn number included — they must reflect *call* time,
+    not whenever the writer thread gets to it) and hands it to the writer
+    queue; "off" drops it. Version registration is unaffected by the mode.
 
     version_id is optional: a conversation turn with no wrapped Prompt still
     gets a row (there's simply nothing to attach to a lineage). At least one
@@ -438,44 +483,73 @@ def record_run(
     here, since failing loudly would violate the shielding this function
     exists to provide.
 
-    turn_index is normally left unset and auto-computed here. Callers that
-    write more than one row for the same physical API call (a message with
-    more than one tracked Prompt in it) should reserve one turn_index via
-    next_turn_index() up front and pass it to every row from that call —
+    turn_index is normally left unset and reserved here. Callers that write
+    more than one row for the same physical API call (a message with more
+    than one tracked Prompt in it) should reserve one via
+    reserve_turn_index() up front and pass it to every row from that call —
     otherwise each row would claim its own turn, splitting one exchange into
     several.
     """
     try:
-        if _get_db() is None:
+        from .config import get_settings
+
+        settings = get_settings()
+        if not settings.enabled or settings.write_mode == "off":
             return
         if turn_index is None and conversation_id is not None:
-            turn_index = next_turn_index(conversation_id)
-        RunRecord.create(
-            version=version_id,
-            variables=_json_or_none(variables),
-            rendered_text=rendered_text,
-            provider=provider,
-            model=model,
-            request_params=_json_or_none(request_params),
-            response_id=response_id,
-            output_text=output_text,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            latency_ms=latency_ms,
-            status=status,
-            error=error,
-            created_at=_utcnow(),
-            conversation=conversation_id,
-            turn_index=turn_index,
-            input_text=input_text,
-        )
-        if conversation_id is not None:
-            ConversationRecord.update(updated_at=_utcnow()).where(
-                ConversationRecord.id == conversation_id
-            ).execute()
+            turn_index = reserve_turn_index(conversation_id)
+        row = {
+            "version": version_id,
+            "variables": _json_or_none(variables),
+            "rendered_text": rendered_text,
+            "provider": provider,
+            "model": model,
+            "request_params": _json_or_none(request_params),
+            "response_id": response_id,
+            "output_text": output_text,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "latency_ms": latency_ms,
+            "status": status,
+            "error": error,
+            "created_at": _utcnow(),
+            "conversation": conversation_id,
+            "turn_index": turn_index,
+            "input_text": input_text,
+        }
+        if settings.write_mode == "background":
+            from . import writer
+
+            writer.submit(row)
+            return
+        if _get_db() is None:
+            return
+        _insert_row(row)
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
+
+
+def _insert_row(row: dict) -> None:
+    """Insert one prepared run row and touch its conversation's updated_at."""
+    RunRecord.create(**row)
+    if row.get("conversation") is not None:
+        ConversationRecord.update(updated_at=_utcnow()).where(
+            ConversationRecord.id == row["conversation"]
+        ).execute()
+
+
+def write_batch(rows: list) -> None:
+    """Persist queued rows in one transaction (called from the writer thread).
+
+    Raises on failure — the writer shields and logs, keeping the whole batch
+    as the unit of loss rather than half-writing it.
+    """
+    if not rows or _get_db() is None:
+        return
+    with _proxy.atomic():
+        for row in rows:
+            _insert_row(row)
 
 
 # --- reads (raise on real errors) ---------------------------------------------

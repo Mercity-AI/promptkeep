@@ -12,6 +12,7 @@ from .decorator import prompt
 from .integrations import wrap
 from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
+from .writer import flush
 
 __version__ = "0.1.0"
 
@@ -24,6 +25,7 @@ __all__ = [
     "get_settings",
     "history",
     "conversation",
+    "flush",
     "extract_placeholders",
     "MissingVariableError",
     "TemplateParseError",

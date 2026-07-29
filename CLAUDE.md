@@ -44,8 +44,16 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 - **Version registration is lazy** — first `.text`/`.render()`/`.version` access, never at
   construction. Prompts are defined at module import time; import must not do I/O.
 - **All implicit write paths are exception-shielded** (`storage.register_version`,
-  `storage.record_run`, `tracking`): a broken DB logs a warning and loses telemetry, it must
-  never raise into the user's request. History reads raise normally.
+  `storage.record_run`, `tracking`, `writer`): a broken DB logs a warning and loses telemetry,
+  it must never raise into the user's request. History reads raise normally.
+- **Run writes are asynchronous by default** (`write_mode="background"`): `record_run` builds
+  the complete row (timestamps/turn numbers reflect call time) and hands it to `writer.py` —
+  a bounded queue drained by one lazy-started daemon thread that batches rows per transaction.
+  Overflow drops oldest and counts; `promptkeep.flush()` + an atexit hook drain it. Version
+  registration stays synchronous (`.version` is a read-back value). Turn numbers come from
+  in-process counters (`storage.reserve_turn_index`, reserve semantics — calling it claims the
+  turn), because the DB's `MAX(turn_index)` is stale while rows sit in the queue. Tests run
+  `write_mode="sync"` via the conftest fixture.
 - **The wrapper never monkey-patches the `openai` module** — only the object passed to
   `wrap()` gets its `create` replaced (idempotent via `_pm_instrumented`). Message dicts are
   copied, never mutated. Streaming defers run recording until the stream ends

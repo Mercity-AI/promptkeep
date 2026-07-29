@@ -25,14 +25,26 @@ class TestConversationStorage:
         """Reading a conversation that was never created returns None, not an error."""
         assert storage.fetch_conversation("nope") is None
 
-    def test_turn_index_increments_per_conversation(self):
-        """Each recorded run advances that conversation's next turn number."""
+    def test_turn_indexes_are_sequential(self):
+        """reserve_turn_index claims a turn per call, and record_run without
+        an explicit turn_index claims its own — no number is ever reused."""
         cid = storage.get_or_create_conversation("sess-2")
-        assert storage.next_turn_index(cid) == 0
-        storage.record_run(provider="openai", conversation_id=cid, input_text="hi")
-        assert storage.next_turn_index(cid) == 1
-        storage.record_run(provider="openai", conversation_id=cid, input_text="again")
-        assert storage.next_turn_index(cid) == 2
+        assert storage.reserve_turn_index(cid) == 0  # claims 0
+        storage.record_run(provider="openai", conversation_id=cid, input_text="hi")  # claims 1
+        storage.record_run(provider="openai", conversation_id=cid, input_text="again")  # claims 2
+        assert storage.reserve_turn_index(cid) == 3
+
+    def test_turn_counter_reseeds_from_db_in_new_process(self, isolated_db):
+        """A fresh process (caches dropped, same DB file) continues the
+        sequence from what's on disk instead of restarting at 0."""
+        cid = storage.get_or_create_conversation("sess-reseed")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="t0")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="t1")
+        storage.reset_caches()
+        promptkeep.configure(db_path=isolated_db)
+        cid2 = storage.get_or_create_conversation("sess-reseed")
+        assert cid2 == cid
+        assert storage.reserve_turn_index(cid2) == 2
 
     def test_run_without_prompt_has_no_version(self):
         """A conversation turn with no wrapped Prompt still gets a row."""

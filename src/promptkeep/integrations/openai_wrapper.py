@@ -206,7 +206,7 @@ def _prepare_conversation(
         conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
         if conversation_id is None:
             return None, None, None
-        turn_index = storage.next_turn_index(conversation_id)
+        turn_index = storage.reserve_turn_index(conversation_id)
         return conversation_id, turn_index, _extract_input_text(messages)
     except Exception:
         logger.warning("promptkeep: failed to prepare conversation %r", external_id, exc_info=True)
