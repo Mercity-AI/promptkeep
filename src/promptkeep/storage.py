@@ -25,7 +25,7 @@ import peewee as pw
 
 logger = logging.getLogger("promptkeep")
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
@@ -86,12 +86,33 @@ class PromptVersionRecord(BaseModel):
         )
 
 
-class RunRecord(BaseModel):
-    """One execution of a prompt version: variables in, model output back."""
+class ConversationRecord(BaseModel):
+    """One multi-turn session; its runs are the ordered turns within it."""
 
-    version = pw.ForeignKeyField(PromptVersionRecord, column_name="version_id", backref="runs")
+    external_id = pw.TextField(unique=True)
+    title = pw.TextField(null=True)
+    metadata = pw.TextField(null=True)
+    created_at = pw.TextField()
+    updated_at = pw.TextField()
+
+    class Meta:
+        table_name = "conversations"
+
+
+class RunRecord(BaseModel):
+    """One execution: a tracked prompt version and/or a conversation turn.
+
+    version is nullable because a conversation turn need not involve a
+    wrapped Prompt (a plain follow-up message still gets a row so the whole
+    session can be replayed); a run with neither a version nor a
+    conversation is never created.
+    """
+
+    version = pw.ForeignKeyField(
+        PromptVersionRecord, column_name="version_id", backref="runs", null=True
+    )
     variables = pw.TextField(null=True)
-    rendered_text = pw.TextField()
+    rendered_text = pw.TextField(null=True)
     provider = pw.TextField()
     model = pw.TextField(null=True)
     request_params = pw.TextField(null=True)
@@ -104,13 +125,21 @@ class RunRecord(BaseModel):
     status = pw.TextField()
     error = pw.TextField(null=True)
     created_at = pw.TextField()
+    conversation = pw.ForeignKeyField(
+        ConversationRecord, column_name="conversation_id", backref="runs", null=True
+    )
+    turn_index = pw.IntegerField(null=True)
+    input_text = pw.TextField(null=True)
 
     class Meta:
         table_name = "runs"
-        indexes = ((("version", "created_at"), False),)
+        indexes = (
+            (("version", "created_at"), False),
+            (("conversation", "turn_index"), False),
+        )
 
 
-_MODELS = [PromptRecord, PromptVersionRecord, RunRecord]
+_MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord]
 
 
 # --- helpers -------------------------------------------------------------------
@@ -178,11 +207,20 @@ def _get_db() -> Optional[pw.DatabaseProxy]:
 
 
 def _migrate(database: pw.SqliteDatabase) -> None:
-    """Apply forward-only schema steps until the DB reaches _SCHEMA_VERSION."""
+    """Apply forward-only schema steps until the DB reaches _SCHEMA_VERSION.
+
+    Each step advances a local `user_version` so steps compose regardless of
+    which version a real DB starts at (e.g. 1 -> 3 must run both the v2 and
+    v3 steps). A brand-new DB is created straight from `_MODELS` at the
+    latest shape, so it's marked done immediately rather than re-running
+    legacy fix-up steps meant for pre-existing rows.
+    """
     (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
+    started_at = user_version
     if user_version < 1:
         database.create_tables(_MODELS, safe=True)
-    if 1 <= user_version < 2:
+        user_version = _SCHEMA_VERSION
+    if user_version < 2:
         # v2: template_hash became a hash of the *normalized* template
         # (variable names canonicalized). Recompute stored hashes so old
         # rows keep deduping correctly against new registrations.
@@ -197,8 +235,25 @@ def _migrate(database: pw.SqliteDatabase) -> None:
                     # Two old versions differing only in variable names now
                     # collide; keep the older row normalized, leave this one.
                     pass
-    # Future steps: `if user_version < 3:` apply playhouse.migrate operations.
-    if user_version < _SCHEMA_VERSION:
+        user_version = 2
+    if user_version < 3:
+        # v3: conversations. runs.version_id/rendered_text drop NOT NULL
+        # because a conversation turn with no wrapped Prompt still gets a
+        # row (it has no version to attach to), and the new columns link a
+        # run to its conversation and turn position.
+        from playhouse.migrate import SqliteMigrator, migrate
+
+        database.create_tables([ConversationRecord], safe=True)
+        migrator = SqliteMigrator(database)
+        migrate(
+            migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
+            migrator.add_column("runs", "turn_index", pw.IntegerField(null=True)),
+            migrator.add_column("runs", "input_text", pw.TextField(null=True)),
+            migrator.drop_not_null("runs", "version_id"),
+            migrator.drop_not_null("runs", "rendered_text"),
+        )
+        user_version = 3
+    if started_at < _SCHEMA_VERSION:
         database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
@@ -308,11 +363,57 @@ def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int
     raise RuntimeError(f"could not register a version for prompt {name!r} after retries")
 
 
+def get_or_create_conversation(
+    external_id: str,
+    title: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> Optional[int]:
+    """Idempotently resolve a conversation by its caller-supplied id.
+
+    Creates the row on first sight (the "never break the caller" rule
+    extends to conversations: an unrecognized id is not an error). Returns
+    None when tracking is disabled or the write fails.
+    """
+    try:
+        if _get_db() is None:
+            return None
+        now = _utcnow()
+        row, _created = ConversationRecord.get_or_create(
+            external_id=external_id,
+            defaults={
+                "title": title,
+                "metadata": _json_or_none(metadata),
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        return row.id
+    except Exception:
+        logger.warning("promptkeep: failed to resolve conversation %r", external_id, exc_info=True)
+        return None
+
+
+def next_turn_index(conversation_id: int) -> int:
+    """This conversation's next turn number (0 if it has none yet).
+
+    Not race-protected like version numbering: a conversation is normally
+    driven by one caller working through it sequentially, so an occasional
+    lost race under heavy concurrent use costs ordering precision, not
+    correctness — created_at still sorts turns correctly if that happens.
+    """
+    max_turn = (
+        RunRecord.select(pw.fn.MAX(RunRecord.turn_index))
+        .where(RunRecord.conversation == conversation_id)
+        .scalar()
+    )
+    return 0 if max_turn is None else max_turn + 1
+
+
 def record_run(
     *,
-    version_id: int,
-    variables: Optional[dict],
-    rendered_text: str,
+    version_id: Optional[int] = None,
+    variables: Optional[dict] = None,
+    rendered_text: Optional[str] = None,
     provider: str,
     model: Optional[str] = None,
     request_params: Optional[dict] = None,
@@ -324,11 +425,31 @@ def record_run(
     latency_ms: Optional[int] = None,
     status: str = "ok",
     error: Optional[str] = None,
+    conversation_id: Optional[int] = None,
+    turn_index: Optional[int] = None,
+    input_text: Optional[str] = None,
 ) -> None:
-    """Insert one run row for a prompt version. Shielded: never raises."""
+    """Insert one run row. Shielded: never raises.
+
+    version_id is optional: a conversation turn with no wrapped Prompt still
+    gets a row (there's simply nothing to attach to a lineage). At least one
+    of version_id / conversation_id should be set by the caller — a run tied
+    to neither is pointless — but that's a caller contract, not enforced
+    here, since failing loudly would violate the shielding this function
+    exists to provide.
+
+    turn_index is normally left unset and auto-computed here. Callers that
+    write more than one row for the same physical API call (a message with
+    more than one tracked Prompt in it) should reserve one turn_index via
+    next_turn_index() up front and pass it to every row from that call —
+    otherwise each row would claim its own turn, splitting one exchange into
+    several.
+    """
     try:
         if _get_db() is None:
             return
+        if turn_index is None and conversation_id is not None:
+            turn_index = next_turn_index(conversation_id)
         RunRecord.create(
             version=version_id,
             variables=_json_or_none(variables),
@@ -345,7 +466,14 @@ def record_run(
             status=status,
             error=error,
             created_at=_utcnow(),
+            conversation=conversation_id,
+            turn_index=turn_index,
+            input_text=input_text,
         )
+        if conversation_id is not None:
+            ConversationRecord.update(updated_at=_utcnow()).where(
+                ConversationRecord.id == conversation_id
+            ).execute()
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
 
@@ -398,12 +526,159 @@ def fetch_runs(name: str, version: Optional[int] = None, limit: int = 50) -> lis
             RunRecord.status,
             RunRecord.error,
             RunRecord.created_at,
+            RunRecord.turn_index,
+            RunRecord.input_text,
+            ConversationRecord.external_id.alias("conversation_id"),
         )
         .join(PromptVersionRecord)
         .join(PromptRecord)
+        .switch(RunRecord)
+        .join(ConversationRecord, pw.JOIN.LEFT_OUTER)
         .where(PromptRecord.name == name)
     )
     if version is not None:
         query = query.where(PromptVersionRecord.version == version)
     query = query.order_by(RunRecord.id.desc()).limit(limit).dicts()
+    return list(query)
+
+
+def fetch_all_runs(limit: int = 100) -> list:
+    """Every run row regardless of prompt (or with none), newest first.
+
+    Left-joined throughout: a conversation-only turn has no version/prompt
+    to join to, and a run outside any conversation has no conversation to
+    join to. Both cases surface as NULLs rather than dropping the row.
+    """
+    if _get_db() is None:
+        return []
+    query = (
+        RunRecord.select(
+            RunRecord.id,
+            PromptRecord.name.alias("prompt_name"),
+            PromptVersionRecord.version.alias("version"),
+            RunRecord.variables,
+            RunRecord.rendered_text,
+            RunRecord.provider,
+            RunRecord.model,
+            RunRecord.request_params,
+            RunRecord.response_id,
+            RunRecord.output_text,
+            RunRecord.prompt_tokens,
+            RunRecord.completion_tokens,
+            RunRecord.total_tokens,
+            RunRecord.latency_ms,
+            RunRecord.status,
+            RunRecord.error,
+            RunRecord.created_at,
+            RunRecord.turn_index,
+            RunRecord.input_text,
+            ConversationRecord.external_id.alias("conversation_id"),
+        )
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(PromptRecord, pw.JOIN.LEFT_OUTER)
+        .switch(RunRecord)
+        .join(ConversationRecord, pw.JOIN.LEFT_OUTER)
+        .order_by(RunRecord.id.desc())
+        .limit(limit)
+        .dicts()
+    )
+    return list(query)
+
+
+def fetch_prompt_summaries() -> list:
+    """One row per prompt with its version and run counts, name-sorted.
+
+    COUNT(DISTINCT ...) is required here: joining both versions and runs off
+    the same prompt fans out into a cross product, so a plain COUNT would
+    double-count whichever side has more rows.
+    """
+    if _get_db() is None:
+        return []
+    query = (
+        PromptRecord.select(
+            PromptRecord.name,
+            PromptRecord.created_at,
+            pw.fn.COUNT(pw.fn.DISTINCT(PromptVersionRecord.id)).alias("version_count"),
+            pw.fn.COUNT(pw.fn.DISTINCT(RunRecord.id)).alias("run_count"),
+        )
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(RunRecord, pw.JOIN.LEFT_OUTER, on=(RunRecord.version == PromptVersionRecord.id))
+        .group_by(PromptRecord.id)
+        .order_by(PromptRecord.name)
+        .dicts()
+    )
+    return list(query)
+
+
+def fetch_conversation_summaries(limit: int = 100) -> list:
+    """One row per conversation with its turn count, most recently active first."""
+    if _get_db() is None:
+        return []
+    query = (
+        ConversationRecord.select(
+            ConversationRecord.external_id,
+            ConversationRecord.title,
+            ConversationRecord.created_at,
+            ConversationRecord.updated_at,
+            pw.fn.COUNT(RunRecord.id).alias("turn_count"),
+        )
+        .join(RunRecord, pw.JOIN.LEFT_OUTER)
+        .group_by(ConversationRecord.id)
+        .order_by(ConversationRecord.updated_at.desc())
+        .limit(limit)
+        .dicts()
+    )
+    return list(query)
+
+
+def fetch_conversation(external_id: str) -> Optional[dict]:
+    """A conversation's own row (not its turns) as a dict, or None if unknown."""
+    if _get_db() is None:
+        return None
+    return (
+        ConversationRecord.select()
+        .where(ConversationRecord.external_id == external_id)
+        .dicts()
+        .first()
+    )
+
+
+def fetch_conversation_turns(external_id: str) -> list:
+    """All turns (runs) of a conversation as dicts, oldest first.
+
+    A turn's version fields are NULL when that turn had no wrapped Prompt —
+    e.g. a plain follow-up message with no system-prompt change.
+    """
+    if _get_db() is None:
+        return []
+    query = (
+        RunRecord.select(
+            RunRecord.id,
+            PromptRecord.name.alias("prompt_name"),
+            PromptVersionRecord.version.alias("version"),
+            RunRecord.turn_index,
+            RunRecord.input_text,
+            RunRecord.variables,
+            RunRecord.rendered_text,
+            RunRecord.provider,
+            RunRecord.model,
+            RunRecord.request_params,
+            RunRecord.response_id,
+            RunRecord.output_text,
+            RunRecord.prompt_tokens,
+            RunRecord.completion_tokens,
+            RunRecord.total_tokens,
+            RunRecord.latency_ms,
+            RunRecord.status,
+            RunRecord.error,
+            RunRecord.created_at,
+        )
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(PromptRecord, pw.JOIN.LEFT_OUTER)
+        .switch(RunRecord)
+        .join(ConversationRecord)
+        .where(ConversationRecord.external_id == external_id)
+        .order_by(RunRecord.turn_index)
+        .dicts()
+    )
     return list(query)
