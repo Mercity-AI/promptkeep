@@ -2,7 +2,10 @@
 
 Prompts as first-class objects: named, versioned templates with lineage tracked in SQLite,
 variable rendering, a decorator for computed prompts, and a transparent OpenAI SDK wrapper
-that records every run (prompt version + variables + output + usage).
+that records every run (prompt version + variables + output + usage). Multi-turn
+conversations are tracked turn by turn, run writes happen off your hot path by default,
+and `promptkeep serve` opens a local dashboard over the whole history — no server, no
+account, one SQLite file you own.
 
 ## The basics
 
@@ -79,6 +82,33 @@ variables used, the rendered text, the model, the output, token usage, and laten
 Streaming, async clients, and multi-part content are supported. Tracking failures never
 break the API call. Unwrapped clients work too — just pass `prompt.text`.
 
+## Conversations
+
+Group calls into a session and promptkeep records the whole thread — every turn gets a
+row, whether or not a `Prompt` was involved, so multi-turn chats can be replayed in full:
+
+```python
+import promptkeep
+
+with promptkeep.conversation("user-42-session-9", user_id=42):
+    client.chat.completions.create(...)   # turn 0
+    client.chat.completions.create(...)   # turn 1
+# async code: `async with` works too
+```
+
+Call sites that can't wrap a block can attach explicitly (it always wins over the
+enclosing block, and is stripped before the request reaches the provider):
+
+```python
+client.chat.completions.create(..., promptkeep_conversation="user-42-session-9")
+```
+
+Each turn stores only what's *new* — the latest user message as `input_text` and the
+model's reply as `output_text`. Earlier turns are earlier rows, and the system prompt is
+already covered by version lineage, so nothing is duplicated as history grows. Which
+prompt version drove each turn is recorded inline — so "which version was live at turn 6
+of this session?" is a lookup, not an investigation.
+
 ## History
 
 ```python
@@ -87,7 +117,47 @@ from promptkeep import history
 history.versions("REVIEW_SYSTEM")            # lineage, oldest first
 print(history.diff("REVIEW_SYSTEM", 1, 3))   # unified diff between versions
 history.runs("REVIEW_SYSTEM", version=3)     # recorded runs, newest first
+
+convo = history.conversation("user-42-session-9")
+convo.turns                                  # ordered turns: input, output, version, usage
+convo.metadata                               # whatever you attached at the start
+
+history.list_prompts()                       # every prompt + version/run counts
+history.list_conversations()                 # every session + turn counts
+history.all_runs()                           # everything, newest first
 ```
+
+## Local dashboard
+
+```bash
+pip install "promptkeep[serve]"
+promptkeep serve                 # http://127.0.0.1:8420, reads ./.promptkeep.db
+promptkeep serve --db path/to/prompts.db --port 8420
+```
+
+A read-only web UI over the same SQLite file: every prompt with its full version lineage
+and colored diffs between any two versions, a filterable runs explorer, and turn-by-turn
+conversation transcripts with the driving prompt version shown inline. Works fully
+offline — no CDN assets, no account, light/dark theme automatic. The server dependencies
+(FastAPI, uvicorn, Jinja2) are an optional extra; the core library never needs them.
+
+## Background writes
+
+By default run rows are persisted **off your hot path**: the wrapped call returns
+immediately and a background thread batches writes into the DB. Version registration
+stays synchronous (`.version` is a value you read back), and a full queue drops oldest
+rather than growing unbounded — telemetry must never take your app down with it.
+
+The one visible consequence: a row may land a moment after the call returns. Scripts and
+notebooks that read their own writes immediately should either flush or switch modes:
+
+```python
+promptkeep.flush(timeout=5)                   # block until everything queued is on disk
+promptkeep.configure(write_mode="sync")       # or: write before the call returns
+```
+
+An `atexit` hook flushes automatically on interpreter shutdown, so short-lived scripts
+don't lose rows. `write_mode="off"` drops run telemetry entirely (versioning still works).
 
 ## Configuration
 
@@ -98,6 +168,10 @@ promptkeep.configure(
     db_path="path/to/prompts.db",   # default: ./.promptkeep.db (or $PROMPTKEEP_DB)
     enabled=True,                   # $PROMPTKEEP_DISABLED=1 turns tracking off
     strict=False,                   # raise on missing variables
+    write_mode="background",        # "background" | "sync" | "off" ($PROMPTKEEP_WRITE_MODE)
+    queue_size=10_000,              # background queue bound (drop-oldest when full)
+    flush_interval=0.5,             # seconds the writer waits before a partial batch
+    batch_size=100,                 # max rows per write transaction
 )
 ```
 
