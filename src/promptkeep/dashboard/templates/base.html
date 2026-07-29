@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}promptkeep{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --surface: #ffffff;
+    --surface-hover: #f4f4f8;
+    --border: #e4e4e9;
+    --border-soft: #ededf1;
+    --text: #1c1c21;
+    --text-secondary: #55555e;
+    --text-muted: #8a8a94;
+    --accent: #5558d9;
+    --accent-strong: #4345c4;
+    --accent-bg: #eeeefc;
+    --ok: #157a4c;
+    --ok-bg: #e5f5ec;
+    --danger: #c2333b;
+    --danger-bg: #fdeced;
+    --add-bg: #e9f7ef;
+    --add-text: #127044;
+    --del-bg: #fdeef0;
+    --del-text: #b02a33;
+    --shadow: 0 1px 2px rgba(20, 20, 30, .05), 0 1px 1px rgba(20, 20, 30, .03);
+    --mono: ui-monospace, "Cascadia Code", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131316;
+      --surface: #1c1c21;
+      --surface-hover: #232329;
+      --border: #2e2e36;
+      --border-soft: #26262d;
+      --text: #ececf1;
+      --text-secondary: #b4b4bd;
+      --text-muted: #7e7e88;
+      --accent: #8587f0;
+      --accent-strong: #9fa1f5;
+      --accent-bg: #26264a;
+      --ok: #4cc38a;
+      --ok-bg: #17301f;
+      --danger: #f07178;
+      --danger-bg: #3a1d1f;
+      --add-bg: #142e1f;
+      --add-text: #5fd39a;
+      --del-bg: #391e21;
+      --del-text: #f28b90;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: var(--sans); color: var(--text); background: var(--bg);
+    font-size: 14px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 28px;
+    padding: 0 28px; height: 52px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 9px;
+    font-weight: 600; font-size: 14.5px; letter-spacing: -.01em; color: var(--text);
+    text-decoration: none;
+  }
+  .brand:hover { text-decoration: none; }
+  .brand .mark {
+    display: grid; place-items: center;
+    width: 22px; height: 22px; border-radius: 6px;
+    background: var(--accent); flex: none;
+  }
+  .brand .mark svg { display: block; }
+  header nav { display: flex; gap: 4px; height: 100%; }
+  header nav a {
+    display: flex; align-items: center; padding: 0 12px;
+    color: var(--text-muted); text-decoration: none; font-weight: 500;
+    border-bottom: 2px solid transparent; border-top: 2px solid transparent;
+    transition: color .12s;
+  }
+  header nav a:hover { color: var(--text); text-decoration: none; }
+  header nav a.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { max-width: 1060px; margin: 0 auto; padding: 32px 28px 64px; }
+  h1 { font-size: 21px; font-weight: 600; letter-spacing: -.015em; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 32px 0 10px; }
+  .page-head { margin-bottom: 20px; }
+  .page-head .sub { color: var(--text-muted); font-size: 13px; }
+  .crumb { margin-bottom: 14px; font-size: 13px; }
+  .crumb a { color: var(--text-muted); }
+  .crumb a:hover { color: var(--accent); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 2px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 14px; vertical-align: top; }
+  th {
+    color: var(--text-muted); font-weight: 500; font-size: 11.5px;
+    text-transform: uppercase; letter-spacing: .05em;
+    border-bottom: 1px solid var(--border); background: var(--surface);
+    white-space: nowrap;
+  }
+  td { border-bottom: 1px solid var(--border-soft); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr { transition: background .08s; }
+  tbody tr:hover { background: var(--surface-hover); }
+  td a { font-weight: 500; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--text-muted); }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 1px 9px 1px 7px; border-radius: 99px;
+    font-size: 11.5px; font-weight: 500; letter-spacing: .02em;
+    background: var(--ok-bg); color: var(--ok);
+  }
+  .pill::before {
+    content: ""; width: 5px; height: 5px; border-radius: 50%;
+    background: currentColor; flex: none;
+  }
+  .pill.status-error { background: var(--danger-bg); color: var(--danger); }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 5px;
+    background: var(--accent-bg); color: var(--accent-strong);
+    font-family: var(--mono); font-size: 11.5px; font-weight: 500;
+  }
+  .empty {
+    color: var(--text-muted); padding: 48px 24px; text-align: center;
+    background: var(--surface); border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+  pre.diff {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 6px 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7; margin: 0;
+  }
+  .diff span, .diff .ctx { display: block; padding: 0 16px; }
+  .diff .add { background: var(--add-bg); color: var(--add-text); }
+  .diff .del { background: var(--del-bg); color: var(--del-text); }
+  form.inline { display: flex; gap: 8px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }
+  select, input[type=number] {
+    font: inherit; font-size: 13px; color: var(--text);
+    padding: 5px 10px; border: 1px solid var(--border); border-radius: 7px;
+    background: var(--surface);
+  }
+  select:focus, input:focus, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent);
+  }
+  button {
+    font: inherit; font-size: 13px; font-weight: 500;
+    padding: 5px 14px; border: 1px solid var(--accent-strong); border-radius: 7px;
+    background: var(--accent); color: #fff; cursor: pointer;
+    transition: background .12s;
+  }
+  button:hover { background: var(--accent-strong); }
+  .turn {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: var(--shadow);
+    padding: 14px 18px; margin-bottom: 14px;
+  }
+  .turn .meta {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    color: var(--text-muted); font-size: 12.5px;
+    padding-bottom: 10px; margin-bottom: 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .turn .meta .sep { color: var(--border); }
+  .turn .field { margin: 12px 0 2px; white-space: pre-wrap; color: var(--text-secondary); }
+  .turn .field.input {
+    border-left: 3px solid var(--accent);
+    padding: 6px 0 6px 12px; color: var(--text);
+  }
+  .turn .label {
+    color: var(--text-muted); font-size: 10.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .07em; margin-bottom: 3px;
+  }
+  .turn-no {
+    font-family: var(--mono); font-weight: 600; font-size: 12px;
+    color: var(--accent-strong); background: var(--accent-bg);
+    padding: 1px 8px; border-radius: 5px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/prompts">
+    <span class="mark">
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+        <path d="M2 2.5h8M2 6h8M2 9.5h5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </span>
+    promptkeep
+  </a>
+  <nav>
+    <a href="/prompts" class="{{ 'active' if active == 'prompts' else '' }}">Prompts</a>
+    <a href="/runs" class="{{ 'active' if active == 'runs' else '' }}">Runs</a>
+    <a href="/conversations" class="{{ 'active' if active == 'conversations' else '' }}">Conversations</a>
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

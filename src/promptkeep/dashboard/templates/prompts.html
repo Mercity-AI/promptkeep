@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Prompts · promptkeep{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Prompts</h1>
+  <div class="sub">Every tracked prompt and its version lineage</div>
+</div>
+{% if prompts %}
+<div class="card">
+<table>
+<thead><tr><th>Name</th><th>Versions</th><th>Runs</th><th>Created</th></tr></thead>
+<tbody>
+{% for p in prompts %}
+<tr>
+  <td><a href="/prompts/{{ p.name }}">{{ p.name }}</a></td>
+  <td class="num">{{ p.version_count }}</td>
+  <td class="num">{{ p.run_count }}</td>
+  <td class="muted mono">{{ p.created_at[:19] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No prompts recorded yet.</p>
+{% endif %}
+{% endblock %}

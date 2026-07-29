@@ -1,6 +1,9 @@
 """Tests for the storage layer: lineage semantics, concurrency, run recording."""
 
+import sqlite3
 import threading
+
+import peewee as pw
 
 import promptkeep
 from promptkeep import Prompt, history
@@ -159,3 +162,76 @@ class TestRunRecording:
         monkeypatch.setattr(storage, "record_run", boom)
         # must not raise
         tracking.record_prompt_run(p, {}, "hi", provider="openai")
+
+
+class TestSchemaMigration:
+    """Upgrading a real pre-conversations (schema v2) database file."""
+
+    def _build_v2_database(self, path):
+        """Hand-build the exact table shapes schema v2 left behind, with one
+        legacy row in each table — promptkeep hasn't touched this file yet
+        (configure() is lazy), so this simulates a genuine existing DB."""
+        raw = pw.SqliteDatabase(str(path), pragmas={"journal_mode": "wal", "foreign_keys": 1})
+        raw.connect()
+        raw.execute_sql(
+            "CREATE TABLE prompts (id INTEGER PRIMARY KEY, name TEXT UNIQUE, created_at TEXT)"
+        )
+        raw.execute_sql(
+            "CREATE TABLE prompt_versions (id INTEGER PRIMARY KEY, prompt_id INTEGER, "
+            "version INTEGER, template TEXT, template_hash TEXT, source TEXT, "
+            "fn_source_hash TEXT, created_at TEXT)"
+        )
+        raw.execute_sql(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL, "
+            "variables TEXT, rendered_text TEXT NOT NULL, provider TEXT, model TEXT, "
+            "request_params TEXT, response_id TEXT, output_text TEXT, prompt_tokens INTEGER, "
+            "completion_tokens INTEGER, total_tokens INTEGER, latency_ms INTEGER, status TEXT, "
+            "error TEXT, created_at TEXT)"
+        )
+        raw.execute_sql(
+            "INSERT INTO prompts (id, name, created_at) VALUES (1, 'OLD', '2020-01-01')"
+        )
+        raw.execute_sql(
+            "INSERT INTO prompt_versions (id, prompt_id, version, template, template_hash, "
+            "source, created_at) VALUES (1, 1, 1, 'hi {v0}', 'abc', 'literal', '2020-01-01')"
+        )
+        raw.execute_sql(
+            "INSERT INTO runs (id, version_id, rendered_text, provider, status, created_at) "
+            "VALUES (1, 1, 'hi there', 'openai', 'ok', '2020-01-01')"
+        )
+        raw.execute_sql("PRAGMA user_version = 2")
+        raw.close()
+
+    def test_v2_database_gains_conversations_and_keeps_its_data(self, isolated_db):
+        """The v3 step adds the conversations table and the new runs columns,
+        drops NOT NULL on version_id/rendered_text, and the pre-existing row
+        survives the table rebuild intact."""
+        self._build_v2_database(isolated_db)
+
+        # First real DB touch: triggers _migrate() against the pre-built file.
+        assert history.runs("OLD")[0].rendered_text == "hi there"
+
+        conn = sqlite3.connect(str(isolated_db))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        assert {"conversation_id", "turn_index", "input_text"} <= columns
+        conn.close()
+
+        # version_id/rendered_text are now nullable: a conversation-only turn
+        # (no wrapped Prompt) must be legal on a migrated database too.
+        cid = storage.get_or_create_conversation("post-migration")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="q", output_text="a")
+        assert history.conversation("post-migration").turns[0].input_text == "q"
+
+    def test_reopening_an_already_migrated_database_does_not_crash(self, isolated_db):
+        """Regression test: the first draft of _migrate() never persisted
+        PRAGMA user_version after the v3 step, so every reopen mistook an
+        already-migrated file for a stale v2 one and re-ran add_column,
+        crashing with a 'duplicate column' error."""
+        self._build_v2_database(isolated_db)
+        history.runs("OLD")  # first open: migrates
+
+        storage.reset_caches()
+        promptkeep.configure(db_path=isolated_db, enabled=True, strict=False)
+        # Must not raise.
+        assert history.runs("OLD")[0].rendered_text == "hi there"

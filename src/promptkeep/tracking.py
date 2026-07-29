@@ -31,6 +31,9 @@ def record_prompt_run(
     latency_ms: Optional[int] = None,
     status: str = "ok",
     error: Optional[str] = None,
+    conversation_id: Optional[int] = None,
+    turn_index: Optional[int] = None,
+    input_text: Optional[str] = None,
 ) -> None:
     """Record one execution of a prompt: resolve its version, insert a run row.
 
@@ -59,6 +62,60 @@ def record_prompt_run(
             latency_ms=latency_ms,
             status=status,
             error=error,
+            conversation_id=conversation_id,
+            turn_index=turn_index,
+            input_text=input_text,
         )
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
+
+
+def record_conversation_turn(
+    *,
+    provider: str,
+    model: Optional[str] = None,
+    request_params: Optional[Dict[str, Any]] = None,
+    response_id: Optional[str] = None,
+    output_text: Optional[str] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    latency_ms: Optional[int] = None,
+    status: str = "ok",
+    error: Optional[str] = None,
+    conversation_id: int,
+    turn_index: Optional[int] = None,
+    input_text: Optional[str] = None,
+) -> None:
+    """Record a conversation turn that involved no wrapped Prompt at all —
+    e.g. a plain follow-up message. There's no version to resolve, so this
+    forwards straight to storage instead of going through a Prompt's lineage
+    (that resolution is the only reason record_prompt_run does more than this).
+
+    Kept as a named sibling of record_prompt_run so the wrapper's two record
+    paths stay symmetric through the tracking layer. No error handling of its
+    own: storage.record_run is already fully shielded, including the disabled
+    /off-mode early return — a guard here would only shield a call that
+    cannot raise.
+    """
+    from . import storage
+
+    storage.record_run(
+        version_id=None,
+        variables=None,
+        rendered_text=None,
+        provider=provider,
+        model=model,
+        request_params=request_params,
+        response_id=response_id,
+        output_text=output_text,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+        conversation_id=conversation_id,
+        turn_index=turn_index,
+        input_text=input_text,
+    )

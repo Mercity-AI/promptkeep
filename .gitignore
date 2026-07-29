@@ -8,3 +8,4 @@ build/
 *.egg-info/
 .promptkeep.db*
 testing.db*
+demo.promptkeep.db*

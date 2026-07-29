@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} v{{ old }} vs v{{ new }} · promptkeep{% endblock %}
+{% block content %}
+<div class="crumb"><a href="/prompts/{{ name }}">← {{ name }}</a></div>
+<div class="page-head">
+  <h1>{{ name }} <span class="badge">v{{ old }}</span> → <span class="badge">v{{ new }}</span></h1>
+</div>
+{% if diff_text %}
+<pre class="diff">{% for line in diff_text.splitlines() %}{% if line.startswith('+') %}<span class="add">{{ line }}</span>{% elif line.startswith('-') %}<span class="del">{{ line }}</span>{% else %}<span class="ctx">{{ line }}</span>{% endif %}{% endfor %}</pre>
+{% else %}
+<p class="empty">These versions are identical — nothing to show.</p>
+{% endif %}
+{% endblock %}

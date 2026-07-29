@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Runs · promptkeep{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Runs</h1>
+  <div class="sub">Every recorded LLM call, newest first</div>
+</div>
+<form class="inline" method="get" action="/runs">
+  <select name="prompt">
+    <option value="">All prompts</option>
+    {% for p in prompts %}
+    <option value="{{ p.name }}" {% if p.name == selected_prompt %}selected{% endif %}>{{ p.name }}</option>
+    {% endfor %}
+  </select>
+  <input type="number" name="version" placeholder="version" value="{{ selected_version or '' }}" style="width:90px">
+  <button type="submit">Filter</button>
+</form>
+
+{% if runs %}
+<div class="card">
+<table>
+<thead><tr><th>ID</th><th>Prompt</th><th>V</th><th>Conversation</th><th>Model</th><th>Tokens</th><th>Latency</th><th>Status</th><th>When</th></tr></thead>
+<tbody>
+{% for r in runs %}
+<tr>
+  <td class="num muted">{{ r.id }}</td>
+  <td>{% if r.prompt_name %}<a href="/prompts/{{ r.prompt_name }}">{{ r.prompt_name }}</a>{% else %}<span class="muted">—</span>{% endif %}</td>
+  <td>{% if r.version is not none %}<span class="badge">v{{ r.version }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+  <td>{% if r.conversation_id %}<a href="/conversations/{{ r.conversation_id }}">{{ r.conversation_id }}</a> <span class="muted num">#{{ r.turn_index }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+  <td class="muted mono">{{ r.model or '—' }}</td>
+  <td class="num">{{ r.total_tokens if r.total_tokens is not none else '—' }}</td>
+  <td class="num">{{ (r.latency_ms ~ 'ms') if r.latency_ms is not none else '—' }}</td>
+  <td><span class="pill {{ 'status-error' if r.status == 'error' else '' }}">{{ r.status }}</span></td>
+  <td class="muted mono">{{ r.created_at[:19] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No runs recorded{% if selected_prompt %} for {{ selected_prompt }}{% endif %} yet.</p>
+{% endif %}
+{% endblock %}

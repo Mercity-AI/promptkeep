@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Conversations · promptkeep{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Conversations</h1>
+  <div class="sub">Multi-turn sessions, most recently active first</div>
+</div>
+{% if conversations %}
+<div class="card">
+<table>
+<thead><tr><th>Session</th><th>Title</th><th>Turns</th><th>Last active</th></tr></thead>
+<tbody>
+{% for c in conversations %}
+<tr>
+  <td><a href="/conversations/{{ c.external_id }}">{{ c.external_id }}</a></td>
+  <td class="muted">{{ c.title or '—' }}</td>
+  <td class="num">{{ c.turn_count }}</td>
+  <td class="muted mono">{{ c.updated_at[:19] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No conversations recorded yet.</p>
+{% endif %}
+{% endblock %}

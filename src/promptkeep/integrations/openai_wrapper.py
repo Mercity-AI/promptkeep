@@ -25,8 +25,9 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..conversation import current as current_conversation
 from ..prompts import Prompt, RenderedText
-from ..tracking import record_prompt_run
+from ..tracking import record_conversation_turn, record_prompt_run
 
 logger = logging.getLogger("promptkeep")
 
@@ -141,6 +142,77 @@ def _process_messages(messages):
     return tracked, new_messages
 
 
+# --- conversation resolution ------------------------------------------------------
+
+
+def _resolve_conversation(kwargs) -> Tuple[Optional[str], Optional[str], dict]:
+    """Which conversation (if any) this call belongs to.
+
+    The explicit per-call kwarg always wins over the ambient `with
+    conversation(...)` block — it's popped here so it never reaches the real
+    API. Returns (external_id, title, metadata); external_id is None when
+    neither path is active.
+    """
+    explicit = kwargs.pop("promptkeep_conversation", None)
+    if explicit is not None:
+        return explicit, None, {}
+    active = current_conversation()
+    if active is not None:
+        return active.external_id, active.title, active.metadata
+    return None, None, {}
+
+
+def _extract_input_text(messages) -> Optional[str]:
+    """The newest message's text content — what's actually new at this turn.
+
+    Earlier turns (including the model's own prior reply) already live in
+    the conversation as earlier rows; the system prompt, if any, is captured
+    by the tracked Prompt's own version lineage instead of being repeated
+    here. Multimodal content blocks are flattened to their text parts.
+    """
+    if not messages or not isinstance(messages, (list, tuple)):
+        return None
+    last = messages[-1]
+    # "developer" is the newer-model spelling of the same system-level role.
+    if not isinstance(last, dict) or last.get("role") in ("system", "developer"):
+        return None
+    content = last.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _prepare_conversation(
+    external_id, title, metadata, messages
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """Resolve/create the conversation row and reserve this call's turn number.
+
+    One reservation per physical API call, reused for every run row it
+    produces — a call with two tracked prompts in one message list must not
+    split into two turns. Shielded like every other implicit write path.
+    """
+    if external_id is None:
+        return None, None, None
+    try:
+        from .. import storage
+
+        conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
+        if conversation_id is None:
+            return None, None, None
+        turn_index = storage.reserve_turn_index(conversation_id)
+        return conversation_id, turn_index, _extract_input_text(messages)
+    except Exception:
+        logger.warning("promptkeep: failed to prepare conversation %r", external_id, exc_info=True)
+        return None, None, None
+
+
 # --- run recording ---------------------------------------------------------------
 
 
@@ -149,9 +221,25 @@ def _ms(start: float) -> int:
     return int(round((time.perf_counter() - start) * 1000))
 
 
-def _record_runs(tracked, kwargs, response, latency_ms, status="ok", error=None) -> None:
-    """Write one run row per tracked prompt, sharing the response metadata."""
-    if not tracked:
+def _record_runs(
+    tracked,
+    kwargs,
+    response,
+    latency_ms,
+    status="ok",
+    error=None,
+    conversation_id=None,
+    turn_index=None,
+    input_text=None,
+) -> None:
+    """Write one run row per tracked prompt, sharing the response metadata.
+
+    When no Prompt was tracked but a conversation is active, still write one
+    untracked turn row — otherwise plain follow-up messages would be
+    invisible to conversation playback even though they're part of the
+    session.
+    """
+    if not tracked and conversation_id is None:
         return
     # Pull metadata defensively — response may be None (errors) or a
     # synthetic stream summary; missing fields just become NULLs.
@@ -170,11 +258,29 @@ def _record_runs(tracked, kwargs, response, latency_ms, status="ok", error=None)
     except Exception:
         logger.warning("promptkeep: failed to extract response metadata", exc_info=True)
         return
-    for prompt_obj, variables, rendered in tracked:
-        record_prompt_run(
-            prompt_obj,
-            variables,
-            rendered,
+    if tracked:
+        for prompt_obj, variables, rendered in tracked:
+            record_prompt_run(
+                prompt_obj,
+                variables,
+                rendered,
+                provider="openai",
+                model=model,
+                request_params=request_params,
+                response_id=response_id,
+                output_text=output_text,
+                prompt_tokens=getattr(usage, "prompt_tokens", None),
+                completion_tokens=getattr(usage, "completion_tokens", None),
+                total_tokens=getattr(usage, "total_tokens", None),
+                latency_ms=latency_ms,
+                status=status,
+                error=error,
+                conversation_id=conversation_id,
+                turn_index=turn_index,
+                input_text=input_text,
+            )
+    else:
+        record_conversation_turn(
             provider="openai",
             model=model,
             request_params=request_params,
@@ -186,6 +292,9 @@ def _record_runs(tracked, kwargs, response, latency_ms, status="ok", error=None)
             latency_ms=latency_ms,
             status=status,
             error=error,
+            conversation_id=conversation_id,
+            turn_index=turn_index,
+            input_text=input_text,
         )
 
 
@@ -198,20 +307,45 @@ def _make_sync_create(original):
     @functools.wraps(original)
     def create(*args, **kwargs):
         """Substitute prompts, call the real API, record the outcome."""
+        external_id, title, metadata = _resolve_conversation(kwargs)
         tracked, messages = _process_messages(kwargs.get("messages"))
         if "messages" in kwargs:
             kwargs["messages"] = messages
+        conversation_id, turn_index, input_text = _prepare_conversation(
+            external_id, title, metadata, messages
+        )
         start = time.perf_counter()
         try:
             response = original(*args, **kwargs)
         except Exception as exc:
             # Record the failure, then surface the original error untouched.
-            _record_runs(tracked, kwargs, None, _ms(start), status="error", error=repr(exc))
+            _record_runs(
+                tracked,
+                kwargs,
+                None,
+                _ms(start),
+                status="error",
+                error=repr(exc),
+                conversation_id=conversation_id,
+                turn_index=turn_index,
+                input_text=input_text,
+            )
             raise
         # Streaming: defer recording until the stream is exhausted.
-        if kwargs.get("stream") and tracked:
-            return _SyncStreamProxy(response, _StreamRecorder(tracked, kwargs, start))
-        _record_runs(tracked, kwargs, response, _ms(start))
+        if kwargs.get("stream") and (tracked or conversation_id is not None):
+            return _SyncStreamProxy(
+                response,
+                _StreamRecorder(tracked, kwargs, start, conversation_id, turn_index, input_text),
+            )
+        _record_runs(
+            tracked,
+            kwargs,
+            response,
+            _ms(start),
+            conversation_id=conversation_id,
+            turn_index=turn_index,
+            input_text=input_text,
+        )
         return response
 
     return create
@@ -223,18 +357,43 @@ def _make_async_create(original):
     @functools.wraps(original)
     async def create(*args, **kwargs):
         """Async twin of the sync interceptor: substitute, await, record."""
+        external_id, title, metadata = _resolve_conversation(kwargs)
         tracked, messages = _process_messages(kwargs.get("messages"))
         if "messages" in kwargs:
             kwargs["messages"] = messages
+        conversation_id, turn_index, input_text = _prepare_conversation(
+            external_id, title, metadata, messages
+        )
         start = time.perf_counter()
         try:
             response = await original(*args, **kwargs)
         except Exception as exc:
-            _record_runs(tracked, kwargs, None, _ms(start), status="error", error=repr(exc))
+            _record_runs(
+                tracked,
+                kwargs,
+                None,
+                _ms(start),
+                status="error",
+                error=repr(exc),
+                conversation_id=conversation_id,
+                turn_index=turn_index,
+                input_text=input_text,
+            )
             raise
-        if kwargs.get("stream") and tracked:
-            return _AsyncStreamProxy(response, _StreamRecorder(tracked, kwargs, start))
-        _record_runs(tracked, kwargs, response, _ms(start))
+        if kwargs.get("stream") and (tracked or conversation_id is not None):
+            return _AsyncStreamProxy(
+                response,
+                _StreamRecorder(tracked, kwargs, start, conversation_id, turn_index, input_text),
+            )
+        _record_runs(
+            tracked,
+            kwargs,
+            response,
+            _ms(start),
+            conversation_id=conversation_id,
+            turn_index=turn_index,
+            input_text=input_text,
+        )
         return response
 
     return create
@@ -246,11 +405,16 @@ def _make_async_create(original):
 class _StreamRecorder:
     """Accumulates streamed deltas; writes the run once when the stream ends."""
 
-    def __init__(self, tracked, kwargs, start):
+    def __init__(
+        self, tracked, kwargs, start, conversation_id=None, turn_index=None, input_text=None
+    ):
         """Hold the request context; content/usage fill in as chunks arrive."""
         self.tracked = tracked
         self.kwargs = kwargs
         self.start = start
+        self.conversation_id = conversation_id
+        self.turn_index = turn_index
+        self.input_text = input_text
         self.parts: List[str] = []
         self.model = None
         self.response_id = None
@@ -283,7 +447,17 @@ class _StreamRecorder:
             usage=self.usage,
             choices=[SimpleNamespace(message=SimpleNamespace(content="".join(self.parts) or None))],
         )
-        _record_runs(self.tracked, self.kwargs, response, _ms(self.start), status, error)
+        _record_runs(
+            self.tracked,
+            self.kwargs,
+            response,
+            _ms(self.start),
+            status,
+            error,
+            conversation_id=self.conversation_id,
+            turn_index=self.turn_index,
+            input_text=self.input_text,
+        )
 
 
 class _SyncStreamProxy:
