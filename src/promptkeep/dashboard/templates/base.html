@@ -19,6 +19,8 @@
     --accent-bg: #eeeefc;
     --ok: #157a4c;
     --ok-bg: #e5f5ec;
+    --warn: #9a6700;
+    --warn-bg: #fdf3d8;
     --danger: #c2333b;
     --danger-bg: #fdeced;
     --add-bg: #e9f7ef;
@@ -44,6 +46,8 @@
       --accent-bg: #26264a;
       --ok: #4cc38a;
       --ok-bg: #17301f;
+      --warn: #e0b341;
+      --warn-bg: #33280e;
       --danger: #f07178;
       --danger-bg: #3a1d1f;
       --add-bg: #142e1f;
@@ -127,12 +131,30 @@
     content: ""; width: 5px; height: 5px; border-radius: 50%;
     background: currentColor; flex: none;
   }
-  .pill.status-error { background: var(--danger-bg); color: var(--danger); }
+  .pill.status-error,
+  .pill.status-blocked,
+  .pill.status-failed { background: var(--danger-bg); color: var(--danger); }
+  .pill.status-warn,
+  .pill.status-pending { background: var(--warn-bg); color: var(--warn); }
   .badge {
     display: inline-block; padding: 1px 7px; border-radius: 5px;
     background: var(--accent-bg); color: var(--accent-strong);
     font-family: var(--mono); font-size: 11.5px; font-weight: 500;
   }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 1px 8px 1px 6px; border-radius: 6px;
+    font-size: 11.5px; font-weight: 500;
+    background: var(--ok-bg); color: var(--ok);
+  }
+  .chip::before {
+    content: ""; width: 5px; height: 5px; border-radius: 50%;
+    background: currentColor; flex: none;
+  }
+  .chip .phase { opacity: .7; font-family: var(--mono); font-size: 10.5px; }
+  .chip.s-warn { background: var(--warn-bg); color: var(--warn); }
+  .chip.s-block, .chip.s-error { background: var(--danger-bg); color: var(--danger); }
   .empty {
     color: var(--text-muted); padding: 48px 24px; text-align: center;
     background: var(--surface); border: 1px dashed var(--border);

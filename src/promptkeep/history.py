@@ -91,6 +91,50 @@ class ConversationSummary:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class CheckInfo:
+    """One check verdict recorded against a run."""
+
+    name: str
+    phase: str  # 'pre' | 'post'
+    status: str  # 'ok' | 'warn' | 'block' | 'error'
+    score: Optional[float]
+    message: Optional[str]
+
+
+def checks(run_id: int) -> List[CheckInfo]:
+    """Every check verdict for a run, oldest first."""
+    return [
+        CheckInfo(
+            name=row["name"],
+            phase=row["phase"],
+            status=row["status"],
+            score=row["score"],
+            message=row["message"],
+        )
+        for row in storage.fetch_checks(run_id)
+    ]
+
+
+def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
+    """The one-word headline for a run's checks, for a badge in the UI.
+
+    'blocked' if the call was gated, else 'failed' if any check errored,
+    'warn' if any warned, 'ok' if checks ran and all passed, None if the run
+    had no checks at all.
+    """
+    if run_status == "blocked":
+        return "blocked"
+    if not check_infos:
+        return None
+    statuses = {c.status for c in check_infos}
+    if "block" in statuses or "error" in statuses:
+        return "failed"
+    if "warn" in statuses:
+        return "warn"
+    return "ok"
+
+
 def _load_json(value: Optional[str]):
     """Decode a stored JSON column; malformed/missing data becomes None."""
     if value is None:

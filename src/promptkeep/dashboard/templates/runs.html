@@ -19,7 +19,7 @@
 {% if runs %}
 <div class="card">
 <table>
-<thead><tr><th>ID</th><th>Prompt</th><th>V</th><th>Conversation</th><th>Model</th><th>Tokens</th><th>Latency</th><th>Status</th><th>When</th></tr></thead>
+<thead><tr><th>ID</th><th>Prompt</th><th>V</th><th>Conversation</th><th>Model</th><th>Tokens</th><th>Status</th><th>Checks</th><th>When</th></tr></thead>
 <tbody>
 {% for r in runs %}
 <tr>
@@ -29,8 +29,11 @@
   <td>{% if r.conversation_id %}<a href="/conversations/{{ r.conversation_id }}">{{ r.conversation_id }}</a> <span class="muted num">#{{ r.turn_index }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
   <td class="muted mono">{{ r.model or '—' }}</td>
   <td class="num">{{ r.total_tokens if r.total_tokens is not none else '—' }}</td>
-  <td class="num">{{ (r.latency_ms ~ 'ms') if r.latency_ms is not none else '—' }}</td>
-  <td><span class="pill {{ 'status-error' if r.status == 'error' else '' }}">{{ r.status }}</span></td>
+  <td><span class="pill status-{{ r.status }}">{{ r.status }}</span></td>
+  <td>
+    {% set v = verdicts.get(r.id) %}
+    {% if v %}<span class="pill status-{{ v }}">{{ v }}</span>{% else %}<span class="muted">—</span>{% endif %}
+  </td>
   <td class="muted mono">{{ r.created_at[:19] }}</td>
 </tr>
 {% endfor %}
