@@ -109,6 +109,61 @@ already covered by version lineage, so nothing is duplicated as history grows. W
 prompt version drove each turn is recorded inline — so "which version was live at turn 6
 of this session?" is a lookup, not an investigation.
 
+## Checks
+
+Run your own function before a call (a gate that can stop it) and after it (an
+audit that grades the answer). A check is just a function returning a `Verdict`
+— plain code or another LLM call, promptkeep doesn't care which.
+
+```python
+from promptkeep import Prompt, check, Verdict
+
+@check.pre(name="no_pii")                     # runs before the request is sent
+def block_pii(ctx):
+    return Verdict.block("email in prompt") if "@" in ctx.rendered else Verdict.ok()
+
+@check.post(name="grounded")                  # runs after; async by default
+def is_grounded(ctx):
+    score = judge(ctx.output_text)            # e.g. an LLM-as-judge call
+    return Verdict.from_score(score, threshold=0.7)
+
+review = Prompt("You are a reviewer.", name="REVIEW_SYSTEM",
+                pre=[block_pii], post=[is_grounded])
+```
+
+A `Verdict` is `ok()`, `warn(msg)`, `block(msg)` (pre only — stops the call), or
+`rewrite(text)` (pre only — substitutes the outgoing message). The result rides
+back on the response, and existing code is untouched:
+
+```python
+response = client.chat.completions.create(...)
+response.choices[0].message.content     # unchanged
+response.promptkeep.verification        # "ok" | "warn" | "failed" | "pending"
+response.promptkeep.checks              # each check's verdict
+response.promptkeep.wait(timeout=5)     # block for async post-checks if you want them
+```
+
+Prefer an explicit shape for new code? `call()` returns the result directly:
+
+```python
+from promptkeep import call
+
+result = call(client, model="gpt-5.5", messages=[...])
+result.text            # the reply
+result.verification    # "ok" | "warn" | "failed" | "pending"
+result.run_id
+# async: await promptkeep.acall(client, ...), and response.promptkeep.awaited()
+```
+
+A blocked call raises `PromptBlocked` by default; `configure(on_block="return")`
+makes it return a response-shaped stub instead so a service can degrade. Checks
+attach globally (`configure(pre=[...])`), per prompt, or per call
+(`promptkeep_pre=[...]`), merged most-specific-wins. A crashing or slow check
+never breaks your call (it fails open, recorded); an LLM-judge check doesn't
+record itself. Checks run on every call path — sync or async, streaming or not
+(post-checks fire once a stream finishes). Every verdict is saved to the
+`checks` table, tied to the prompt version that produced the output.
+
 ## History
 
 ```python
