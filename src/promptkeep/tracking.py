@@ -34,8 +34,10 @@ def record_prompt_run(
     conversation_id: Optional[int] = None,
     turn_index: Optional[int] = None,
     input_text: Optional[str] = None,
-) -> None:
+    checks: Optional[list] = None,
+) -> Optional[int]:
     """Record one execution of a prompt: resolve its version, insert a run row.
+    Returns the new run's id when known (see storage.record_run).
 
     Silently skips when tracking is disabled; swallows (and logs) all errors.
     """
@@ -44,10 +46,10 @@ def record_prompt_run(
         # or registration failed — either way there's nothing to attach to.
         registration = prompt._ensure_registered()
         if registration is None:
-            return
+            return None
         from . import storage
 
-        storage.record_run(
+        return storage.record_run(
             version_id=registration[0],
             variables=variables,
             rendered_text=rendered_text,
@@ -65,9 +67,11 @@ def record_prompt_run(
             conversation_id=conversation_id,
             turn_index=turn_index,
             input_text=input_text,
+            checks=checks,
         )
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
+        return None
 
 
 def record_conversation_turn(
@@ -83,24 +87,23 @@ def record_conversation_turn(
     latency_ms: Optional[int] = None,
     status: str = "ok",
     error: Optional[str] = None,
-    conversation_id: int,
+    conversation_id: Optional[int] = None,
     turn_index: Optional[int] = None,
     input_text: Optional[str] = None,
-) -> None:
-    """Record a conversation turn that involved no wrapped Prompt at all —
-    e.g. a plain follow-up message. There's no version to resolve, so this
-    forwards straight to storage instead of going through a Prompt's lineage
-    (that resolution is the only reason record_prompt_run does more than this).
+    checks: Optional[list] = None,
+) -> Optional[int]:
+    """Record a turn with no wrapped Prompt — a plain message, or a checked
+    call whose only reason to exist as a run is to hang check verdicts off.
+    Returns the new run's id when known.
 
-    Kept as a named sibling of record_prompt_run so the wrapper's two record
-    paths stay symmetric through the tracking layer. No error handling of its
-    own: storage.record_run is already fully shielded, including the disabled
-    /off-mode early return — a guard here would only shield a call that
-    cannot raise.
+    There's no version to resolve, so this forwards straight to storage
+    instead of going through a Prompt's lineage (that resolution is the only
+    reason record_prompt_run does more than this). storage.record_run is
+    already fully shielded, so no guard of its own is needed.
     """
     from . import storage
 
-    storage.record_run(
+    return storage.record_run(
         version_id=None,
         variables=None,
         rendered_text=None,
@@ -116,6 +119,7 @@ def record_conversation_turn(
         status=status,
         error=error,
         conversation_id=conversation_id,
+        checks=checks,
         turn_index=turn_index,
         input_text=input_text,
     )

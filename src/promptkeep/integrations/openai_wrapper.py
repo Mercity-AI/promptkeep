@@ -25,6 +25,13 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..checks import (
+    CheckContext,
+    PromptBlocked,
+    RunHandle,
+    run_pre_checks,
+    suppressed,
+)
 from ..conversation import current as current_conversation
 from ..prompts import Prompt, RenderedText
 from ..tracking import record_conversation_turn, record_prompt_run
@@ -298,6 +305,324 @@ def _record_runs(
         )
 
 
+# --- checks -----------------------------------------------------------------------
+
+
+def _pop_check_kwargs(kwargs):
+    """Strip and return per-call checks (never reach the provider)."""
+    pre = kwargs.pop("promptkeep_pre", None) or ()
+    post = kwargs.pop("promptkeep_post", None) or ()
+    return tuple(pre), tuple(post)
+
+
+def _collect_checks(tracked, per_call_pre, per_call_post):
+    """Merge checks from all three scopes: global < prompt < per-call.
+
+    Deduplicated by name (most specific wins), preserving order. A tracked
+    prompt contributes its own pre/post; global comes from configure().
+    """
+    from ..config import get_settings
+
+    settings = get_settings()
+    pre, post = [], []
+    for prompt_obj, _vars, _rendered in tracked:
+        pre.extend(prompt_obj.pre)
+        post.extend(prompt_obj.post)
+    pre = list(settings.pre) + pre + list(per_call_pre)
+    post = list(settings.post) + post + list(per_call_post)
+    return _dedupe_checks(pre), _dedupe_checks(post)
+
+
+def _dedupe_checks(checks):
+    """Keep the last check registered under each name (most specific scope)."""
+    by_name = {}
+    for chk in checks:
+        by_name[chk.name] = chk
+    return list(by_name.values())
+
+
+def _joined_text(messages):
+    """All outgoing text as one string — what a pre-check scans."""
+    if not isinstance(messages, (list, tuple)):
+        return ""
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.extend(
+                b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)
+            )
+    return "\n".join(parts)
+
+
+def _last_text(messages):
+    """The newest outgoing message's string content — what rewrite targets."""
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
+    return None
+
+
+def _apply_rewrite(messages, new_text):
+    """Replace the last text message's content with a pre-check's rewrite."""
+    new_messages = list(messages)
+    for i in range(len(new_messages) - 1, -1, -1):
+        msg = new_messages[i]
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            new_messages[i] = {**msg, "content": new_text}
+            break
+    return new_messages
+
+
+def _blocked_stub(blocked, kwargs):
+    """A response-shaped object returned when on_block='return'."""
+    return SimpleNamespace(
+        id=None,
+        model=kwargs.get("model"),
+        usage=None,
+        choices=[],
+        promptkeep_blocked=SimpleNamespace(check=blocked.name, message=blocked.message),
+    )
+
+
+def _attach_handle(response, handle):
+    """Attach the RunHandle as response.promptkeep, tolerating frozen objects."""
+    try:
+        object.__setattr__(response, "promptkeep", handle)
+    except Exception:
+        try:
+            response.promptkeep = handle
+        except Exception:
+            logger.warning("promptkeep: could not attach run handle to response", exc_info=True)
+
+
+def _record_checked(tracked, kwargs, response, latency_ms, status, error, conv, check_rows):
+    """Record the run for a checked call (checks bundled), returning run_id.
+
+    Mirrors _record_runs but returns the primary run's id and attaches the
+    verdicts. For multiple tracked prompts, checks bundle onto the first;
+    the rest record normally.
+    """
+    conversation_id, turn_index, input_text = conv
+    model = getattr(response, "model", None) or kwargs.get("model")
+    response_id = getattr(response, "id", None)
+    usage = getattr(response, "usage", None)
+    output_text = _extract_output_text(response)
+    request_params = {k: v for k, v in kwargs.items() if k != "messages"}
+    usage_kw = dict(
+        model=model,
+        request_params=request_params,
+        response_id=response_id,
+        output_text=output_text,
+        prompt_tokens=getattr(usage, "prompt_tokens", None),
+        completion_tokens=getattr(usage, "completion_tokens", None),
+        total_tokens=getattr(usage, "total_tokens", None),
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+        conversation_id=conversation_id,
+        turn_index=turn_index,
+        input_text=input_text,
+    )
+    if tracked:
+        run_id = record_prompt_run(
+            tracked[0][0],
+            tracked[0][1],
+            tracked[0][2],
+            provider="openai",
+            checks=check_rows,
+            **usage_kw,
+        )
+        for prompt_obj, variables, rendered in tracked[1:]:
+            record_prompt_run(prompt_obj, variables, rendered, provider="openai", **usage_kw)
+        return run_id
+    return record_conversation_turn(provider="openai", checks=check_rows, **usage_kw)
+
+
+def _extract_output_text(response):
+    """The assistant's text reply, or None (errors, empty, non-string)."""
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _schedule_async_post(chk, ctx, run_id):
+    """Run one async post-check off-thread; write its verdict when it lands."""
+    from ..checks import _get_executor
+
+    def _work():
+        result = chk.run_inline(ctx)
+        from .. import storage
+
+        storage.record_check(run_id, result.to_row())
+        return result
+
+    return _get_executor().submit(_work)
+
+
+# The checked-call flow is split into pure-sync phases (run pre-checks, handle
+# a block, run post-checks + record) so the sync and async orchestrators can
+# share every bit of logic — the async one just runs each phase via
+# asyncio.to_thread so a blocking check or DB write never stalls the loop.
+
+
+def _checked_pre(tracked, messages, kwargs, pre_checks):
+    """Run pre-checks; return (outcome, bits) where bits carries the shared
+    context values the later phases need."""
+    prompt_obj = tracked[0][0] if len(tracked) == 1 else None
+    variables = tracked[0][1] if len(tracked) == 1 else None
+    rendered = _joined_text(messages)
+    last_text = _last_text(messages)
+    model = kwargs.get("model")
+    version = prompt_obj.version if prompt_obj is not None else None
+    pre_ctx = CheckContext(
+        rendered=rendered,
+        messages=messages,
+        prompt=prompt_obj,
+        variables=variables,
+        model=model,
+        last_text=last_text,
+    )
+    outcome = run_pre_checks(list(pre_checks), pre_ctx)
+    return outcome, (prompt_obj, variables, rendered, last_text, version, model)
+
+
+def _checked_block(outcome, tracked, kwargs, conv, bits):
+    """If a pre-check blocked: record the blocked run, then raise PromptBlocked
+    or return a response-shaped stub. Returns None when nothing blocked."""
+    if outcome.blocked is None:
+        return None
+    from ..config import get_settings
+
+    version = bits[4]
+    pre_rows = [r.to_row() for r in outcome.results]
+    run_id = _record_checked(
+        tracked,
+        kwargs,
+        None,
+        0,
+        "blocked",
+        f"blocked by check {outcome.blocked.name!r}",
+        conv,
+        pre_rows,
+    )
+    if get_settings().on_block == "raise":
+        raise PromptBlocked(outcome.blocked.name, outcome.blocked.message)
+    stub = _blocked_stub(outcome.blocked, kwargs)
+    _attach_handle(stub, RunHandle(run_id, version, outcome.results))
+    return stub
+
+
+def _checked_record_error(tracked, kwargs, conv, outcome, error_repr, latency_ms):
+    """Record a failed checked call (provider raised), keeping pre verdicts."""
+    pre_rows = [r.to_row() for r in outcome.results]
+    _record_checked(tracked, kwargs, None, latency_ms, "error", error_repr, conv, pre_rows)
+
+
+def _checked_post(
+    response, tracked, kwargs, conv, outcome, bits, messages, post_checks, latency, handle=None
+):
+    """Run post-checks, record the run with all known verdicts, and surface the
+    RunHandle. If `handle` is given (streaming: it's already on the proxy),
+    populate it in place; otherwise create one and attach it to `response`.
+    Async post-checks land later via their futures."""
+    prompt_obj, variables, rendered, last_text, version, model = bits
+    output_text = _extract_output_text(response)
+    post_ctx = CheckContext(
+        rendered=rendered,
+        messages=messages,
+        prompt=prompt_obj,
+        variables=variables,
+        model=getattr(response, "model", None) or model,
+        output_text=output_text,
+        response=response,
+        last_text=last_text,
+    )
+    blocking = [c for c in post_checks if c.mode != "async"]
+    asyncs = [c for c in post_checks if c.mode == "async"]
+    blocking_results = [c.run(post_ctx) for c in blocking]
+
+    known_results = list(outcome.results) + blocking_results
+    check_rows = [r.to_row() for r in known_results]
+    run_id = _record_checked(tracked, kwargs, response, latency, "ok", None, conv, check_rows)
+
+    futures = []
+    if asyncs and run_id is not None:
+        futures = [_schedule_async_post(c, post_ctx, run_id) for c in asyncs]
+    if handle is None:
+        _attach_handle(response, RunHandle(run_id, version, known_results, futures))
+    else:
+        handle.run_id = run_id
+        handle.checks = list(known_results)
+        handle._futures = futures
+    return response
+
+
+def _run_checked_create(original, args, kwargs, tracked, messages, conv, pre_checks, post_checks):
+    """Checked call on the sync path: pre-gate, call, post-audit, RunHandle."""
+    outcome, bits = _checked_pre(tracked, messages, kwargs, pre_checks)
+    stub = _checked_block(outcome, tracked, kwargs, conv, bits)
+    if stub is not None:
+        return stub
+    if outcome.rewritten is not None:
+        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    start = time.perf_counter()
+    try:
+        response = original(*args, **kwargs)
+    except Exception as exc:
+        _checked_record_error(tracked, kwargs, conv, outcome, repr(exc), _ms(start))
+        raise
+    return _checked_post(
+        response, tracked, kwargs, conv, outcome, bits, messages, post_checks, _ms(start)
+    )
+
+
+async def _run_checked_create_async(
+    original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+):
+    """Checked call on the async path: same phases, each run off the event loop
+    via asyncio.to_thread so a slow check or DB write never blocks it."""
+    import asyncio
+
+    outcome, bits = await asyncio.to_thread(_checked_pre, tracked, messages, kwargs, pre_checks)
+    # _checked_block raises PromptBlocked through to_thread when on_block='raise'.
+    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, bits)
+    if stub is not None:
+        return stub
+    if outcome.rewritten is not None:
+        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    start = time.perf_counter()
+    try:
+        response = await original(*args, **kwargs)
+    except Exception as exc:
+        await asyncio.to_thread(
+            _checked_record_error, tracked, kwargs, conv, outcome, repr(exc), _ms(start)
+        )
+        raise
+    return await asyncio.to_thread(
+        _checked_post,
+        response,
+        tracked,
+        kwargs,
+        conv,
+        outcome,
+        bits,
+        messages,
+        post_checks,
+        _ms(start),
+    )
+
+
 # --- interceptors -------------------------------------------------------------------
 
 
@@ -307,13 +632,33 @@ def _make_sync_create(original):
     @functools.wraps(original)
     def create(*args, **kwargs):
         """Substitute prompts, call the real API, record the outcome."""
+        # A call made from inside a check (e.g. an LLM judge) is a passthrough:
+        # no tracking, no nested checks — just strip our kwargs and delegate.
+        if suppressed():
+            _pop_check_kwargs(kwargs)
+            kwargs.pop("promptkeep_conversation", None)
+            return original(*args, **kwargs)
+
         external_id, title, metadata = _resolve_conversation(kwargs)
+        per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
         tracked, messages = _process_messages(kwargs.get("messages"))
         if "messages" in kwargs:
             kwargs["messages"] = messages
         conversation_id, turn_index, input_text = _prepare_conversation(
             external_id, title, metadata, messages
         )
+        conv = (conversation_id, turn_index, input_text)
+
+        pre_checks, post_checks = _collect_checks(tracked, per_call_pre, per_call_post)
+        if pre_checks or post_checks:
+            if kwargs.get("stream"):
+                return _run_checked_stream(
+                    original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+                )
+            return _run_checked_create(
+                original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+            )
+
         start = time.perf_counter()
         try:
             response = original(*args, **kwargs)
@@ -357,13 +702,30 @@ def _make_async_create(original):
     @functools.wraps(original)
     async def create(*args, **kwargs):
         """Async twin of the sync interceptor: substitute, await, record."""
+        if suppressed():
+            _pop_check_kwargs(kwargs)
+            kwargs.pop("promptkeep_conversation", None)
+            return await original(*args, **kwargs)
         external_id, title, metadata = _resolve_conversation(kwargs)
+        per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
         tracked, messages = _process_messages(kwargs.get("messages"))
         if "messages" in kwargs:
             kwargs["messages"] = messages
         conversation_id, turn_index, input_text = _prepare_conversation(
             external_id, title, metadata, messages
         )
+        conv = (conversation_id, turn_index, input_text)
+
+        pre_checks, post_checks = _collect_checks(tracked, per_call_pre, per_call_post)
+        if pre_checks or post_checks:
+            if kwargs.get("stream"):
+                return await _run_checked_stream_async(
+                    original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+                )
+            return await _run_checked_create_async(
+                original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+            )
+
         start = time.perf_counter()
         try:
             response = await original(*args, **kwargs)
@@ -458,6 +820,106 @@ class _StreamRecorder:
             turn_index=self.turn_index,
             input_text=self.input_text,
         )
+
+
+class _CheckedStreamRecorder(_StreamRecorder):
+    """A stream recorder that also runs post-checks once the stream ends —
+    output only exists then — and populates the RunHandle already on the proxy.
+
+    Pre-checks already ran (before the stream started); their verdicts live in
+    `outcome`. finish() adds the post verdicts and records the run with both.
+    """
+
+    def __init__(self, tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle):
+        super().__init__(tracked, kwargs, start, conv[0], conv[1], conv[2])
+        self.conv = conv
+        self.outcome = outcome
+        self.bits = bits
+        self.messages = messages
+        self.post_checks = post_checks
+        self.handle = handle
+
+    def finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+        """Record once: post-checks on success, or a checked error run."""
+        if self.recorded:
+            return
+        self.recorded = True
+        if error is not None:
+            _checked_record_error(
+                self.tracked, self.kwargs, self.conv, self.outcome, error, _ms(self.start)
+            )
+            return
+        response = SimpleNamespace(
+            model=self.model,
+            id=self.response_id,
+            usage=self.usage,
+            choices=[SimpleNamespace(message=SimpleNamespace(content="".join(self.parts) or None))],
+        )
+        _checked_post(
+            response,
+            self.tracked,
+            self.kwargs,
+            self.conv,
+            self.outcome,
+            self.bits,
+            self.messages,
+            self.post_checks,
+            _ms(self.start),
+            handle=self.handle,
+        )
+
+
+def _run_checked_stream(original, args, kwargs, tracked, messages, conv, pre_checks, post_checks):
+    """Checked streaming (sync): pre-gate before the stream, post-audit after it
+    drains. Returns a proxy carrying the (progressively filled) RunHandle."""
+    outcome, bits = _checked_pre(tracked, messages, kwargs, pre_checks)
+    stub = _checked_block(outcome, tracked, kwargs, conv, bits)
+    if stub is not None:
+        return stub
+    if outcome.rewritten is not None:
+        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    start = time.perf_counter()
+    try:
+        stream = original(*args, **kwargs)
+    except Exception as exc:
+        _checked_record_error(tracked, kwargs, conv, outcome, repr(exc), _ms(start))
+        raise
+    handle = RunHandle(None, bits[4], list(outcome.results))
+    recorder = _CheckedStreamRecorder(
+        tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle
+    )
+    proxy = _SyncStreamProxy(stream, recorder)
+    _attach_handle(proxy, handle)
+    return proxy
+
+
+async def _run_checked_stream_async(
+    original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
+):
+    """Checked streaming (async): same shape, blocking phases off the loop."""
+    import asyncio
+
+    outcome, bits = await asyncio.to_thread(_checked_pre, tracked, messages, kwargs, pre_checks)
+    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, bits)
+    if stub is not None:
+        return stub
+    if outcome.rewritten is not None:
+        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    start = time.perf_counter()
+    try:
+        stream = await original(*args, **kwargs)
+    except Exception as exc:
+        await asyncio.to_thread(
+            _checked_record_error, tracked, kwargs, conv, outcome, repr(exc), _ms(start)
+        )
+        raise
+    handle = RunHandle(None, bits[4], list(outcome.results))
+    recorder = _CheckedStreamRecorder(
+        tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle
+    )
+    proxy = _AsyncStreamProxy(stream, recorder)
+    _attach_handle(proxy, handle)
+    return proxy
 
 
 class _SyncStreamProxy:

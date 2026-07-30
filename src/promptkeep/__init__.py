@@ -6,6 +6,7 @@ Public API:
 """
 
 from . import history
+from .checks import CheckContext, PromptBlocked, Verdict, acall, call, check, suppress
 from .config import configure, get_settings
 from .conversation import conversation
 from .decorator import prompt
@@ -26,6 +27,13 @@ __all__ = [
     "history",
     "conversation",
     "flush",
+    "check",
+    "call",
+    "acall",
+    "Verdict",
+    "CheckContext",
+    "PromptBlocked",
+    "suppress",
     "extract_placeholders",
     "MissingVariableError",
     "TemplateParseError",

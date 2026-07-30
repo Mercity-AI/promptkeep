@@ -36,6 +36,9 @@ class Settings:
     queue_size: int
     flush_interval: float
     batch_size: int
+    pre: tuple
+    post: tuple
+    on_block: str
 
 
 def configure(
@@ -46,6 +49,9 @@ def configure(
     queue_size: Optional[int] = None,
     flush_interval: Optional[float] = None,
     batch_size: Optional[int] = None,
+    pre: Optional[list] = None,
+    post: Optional[list] = None,
+    on_block: Optional[str] = None,
 ) -> None:
     """Override library settings. Only the arguments you pass are changed.
 
@@ -70,6 +76,11 @@ def configure(
     - flush_interval: seconds the background writer waits for more work
       before writing a partial batch (default 0.5).
     - batch_size: max runs written per transaction (default 100).
+    - pre / post: checks applied to *every* tracked call (global scope). A
+      call's checks are its prompt's, plus per-call, plus these.
+    - on_block: what a blocking pre-check does — "raise" (default, raises
+      PromptBlocked) or "return" a response-shaped stub so a service can
+      degrade instead of erroring.
     """
     with _lock:
         if db_path is not None:
@@ -94,6 +105,14 @@ def configure(
             if batch_size < 1:
                 raise ValueError("batch_size must be a positive integer")
             _overrides["batch_size"] = int(batch_size)
+        if pre is not None:
+            _overrides["pre"] = tuple(pre)
+        if post is not None:
+            _overrides["post"] = tuple(post)
+        if on_block is not None:
+            if on_block not in ("raise", "return"):
+                raise ValueError(f"on_block must be 'raise' or 'return', got {on_block!r}")
+            _overrides["on_block"] = on_block
 
 
 def get_settings() -> Settings:
@@ -129,6 +148,9 @@ def get_settings() -> Settings:
             queue_size=_overrides.get("queue_size", 10_000),
             flush_interval=_overrides.get("flush_interval", 0.5),
             batch_size=_overrides.get("batch_size", 100),
+            pre=_overrides.get("pre", ()),
+            post=_overrides.get("post", ()),
+            on_block=_overrides.get("on_block", "raise"),
         )
 
 

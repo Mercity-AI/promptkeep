@@ -25,7 +25,7 @@ import peewee as pw
 
 logger = logging.getLogger("promptkeep")
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 # The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
@@ -149,7 +149,29 @@ class RunRecord(BaseModel):
         )
 
 
-_MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord]
+class CheckRecord(BaseModel):
+    """One check verdict against a run — the label store for optimization.
+
+    phase is 'pre' | 'post'; status is 'ok' | 'warn' | 'block' | 'error'.
+    An async post-check's row is written when its verdict lands, so a run can
+    accumulate check rows after it was itself recorded.
+    """
+
+    run = pw.ForeignKeyField(RunRecord, column_name="run_id", backref="checks")
+    name = pw.TextField()
+    phase = pw.TextField()
+    status = pw.TextField()
+    score = pw.FloatField(null=True)
+    message = pw.TextField(null=True)
+    latency_ms = pw.IntegerField(null=True)
+    created_at = pw.TextField()
+
+    class Meta:
+        table_name = "checks"
+        indexes = ((("run", "name"), False),)
+
+
+_MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord, CheckRecord]
 
 
 # --- helpers -------------------------------------------------------------------
@@ -263,6 +285,10 @@ def _migrate(database: pw.SqliteDatabase) -> None:
             migrator.drop_not_null("runs", "rendered_text"),
         )
         user_version = 3
+    if user_version < 4:
+        # v4: the checks table — one verdict per (run, check).
+        database.create_tables([CheckRecord], safe=True)
+        user_version = 4
     if started_at < _SCHEMA_VERSION:
         database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
@@ -468,8 +494,14 @@ def record_run(
     conversation_id: Optional[int] = None,
     turn_index: Optional[int] = None,
     input_text: Optional[str] = None,
-) -> None:
+    checks: Optional[list] = None,
+) -> Optional[int]:
     """Record one run row, honoring the configured write_mode. Never raises.
+
+    Returns the new run's id when it can — always in sync mode, and always
+    when ``checks`` are attached (those force a synchronous insert so the
+    run_id exists for the check rows and for the caller's RunHandle).
+    Returns None when the row was queued (background, no checks) or dropped.
 
     "sync" inserts before returning; "background" builds the complete row
     (timestamps and turn number included — they must reflect *call* time,
@@ -495,7 +527,7 @@ def record_run(
 
         settings = get_settings()
         if not settings.enabled or settings.write_mode == "off":
-            return
+            return None
         if turn_index is None and conversation_id is not None:
             turn_index = reserve_turn_index(conversation_id)
         row = {
@@ -518,25 +550,55 @@ def record_run(
             "turn_index": turn_index,
             "input_text": input_text,
         }
-        if settings.write_mode == "background":
+        if checks:
+            row["_checks"] = checks
+        # Checked calls insert synchronously: the run_id has to exist now, for
+        # the check rows and for the caller's RunHandle. Unchecked calls follow
+        # the configured mode.
+        if settings.write_mode == "background" and not checks:
             from . import writer
 
             writer.submit(row)
-            return
+            return None
         if _get_db() is None:
-            return
-        _insert_row(row)
+            return None
+        return _insert_row(row)
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
+        return None
 
 
-def _insert_row(row: dict) -> None:
-    """Insert one prepared run row and touch its conversation's updated_at."""
-    RunRecord.create(**row)
+def _insert_row(row: dict) -> int:
+    """Insert one prepared run row (and any bundled check rows), returning its id.
+
+    A row may carry an ``_checks`` list — check verdicts known at record time
+    (all pre-checks, plus blocking post-checks). They're written in the same
+    transaction as the run so they can never orphan.
+    """
+    checks = row.pop("_checks", None)
+    run = RunRecord.create(**row)
+    if checks:
+        now = _utcnow()
+        CheckRecord.insert_many([{**c, "run": run.id, "created_at": now} for c in checks]).execute()
     if row.get("conversation") is not None:
         ConversationRecord.update(updated_at=_utcnow()).where(
             ConversationRecord.id == row["conversation"]
         ).execute()
+    return run.id
+
+
+def record_check(run_id: int, check_row: dict) -> None:
+    """Write one check verdict against an already-recorded run. Never raises.
+
+    The late path: an async post-check finishes after its run was recorded,
+    so its row is inserted on its own rather than bundled.
+    """
+    try:
+        if _get_db() is None:
+            return
+        CheckRecord.create(run=run_id, created_at=_utcnow(), **check_row)
+    except Exception:
+        logger.warning("promptkeep: failed to record check", exc_info=True)
 
 
 def write_batch(rows: list) -> None:
@@ -723,6 +785,27 @@ def fetch_conversation_turns(external_id: str) -> list:
         .join(ConversationRecord)
         .where(ConversationRecord.external_id == external_id)
         .order_by(RunRecord.turn_index)
+        .dicts()
+    )
+    return list(query)
+
+
+def fetch_checks(run_id: int) -> list:
+    """All check verdicts recorded against one run, as dicts, oldest first."""
+    if _get_db() is None:
+        return []
+    query = (
+        CheckRecord.select(
+            CheckRecord.name,
+            CheckRecord.phase,
+            CheckRecord.status,
+            CheckRecord.score,
+            CheckRecord.message,
+            CheckRecord.latency_ms,
+            CheckRecord.created_at,
+        )
+        .where(CheckRecord.run == run_id)
+        .order_by(CheckRecord.id)
         .dicts()
     )
     return list(query)

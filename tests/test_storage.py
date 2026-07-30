@@ -235,3 +235,32 @@ class TestSchemaMigration:
         promptkeep.configure(db_path=isolated_db, enabled=True, strict=False)
         # Must not raise.
         assert history.runs("OLD")[0].rendered_text == "hi there"
+
+    def test_v2_all_the_way_to_v4_adds_checks_table(self, isolated_db):
+        """A v2 file migrates through v3 and v4 in one pass: the checks table
+        appears and the pre-existing run still reads back."""
+        self._build_v2_database(isolated_db)
+        assert history.runs("OLD")[0].rendered_text == "hi there"
+
+        conn = sqlite3.connect(str(isolated_db))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "checks" in tables
+        conn.close()
+
+        # The checks table is usable: a run with bundled verdicts round-trips.
+        run_id = storage.record_run(
+            provider="openai",
+            model="m",
+            checks=[
+                {
+                    "name": "g",
+                    "phase": "pre",
+                    "status": "ok",
+                    "score": None,
+                    "message": None,
+                    "latency_ms": 1,
+                }
+            ],
+        )
+        assert [c["name"] for c in storage.fetch_checks(run_id)] == ["g"]
