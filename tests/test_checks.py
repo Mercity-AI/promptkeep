@@ -154,6 +154,41 @@ class TestPreChecks:
         )
         assert seen["last_text"] == "here is my key sk-live-abc123"
 
+    def test_rewrite_reaches_post_check_and_storage(self):
+        # A redaction rewrite must not stop at the wire: the post-check that
+        # audits the turn, and the input_text persisted to the DB, must both
+        # see the rewritten text — otherwise the raw secret is written back.
+        seen = {}
+
+        @check.pre(name="redact")
+        def redact(ctx):
+            if "SECRET" in (ctx.last_text or ""):
+                return Verdict.rewrite(ctx.last_text.replace("SECRET", "[redacted]"))
+            return Verdict.ok()
+
+        @check.post(name="audit", mode="blocking")
+        def audit(ctx):
+            seen["last_text"] = ctx.last_text
+            seen["rendered"] = ctx.rendered
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[redact], post=[audit])
+        client = _client()
+        with promptkeep.conversation("c-redact"):
+            client.chat.completions.create(
+                model="m",
+                messages=[
+                    {"role": "developer", "content": p},
+                    {"role": "user", "content": "my SECRET token"},
+                ],
+            )
+        # The post-check saw the redacted turn, not the raw one.
+        assert seen["last_text"] == "my [redacted] token"
+        assert "SECRET" not in seen["rendered"]
+        # And the stored turn is redacted too.
+        (turn,) = history.conversation("c-redact").turns
+        assert turn.input_text == "my [redacted] token"
+
     def test_rewrite_targets_multimodal_user_turn(self):
         # A rewrite on a vision message must edit the user's text block and
         # keep the image, not overwrite the system prompt.

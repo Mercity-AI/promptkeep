@@ -22,6 +22,7 @@ import functools
 import inspect
 import logging
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -489,37 +490,61 @@ def _schedule_async_post(chk, ctx, run_id):
 
 
 def _checked_pre(tracked, messages, kwargs, pre_checks):
-    """Run pre-checks; return (outcome, bits) where bits carries the shared
-    context values the later phases need."""
+    """Run pre-checks; return (outcome, pre_ctx, version).
+
+    pre_ctx is the exact context the checks saw. The later phases derive the
+    post-check context from it (via dataclasses.replace) instead of rebuilding
+    it from a positional tuple — one source of truth for the request-side
+    fields, and the place a rewrite gets folded in so the audit and the
+    recorded row see the rewritten turn, not the original.
+    """
     prompt_obj = tracked[0][0] if len(tracked) == 1 else None
     variables = tracked[0][1] if len(tracked) == 1 else None
-    rendered = _joined_text(messages)
-    # The current turn — skips a trailing system prompt and flattens image
-    # content blocks, so a PII/rewrite check reads the user's real message,
-    # not whatever last happened to be a plain string.
-    last_text = _extract_input_text(messages)
-    model = kwargs.get("model")
     version = prompt_obj.version if prompt_obj is not None else None
     pre_ctx = CheckContext(
-        rendered=rendered,
+        rendered=_joined_text(messages),
         messages=messages,
         prompt=prompt_obj,
         variables=variables,
-        model=model,
-        last_text=last_text,
+        model=kwargs.get("model"),
+        # The current turn — skips a trailing system prompt and flattens image
+        # content blocks, so a PII/rewrite check reads the user's real message,
+        # not whatever last happened to be a plain string.
+        last_text=_extract_input_text(messages),
     )
     outcome = run_pre_checks(list(pre_checks), pre_ctx)
-    return outcome, (prompt_obj, variables, rendered, last_text, version, model)
+    return outcome, pre_ctx, version
 
 
-def _checked_block(outcome, tracked, kwargs, conv, bits):
+def _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv):
+    """Fold a pre-check rewrite into everything downstream, or pass through.
+
+    A rewrite has to reach three places, not just the wire: the outgoing
+    request (so the provider sees it), the post-check context (so the audit
+    grades what was actually sent), and the recorded ``input_text`` (so the
+    stored turn isn't the pre-rewrite original — e.g. a scrubbed secret must
+    not be written back in the clear). Returns the updated
+    (messages, pre_ctx, conv).
+    """
+    if outcome.rewritten is None:
+        return messages, pre_ctx, conv
+    messages = _apply_rewrite(messages, outcome.rewritten)
+    kwargs["messages"] = messages
+    last_text = _extract_input_text(messages)
+    pre_ctx = replace(
+        pre_ctx, rendered=_joined_text(messages), last_text=last_text, messages=messages
+    )
+    conv = (conv[0], conv[1], last_text)
+    return messages, pre_ctx, conv
+
+
+def _checked_block(outcome, tracked, kwargs, conv, version):
     """If a pre-check blocked: record the blocked run, then raise PromptBlocked
     or return a response-shaped stub. Returns None when nothing blocked."""
     if outcome.blocked is None:
         return None
     from ..config import get_settings
 
-    version = bits[4]
     pre_rows = [r.to_row() for r in outcome.results]
     run_id = _record_checked(
         tracked,
@@ -545,23 +570,21 @@ def _checked_record_error(tracked, kwargs, conv, outcome, error_repr, latency_ms
 
 
 def _checked_post(
-    response, tracked, kwargs, conv, outcome, bits, messages, post_checks, latency, handle=None
+    response, tracked, kwargs, conv, outcome, pre_ctx, version, post_checks, latency, handle=None
 ):
     """Run post-checks, record the run with all known verdicts, and surface the
     RunHandle. If `handle` is given (streaming: it's already on the proxy),
     populate it in place; otherwise create one and attach it to `response`.
-    Async post-checks land later via their futures."""
-    prompt_obj, variables, rendered, last_text, version, model = bits
-    output_text = _extract_output_text(response)
-    post_ctx = CheckContext(
-        rendered=rendered,
-        messages=messages,
-        prompt=prompt_obj,
-        variables=variables,
-        model=getattr(response, "model", None) or model,
-        output_text=output_text,
+    Async post-checks land later via their futures.
+
+    The post context is the pre context with the response fields filled in, so
+    any pre-check rewrite (already folded into pre_ctx) is what the audit sees.
+    """
+    post_ctx = replace(
+        pre_ctx,
+        model=getattr(response, "model", None) or pre_ctx.model,
+        output_text=_extract_output_text(response),
         response=response,
-        last_text=last_text,
     )
     blocking = [c for c in post_checks if c.mode != "async"]
     asyncs = [c for c in post_checks if c.mode == "async"]
@@ -585,12 +608,11 @@ def _checked_post(
 
 def _run_checked_create(original, args, kwargs, tracked, messages, conv, pre_checks, post_checks):
     """Checked call on the sync path: pre-gate, call, post-audit, RunHandle."""
-    outcome, bits = _checked_pre(tracked, messages, kwargs, pre_checks)
-    stub = _checked_block(outcome, tracked, kwargs, conv, bits)
+    outcome, pre_ctx, version = _checked_pre(tracked, messages, kwargs, pre_checks)
+    stub = _checked_block(outcome, tracked, kwargs, conv, version)
     if stub is not None:
         return stub
-    if outcome.rewritten is not None:
-        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    messages, pre_ctx, conv = _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv)
     start = time.perf_counter()
     try:
         response = original(*args, **kwargs)
@@ -598,7 +620,7 @@ def _run_checked_create(original, args, kwargs, tracked, messages, conv, pre_che
         _checked_record_error(tracked, kwargs, conv, outcome, repr(exc), _ms(start))
         raise
     return _checked_post(
-        response, tracked, kwargs, conv, outcome, bits, messages, post_checks, _ms(start)
+        response, tracked, kwargs, conv, outcome, pre_ctx, version, post_checks, _ms(start)
     )
 
 
@@ -609,13 +631,14 @@ async def _run_checked_create_async(
     via asyncio.to_thread so a slow check or DB write never blocks it."""
     import asyncio
 
-    outcome, bits = await asyncio.to_thread(_checked_pre, tracked, messages, kwargs, pre_checks)
+    outcome, pre_ctx, version = await asyncio.to_thread(
+        _checked_pre, tracked, messages, kwargs, pre_checks
+    )
     # _checked_block raises PromptBlocked through to_thread when on_block='raise'.
-    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, bits)
+    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, version)
     if stub is not None:
         return stub
-    if outcome.rewritten is not None:
-        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    messages, pre_ctx, conv = _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv)
     start = time.perf_counter()
     try:
         response = await original(*args, **kwargs)
@@ -631,8 +654,8 @@ async def _run_checked_create_async(
         kwargs,
         conv,
         outcome,
-        bits,
-        messages,
+        pre_ctx,
+        version,
         post_checks,
         _ms(start),
     )
@@ -845,12 +868,14 @@ class _CheckedStreamRecorder(_StreamRecorder):
     `outcome`. finish() adds the post verdicts and records the run with both.
     """
 
-    def __init__(self, tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle):
+    def __init__(
+        self, tracked, kwargs, start, conv, outcome, pre_ctx, version, post_checks, handle
+    ):
         super().__init__(tracked, kwargs, start, conv[0], conv[1], conv[2])
         self.conv = conv
         self.outcome = outcome
-        self.bits = bits
-        self.messages = messages
+        self.pre_ctx = pre_ctx
+        self.version = version
         self.post_checks = post_checks
         self.handle = handle
 
@@ -876,8 +901,8 @@ class _CheckedStreamRecorder(_StreamRecorder):
             self.kwargs,
             self.conv,
             self.outcome,
-            self.bits,
-            self.messages,
+            self.pre_ctx,
+            self.version,
             self.post_checks,
             _ms(self.start),
             handle=self.handle,
@@ -887,21 +912,20 @@ class _CheckedStreamRecorder(_StreamRecorder):
 def _run_checked_stream(original, args, kwargs, tracked, messages, conv, pre_checks, post_checks):
     """Checked streaming (sync): pre-gate before the stream, post-audit after it
     drains. Returns a proxy carrying the (progressively filled) RunHandle."""
-    outcome, bits = _checked_pre(tracked, messages, kwargs, pre_checks)
-    stub = _checked_block(outcome, tracked, kwargs, conv, bits)
+    outcome, pre_ctx, version = _checked_pre(tracked, messages, kwargs, pre_checks)
+    stub = _checked_block(outcome, tracked, kwargs, conv, version)
     if stub is not None:
         return stub
-    if outcome.rewritten is not None:
-        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    messages, pre_ctx, conv = _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv)
     start = time.perf_counter()
     try:
         stream = original(*args, **kwargs)
     except Exception as exc:
         _checked_record_error(tracked, kwargs, conv, outcome, repr(exc), _ms(start))
         raise
-    handle = RunHandle(None, bits[4], list(outcome.results))
+    handle = RunHandle(None, version, list(outcome.results))
     recorder = _CheckedStreamRecorder(
-        tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle
+        tracked, kwargs, start, conv, outcome, pre_ctx, version, post_checks, handle
     )
     proxy = _SyncStreamProxy(stream, recorder)
     _attach_handle(proxy, handle)
@@ -914,12 +938,13 @@ async def _run_checked_stream_async(
     """Checked streaming (async): same shape, blocking phases off the loop."""
     import asyncio
 
-    outcome, bits = await asyncio.to_thread(_checked_pre, tracked, messages, kwargs, pre_checks)
-    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, bits)
+    outcome, pre_ctx, version = await asyncio.to_thread(
+        _checked_pre, tracked, messages, kwargs, pre_checks
+    )
+    stub = await asyncio.to_thread(_checked_block, outcome, tracked, kwargs, conv, version)
     if stub is not None:
         return stub
-    if outcome.rewritten is not None:
-        kwargs["messages"] = _apply_rewrite(messages, outcome.rewritten)
+    messages, pre_ctx, conv = _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv)
     start = time.perf_counter()
     try:
         stream = await original(*args, **kwargs)
@@ -928,9 +953,9 @@ async def _run_checked_stream_async(
             _checked_record_error, tracked, kwargs, conv, outcome, repr(exc), _ms(start)
         )
         raise
-    handle = RunHandle(None, bits[4], list(outcome.results))
+    handle = RunHandle(None, version, list(outcome.results))
     recorder = _CheckedStreamRecorder(
-        tracked, kwargs, start, conv, outcome, bits, messages, post_checks, handle
+        tracked, kwargs, start, conv, outcome, pre_ctx, version, post_checks, handle
     )
     proxy = _AsyncStreamProxy(stream, recorder)
     _attach_handle(proxy, handle)
