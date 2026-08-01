@@ -12,6 +12,7 @@ Run from the repo root:  uv run python examples/seed_demo.py
 """
 
 import random
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ for suffix in ("", "-wal", "-shm"):
         p.unlink()
 
 import promptkeep  # noqa: E402
-from promptkeep import Prompt  # noqa: E402
+from promptkeep import Prompt, PromptBlocked, Verdict, check  # noqa: E402
 
 promptkeep.configure(db_path=str(DB_PATH))
 random.seed(42)
@@ -303,6 +304,77 @@ fail(
 fail(
     [{"role": "system", "content": SUMMARIZE_V2}],
     RuntimeError("AuthenticationError: invalid API key"),
+)
+
+
+# --- checked runs: pre-gates and post-audits, so the dashboard's checks view
+#     and the runs verdict badges have data across ok / warn / blocked ----------
+
+
+@check.pre(name="no_secrets")
+def no_secrets(ctx):
+    """Block a prompt that leaks something shaped like an API key."""
+    if re.search(r"sk-[A-Za-z0-9\-]{6,}", ctx.rendered):
+        return Verdict.block("an API key was in the prompt")
+    return Verdict.ok()
+
+
+@check.post(name="grounded", mode="blocking")
+def grounded(ctx):
+    """Toy groundedness score: a one-liner reply reads as unsupported."""
+    return Verdict.from_score(0.92 if len(ctx.output_text or "") > 40 else 0.3, threshold=0.5)
+
+
+@check.post(name="offers_next_step", mode="blocking")
+def offers_next_step(ctx):
+    """Warn (don't block) when a support reply names no next step."""
+    text = (ctx.output_text or "").lower()
+    return Verdict.ok() if ("next" in text or "step" in text) else Verdict.warn("no next step")
+
+
+def checked_call(messages, reply, pre=None, post=None, model="gpt-4o-mini"):
+    """A tracked call carrying per-call checks; swallow a block like a real app."""
+    tokens_in = sum(len(str(m.get("content", ""))) // 4 for m in messages) + 20
+    client.chat.completions.next_result = _response(
+        reply, model, tokens_in, max(len(reply) // 4, 5)
+    )
+    kwargs = {"model": model, "messages": messages}
+    if pre:
+        kwargs["promptkeep_pre"] = pre
+    if post:
+        kwargs["promptkeep_post"] = post
+    try:
+        client.chat.completions.create(**kwargs)
+    except PromptBlocked:
+        pass  # recorded as a blocked run; the app would ask the user to retry
+
+
+# both audits pass -> verification "ok"
+checked_call(
+    [
+        {"role": "system", "content": REVIEW_V3.format(focus="security")},
+        {"role": "user", "content": "def login(pw): return pw == stored_pw"},
+    ],
+    "Timing-unsafe comparison — use hmac.compare_digest. Next step: patch it and add a test.",
+    post=[grounded, offers_next_step],
+)
+# a thin reply -> grounded warns, no next step warns -> verification "warn"
+checked_call(
+    [
+        {"role": "system", "content": SUPPORT_V2.format(product="billing")},
+        {"role": "user", "content": "why was I charged twice?"},
+    ],
+    "Let me check.",
+    post=[grounded, offers_next_step],
+)
+# a leaked key never reaches the model -> a blocked run
+checked_call(
+    [
+        {"role": "system", "content": SUPPORT_V1},
+        {"role": "user", "content": "my key is sk-live-9fA2Bq7Xk — is it still valid?"},
+    ],
+    "(never sent)",
+    pre=[no_secrets],
 )
 
 
