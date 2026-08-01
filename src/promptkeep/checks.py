@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("promptkeep")
 
@@ -40,17 +40,47 @@ _suppressed: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "promptkeep_suppress", default=False
 )
 
-# One shared pool: enforces per-check timeouts (a sync function can't be
-# interrupted otherwise) and runs async post-checks off the caller's thread.
+# Shared pool for *async* post-checks only (fire-and-forget audits that run
+# after the response is already back). Its size bounds how many run at once —
+# backpressure on background telemetry, which never gates a request. Blocking
+# checks (pre and blocking-post) do NOT use this pool: each runs in its own
+# thread (see _run_with_timeout), so a saturated pool can't make a fast check
+# look slow or cap how many requests can be in flight.
 _executor: Optional[ThreadPoolExecutor] = None
 
 
 def _get_executor() -> ThreadPoolExecutor:
-    """Lazily create the shared check executor (never at import time)."""
+    """Lazily create the shared async-post-check pool (never at import time)."""
     global _executor
     if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-check")
+        _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
     return _executor
+
+
+def _run_with_timeout(fn: Callable[[], Any], timeout: float) -> Tuple[bool, Any]:
+    """Run ``fn()`` in a dedicated daemon thread, waiting up to ``timeout`` seconds.
+
+    A fresh thread per call — not a shared pool — is deliberate. It means the
+    timeout measures the check's *own* execution: there's no queue to wait in
+    first, so a saturated pool can never make a fast check look like it timed
+    out (which, with on_timeout='closed', would block real traffic). The
+    number of check threads is then bounded by request concurrency, not a
+    fixed worker count.
+
+    Returns ``(finished, result)``: ``(True, value)`` when ``fn`` completed,
+    ``(False, None)`` when it ran past the timeout. A timed-out check keeps
+    running — a synchronous function can't be interrupted — but the thread is
+    a daemon, so a check that hangs forever neither holds up interpreter exit
+    nor permanently retires a pooled worker (both of which the old shared pool
+    was prone to).
+    """
+    box: List[Any] = []
+    thread = threading.Thread(target=lambda: box.append(fn()), name="promptkeep-check", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return False, None
+    return True, box[0]
 
 
 def suppressed() -> bool:
@@ -189,20 +219,24 @@ class Check:
     def run(self, ctx: CheckContext) -> "CheckResult":
         """Hot-path execution with a timeout. On timeout, fail open (record a
         warning and continue) unless on_timeout='closed' on a pre-check, which
-        blocks. A slow check must never become an outage."""
+        blocks. A slow check must never become an outage.
+
+        The timeout is enforced in a dedicated thread (not a shared pool), so
+        it measures this check's execution rather than time spent queued behind
+        other checks — under load a fast check no longer spuriously times out.
+        """
         if self.timeout is None:
             return self._execute(ctx)
         start = time.perf_counter()
-        future = _get_executor().submit(self._execute, ctx)
-        try:
-            return future.result(timeout=self.timeout)
-        except FuturesTimeout:
-            latency = int((time.perf_counter() - start) * 1000)
-            msg = f"check timed out after {self.timeout}s"
-            if self.on_timeout == "closed" and self.phase == "pre":
-                return CheckResult(self.name, self.phase, "block", None, msg, latency)
-            logger.warning("promptkeep: check %r timed out — failing open", self.name)
-            return CheckResult(self.name, self.phase, "warn", None, msg, latency)
+        finished, result = _run_with_timeout(lambda: self._execute(ctx), self.timeout)
+        if finished:
+            return result
+        latency = int((time.perf_counter() - start) * 1000)
+        msg = f"check timed out after {self.timeout}s"
+        if self.on_timeout == "closed" and self.phase == "pre":
+            return CheckResult(self.name, self.phase, "block", None, msg, latency)
+        logger.warning("promptkeep: check %r timed out — failing open", self.name)
+        return CheckResult(self.name, self.phase, "warn", None, msg, latency)
 
     def run_inline(self, ctx: CheckContext) -> "CheckResult":
         """Execution without the timeout wrapper — for async post-checks, which

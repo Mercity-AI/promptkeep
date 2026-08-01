@@ -312,6 +312,37 @@ class TestSafety:
             )
         assert client.calls == []
 
+    def test_checks_under_load_do_not_spuriously_time_out(self):
+        # Each blocking check runs in its own thread, so its timeout measures
+        # its own execution, not time spent queued behind other checks. With
+        # far more concurrent calls than the old shared pool had workers (8),
+        # a comfortably-fast check must not report a timeout just because the
+        # pool was saturated.
+        import threading
+
+        @check.pre(name="gate", timeout=0.7)
+        def gate(ctx):
+            time.sleep(0.3)  # well under the 0.7s budget on its own
+            return Verdict.ok()
+
+        p = Prompt("sys", name="P", pre=[gate])
+        results = {}
+
+        def call(i):
+            resp = _client().chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+            results[i] = resp.promptkeep.verification
+
+        threads = [threading.Thread(target=call, args=(i,)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # All 24 ran concurrently and passed; none fell back to a timeout warn.
+        assert len(results) == 24
+        assert set(results.values()) == {"ok"}
+
 
 class TestScopes:
     def test_global_and_per_call_checks_apply(self):
