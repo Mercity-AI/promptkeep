@@ -525,6 +525,46 @@ class TestStreamingChecks:
         stream = asyncio.run(go())
         assert {c.name for c in stream.promptkeep.checks} == {"grounded"}
 
+    def test_async_stream_finalize_does_not_stall_the_loop(self):
+        # A blocking post-check on an async stream must run off the event loop:
+        # finalizing inline would freeze every other task for the check's
+        # duration. Measure with a heartbeat running alongside the drain.
+        @check.post(name="slow", mode="blocking", timeout=5.0)
+        def slow(ctx):
+            time.sleep(0.3)
+            return Verdict.ok()
+
+        p = Prompt("sys", name="SP", post=[slow])
+        client = wrap(FakeAsyncClient(stream_chunks=self._chunks()))
+
+        async def go():
+            gaps = []
+
+            async def heartbeat(stop):
+                last = time.perf_counter()
+                while not stop.is_set():
+                    await asyncio.sleep(0.01)
+                    now = time.perf_counter()
+                    gaps.append(now - last)
+                    last = now
+
+            stop = asyncio.Event()
+            hb = asyncio.create_task(heartbeat(stop))
+            stream = await client.chat.completions.create(
+                model="m", stream=True, messages=[{"role": "developer", "content": p}]
+            )
+            _ = [c async for c in stream]  # drain -> triggers finalize + slow check
+            stop.set()
+            await hb
+            return gaps, stream
+
+        gaps, stream = asyncio.run(go())
+        # The check still ran and recorded.
+        assert {c.name for c in stream.promptkeep.checks} == {"slow"}
+        # The loop stayed responsive: no heartbeat gap anywhere near the 0.3s
+        # check. Inline finalize would have produced a ~0.3s gap.
+        assert max(gaps) < 0.15
+
 
 class TestCallHelper:
     """promptkeep.call() / acall(): the explicit result shape."""

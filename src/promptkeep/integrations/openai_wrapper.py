@@ -1018,9 +1018,32 @@ class _AsyncStreamProxy:
         self._stream = stream
         self._recorder = recorder
         self._iterator = None
+        self._finalized = False
 
     def __aiter__(self):
         return self
+
+    async def _finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+        """Finalize off the event loop.
+
+        recorder.finish() runs post-checks and a synchronous DB insert. On the
+        async path those must not run on the loop thread — a blocking
+        post-check would stall every other task, and even a plain insert can
+        wait on the write lock (busy_timeout). Offload to a worker thread,
+        mirroring the non-streaming async path.
+
+        The write-once claim is taken *here*, synchronously, before the await:
+        two finalize points (StopAsyncIteration and __aexit__) can both reach
+        this across the yield, and flipping the flag before offloading is what
+        keeps it single-shot. asyncio.shield keeps the record from being lost
+        if the consuming task is cancelled mid-finalize.
+        """
+        import asyncio
+
+        if self._finalized:
+            return
+        self._finalized = True
+        await asyncio.shield(asyncio.to_thread(self._recorder.finish, status, error))
 
     async def __anext__(self):
         """Yield the next chunk, absorbing it; finish the run on exhaustion/error."""
@@ -1029,10 +1052,10 @@ class _AsyncStreamProxy:
         try:
             chunk = await self._iterator.__anext__()
         except StopAsyncIteration:
-            self._recorder.finish()
+            await self._finish()
             raise
         except Exception as exc:
-            self._recorder.finish(status="error", error=repr(exc))
+            await self._finish(status="error", error=repr(exc))
             raise
         self._recorder.absorb(chunk)
         return chunk
@@ -1046,7 +1069,7 @@ class _AsyncStreamProxy:
 
     async def __aexit__(self, exc_type, exc, tb):
         """Record on context exit (even if the loop broke early), then delegate."""
-        self._recorder.finish(
+        await self._finish(
             status="error" if exc_type else "ok",
             error=repr(exc) if exc_type else None,
         )
