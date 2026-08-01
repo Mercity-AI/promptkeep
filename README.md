@@ -162,7 +162,9 @@ attach globally (`configure(pre=[...])`), per prompt, or per call
 never breaks your call (it fails open, recorded); an LLM-judge check doesn't
 record itself. Checks run on every call path — sync or async, streaming or not
 (post-checks fire once a stream finishes). Every verdict is saved to the
-`checks` table, tied to the prompt version that produced the output.
+`checks` table, tied to the run it graded (and, when a `Prompt` drove the call,
+that prompt's version). Because the verdicts need a run to hang off, a checked
+call records its run synchronously even in background write mode.
 
 ## History
 
@@ -227,6 +229,9 @@ promptkeep.configure(
     queue_size=10_000,              # background queue bound (drop-oldest when full)
     flush_interval=0.5,             # seconds the writer waits before a partial batch
     batch_size=100,                 # max rows per write transaction
+    pre=[...],                      # global pre-checks (gates), run on every tracked call
+    post=[...],                     # global post-checks (audits), run on every tracked call
+    on_block="raise",               # blocked pre-check: "raise" PromptBlocked | "return" a stub
 )
 ```
 
