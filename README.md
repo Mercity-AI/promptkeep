@@ -158,13 +158,23 @@ result.run_id
 A blocked call raises `PromptBlocked` by default; `configure(on_block="return")`
 makes it return a response-shaped stub instead so a service can degrade. Checks
 attach globally (`configure(pre=[...])`), per prompt, or per call
-(`promptkeep_pre=[...]`), merged most-specific-wins. A crashing or slow check
-never breaks your call (it fails open, recorded); an LLM-judge check doesn't
-record itself. Checks run on every call path — sync or async, streaming or not
-(post-checks fire once a stream finishes). Every verdict is saved to the
-`checks` table, tied to the run it graded (and, when a `Prompt` drove the call,
-that prompt's version). Because the verdicts need a run to hang off, a checked
-call records its run synchronously even in background write mode.
+(`promptkeep_pre=[...]`), merged most-specific-wins.
+
+Because a guardrail is only useful if it can't take the request down with it,
+checks are isolated from your call path: a crashing or slow check never breaks
+the call (it fails open, recorded), each check's timeout measures its own
+execution — so a burst of concurrent calls can't make a fast check look slow —
+and on async calls nothing runs on the event loop, not even a streamed
+response's post-checks. A check reads the current turn as `ctx.last_text` even
+when the message carries image content, and a `pre` rewrite is applied
+consistently to the outgoing request, the post-check that audits it, and the
+row that's stored. An LLM-judge check doesn't record itself.
+
+Checks run on every call path — sync or async, streaming or not (post-checks
+fire once a stream finishes). Every verdict is saved to the `checks` table, tied
+to the run it graded (and, when a `Prompt` drove the call, that prompt's
+version). Because the verdicts need a run to hang off, a checked call records
+its run synchronously even in background write mode.
 
 ## History
 
