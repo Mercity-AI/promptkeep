@@ -359,24 +359,36 @@ def _joined_text(messages):
     return "\n".join(parts)
 
 
-def _last_text(messages):
-    """The newest outgoing message's string content — what rewrite targets."""
-    if not isinstance(messages, (list, tuple)):
-        return None
-    for message in reversed(messages):
-        if isinstance(message, dict) and isinstance(message.get("content"), str):
-            return message["content"]
-    return None
-
-
 def _apply_rewrite(messages, new_text):
-    """Replace the last text message's content with a pre-check's rewrite."""
+    """Replace the current turn's text with a pre-check's rewrite.
+
+    Targets exactly the message ``_extract_input_text`` reads as
+    ``ctx.last_text`` — the newest non-system message — so a rewrite built
+    from ``last_text`` lands where the check meant it to. A trailing
+    system/developer message has no user turn to rewrite, so this is a no-op;
+    multi-part (image) content keeps its non-text blocks and its rewritten
+    text goes into the first text block.
+    """
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return messages
     new_messages = list(messages)
-    for i in range(len(new_messages) - 1, -1, -1):
-        msg = new_messages[i]
-        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-            new_messages[i] = {**msg, "content": new_text}
-            break
+    last = new_messages[-1]
+    if not isinstance(last, dict) or last.get("role") in ("system", "developer"):
+        return new_messages
+    content = last.get("content")
+    if isinstance(content, str):
+        new_messages[-1] = {**last, "content": new_text}
+    elif isinstance(content, list):
+        new_blocks, replaced = [], False
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                if not replaced:  # the joined text folds into the first block
+                    new_blocks.append({**block, "text": new_text})
+                    replaced = True
+            else:
+                new_blocks.append(block)
+        if replaced:
+            new_messages[-1] = {**last, "content": new_blocks}
     return new_messages
 
 
@@ -482,7 +494,10 @@ def _checked_pre(tracked, messages, kwargs, pre_checks):
     prompt_obj = tracked[0][0] if len(tracked) == 1 else None
     variables = tracked[0][1] if len(tracked) == 1 else None
     rendered = _joined_text(messages)
-    last_text = _last_text(messages)
+    # The current turn — skips a trailing system prompt and flattens image
+    # content blocks, so a PII/rewrite check reads the user's real message,
+    # not whatever last happened to be a plain string.
+    last_text = _extract_input_text(messages)
     model = kwargs.get("model")
     version = prompt_obj.version if prompt_obj is not None else None
     pre_ctx = CheckContext(

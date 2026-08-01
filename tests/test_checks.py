@@ -126,6 +126,63 @@ class TestPreChecks:
         assert sent[0]["content"] == "system"  # system prompt untouched
         assert sent[1]["content"] == "my [redacted] token"
 
+    def test_last_text_reads_the_user_turn_not_the_system_prompt(self):
+        # A user message with image content is a list of blocks, not a string.
+        # A gate must still scan the user's text, not fall back to the system
+        # prompt (which would let a secret through on any vision call).
+        seen = {}
+
+        @check.pre(name="peek")
+        def gate(ctx):
+            seen["last_text"] = ctx.last_text
+            return Verdict.ok()
+
+        p = Prompt("you are a support agent", name="P", pre=[gate])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "here is my key sk-live-abc123"},
+                        {"type": "image_url", "image_url": {"url": "data:..."}},
+                    ],
+                },
+            ],
+        )
+        assert seen["last_text"] == "here is my key sk-live-abc123"
+
+    def test_rewrite_targets_multimodal_user_turn(self):
+        # A rewrite on a vision message must edit the user's text block and
+        # keep the image, not overwrite the system prompt.
+        @check.pre(name="redact")
+        def gate(ctx):
+            return Verdict.rewrite((ctx.last_text or "").replace("SECRET", "[redacted]"))
+
+        p = Prompt("system", name="P", pre=[gate])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "my SECRET token"},
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                    ],
+                },
+            ],
+        )
+        sent = client.calls[0]["messages"]
+        assert sent[0]["content"] == "system"  # system prompt untouched
+        text_blocks = [b for b in sent[1]["content"] if b.get("type") == "text"]
+        image_blocks = [b for b in sent[1]["content"] if b.get("type") == "image_url"]
+        assert text_blocks[0]["text"] == "my [redacted] token"
+        assert len(image_blocks) == 1  # image preserved
+
 
 class TestPostChecks:
     def test_blocking_post_grades_output(self):
