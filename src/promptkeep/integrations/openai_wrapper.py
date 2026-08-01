@@ -229,6 +229,26 @@ def _ms(start: float) -> int:
     return int(round((time.perf_counter() - start) * 1000))
 
 
+def _response_fields(response, kwargs) -> dict:
+    """The run-row fields pulled from a response and its request kwargs.
+
+    Shared by the checked and unchecked record paths so there's one place that
+    knows how to read a response. Defensive by construction — response may be
+    None (an error) or a synthetic stream summary, so every missing attribute
+    becomes a NULL rather than raising.
+    """
+    usage = getattr(response, "usage", None)
+    return dict(
+        model=getattr(response, "model", None) or kwargs.get("model"),
+        request_params={k: v for k, v in kwargs.items() if k != "messages"},
+        response_id=getattr(response, "id", None),
+        output_text=_extract_output_text(response),
+        prompt_tokens=getattr(usage, "prompt_tokens", None),
+        completion_tokens=getattr(usage, "completion_tokens", None),
+        total_tokens=getattr(usage, "total_tokens", None),
+    )
+
+
 def _record_runs(
     tracked,
     kwargs,
@@ -249,61 +269,26 @@ def _record_runs(
     """
     if not tracked and conversation_id is None:
         return
-    # Pull metadata defensively — response may be None (errors) or a
-    # synthetic stream summary; missing fields just become NULLs.
     try:
-        model = getattr(response, "model", None) or kwargs.get("model")
-        response_id = getattr(response, "id", None)
-        usage = getattr(response, "usage", None)
-        output_text = None
-        choices = getattr(response, "choices", None)
-        if choices:
-            message = getattr(choices[0], "message", None)
-            content = getattr(message, "content", None)
-            if isinstance(content, str):
-                output_text = content
-        request_params = {k: v for k, v in kwargs.items() if k != "messages"}
+        fields = _response_fields(response, kwargs)
     except Exception:
         logger.warning("promptkeep: failed to extract response metadata", exc_info=True)
         return
+    common = dict(
+        provider="openai",
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+        conversation_id=conversation_id,
+        turn_index=turn_index,
+        input_text=input_text,
+        **fields,
+    )
     if tracked:
         for prompt_obj, variables, rendered in tracked:
-            record_prompt_run(
-                prompt_obj,
-                variables,
-                rendered,
-                provider="openai",
-                model=model,
-                request_params=request_params,
-                response_id=response_id,
-                output_text=output_text,
-                prompt_tokens=getattr(usage, "prompt_tokens", None),
-                completion_tokens=getattr(usage, "completion_tokens", None),
-                total_tokens=getattr(usage, "total_tokens", None),
-                latency_ms=latency_ms,
-                status=status,
-                error=error,
-                conversation_id=conversation_id,
-                turn_index=turn_index,
-                input_text=input_text,
-            )
+            record_prompt_run(prompt_obj, variables, rendered, **common)
     else:
-        record_conversation_turn(
-            provider="openai",
-            model=model,
-            request_params=request_params,
-            response_id=response_id,
-            output_text=output_text,
-            prompt_tokens=getattr(usage, "prompt_tokens", None),
-            completion_tokens=getattr(usage, "completion_tokens", None),
-            total_tokens=getattr(usage, "total_tokens", None),
-            latency_ms=latency_ms,
-            status=status,
-            error=error,
-            conversation_id=conversation_id,
-            turn_index=turn_index,
-            input_text=input_text,
-        )
+        record_conversation_turn(**common)
 
 
 # --- checks -----------------------------------------------------------------------
@@ -423,39 +408,24 @@ def _record_checked(tracked, kwargs, response, latency_ms, status, error, conv, 
     the rest record normally.
     """
     conversation_id, turn_index, input_text = conv
-    model = getattr(response, "model", None) or kwargs.get("model")
-    response_id = getattr(response, "id", None)
-    usage = getattr(response, "usage", None)
-    output_text = _extract_output_text(response)
-    request_params = {k: v for k, v in kwargs.items() if k != "messages"}
     usage_kw = dict(
-        model=model,
-        request_params=request_params,
-        response_id=response_id,
-        output_text=output_text,
-        prompt_tokens=getattr(usage, "prompt_tokens", None),
-        completion_tokens=getattr(usage, "completion_tokens", None),
-        total_tokens=getattr(usage, "total_tokens", None),
+        provider="openai",
         latency_ms=latency_ms,
         status=status,
         error=error,
         conversation_id=conversation_id,
         turn_index=turn_index,
         input_text=input_text,
+        **_response_fields(response, kwargs),
     )
     if tracked:
         run_id = record_prompt_run(
-            tracked[0][0],
-            tracked[0][1],
-            tracked[0][2],
-            provider="openai",
-            checks=check_rows,
-            **usage_kw,
+            tracked[0][0], tracked[0][1], tracked[0][2], checks=check_rows, **usage_kw
         )
         for prompt_obj, variables, rendered in tracked[1:]:
-            record_prompt_run(prompt_obj, variables, rendered, provider="openai", **usage_kw)
+            record_prompt_run(prompt_obj, variables, rendered, **usage_kw)
         return run_id
-    return record_conversation_turn(provider="openai", checks=check_rows, **usage_kw)
+    return record_conversation_turn(checks=check_rows, **usage_kw)
 
 
 def _extract_output_text(response):
@@ -498,8 +468,11 @@ def _checked_pre(tracked, messages, kwargs, pre_checks):
     fields, and the place a rewrite gets folded in so the audit and the
     recorded row see the rewritten turn, not the original.
     """
-    prompt_obj = tracked[0][0] if len(tracked) == 1 else None
-    variables = tracked[0][1] if len(tracked) == 1 else None
+    # When several prompts ride one call, checks and the RunHandle refer to
+    # the first — the same run the verdicts are filed under (see
+    # _record_checked) — so ctx.prompt/version and the recorded row agree.
+    prompt_obj = tracked[0][0] if tracked else None
+    variables = tracked[0][1] if tracked else None
     version = prompt_obj.version if prompt_obj is not None else None
     pre_ctx = CheckContext(
         rendered=_joined_text(messages),
