@@ -37,6 +37,12 @@ _thread: Optional[threading.Thread] = None
 _dropped_total = 0
 _last_drop_log = 0.0
 _DROP_LOG_INTERVAL = 5.0
+# The atexit drain is registered once per process, not once per worker start:
+# reset() retires the thread, and re-registering on each restart would pile up
+# duplicate hooks (one per test, in a test suite). Deliberately not cleared by
+# reset() — a stale hook is harmless (flush() no-ops on an empty queue), a
+# leaked one per reset is not.
+_atexit_registered = False
 
 
 def submit(item: dict) -> None:
@@ -147,7 +153,12 @@ def _ensure_started() -> "queue.Queue[dict]":
             _thread.start()
             # Drain on interpreter exit: atexit runs in the main thread while
             # daemon threads are still alive, so queued rows can still land.
-            atexit.register(flush, 2.0)
+            # Registered once per process (see _atexit_registered) — restarts
+            # after reset() must not stack duplicate hooks.
+            global _atexit_registered
+            if not _atexit_registered:
+                atexit.register(flush, 2.0)
+                _atexit_registered = True
         return _queue
 
 

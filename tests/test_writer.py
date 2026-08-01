@@ -98,6 +98,19 @@ class TestOffMode:
         promptkeep.flush(timeout=2)
         assert history.runs("OFF") == []
 
+    def test_atexit_hook_registered_once_across_restarts(self, monkeypatch):
+        """reset() retires the worker; restarting it must not stack a fresh
+        atexit hook each time (one per test would leak hundreds in a suite)."""
+        registered = []
+        monkeypatch.setattr(writer.atexit, "register", lambda *a, **k: registered.append(a))
+        # Force a clean slate for the module's one-time-registration flag.
+        writer._atexit_registered = False
+        promptkeep.configure(write_mode="background")
+        for _ in range(5):
+            writer.reset()  # retire the worker
+            _record()  # next enqueue restarts it
+        assert len(registered) == 1
+
 
 class TestSyncMode:
     def test_sync_rows_exist_immediately(self):
