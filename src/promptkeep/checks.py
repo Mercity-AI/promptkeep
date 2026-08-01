@@ -368,19 +368,16 @@ class RunHandle:
 
     @property
     def verification(self) -> str:
-        """Aggregate: 'failed' if anything blocked/errored, else 'warn' if any
-        warning, 'pending' if async checks are still running, else 'ok'."""
-        if self._pending():
-            statuses = [c.status for c in self.checks]
-            if any(s in ("block", "error") for s in statuses):
-                return "failed"
-            return "pending"
+        """Aggregate verdict, in precedence order: 'failed' if anything
+        blocked/errored, else 'pending' if async checks are still running
+        (a later verdict could still fail), else 'warn' if any warned, else
+        'ok'."""
         statuses = [c.status for c in self.checks]
         if any(s in ("block", "error") for s in statuses):
             return "failed"
-        if any(s == "warn" for s in statuses):
-            return "warn"
-        return "ok"
+        if self._pending():
+            return "pending"
+        return "warn" if any(s == "warn" for s in statuses) else "ok"
 
     def _pending(self) -> bool:
         return any(not f.done() for f in self._futures)
@@ -440,6 +437,29 @@ def _result_from_response(response) -> CallResult:
     return CallResult(text, "ok", None, [], response)
 
 
+def _require_non_streaming(kwargs) -> None:
+    """call()/acall() return a settled CallResult, so streaming makes no sense
+    here — the reply and verdicts don't exist until the stream drains. Fail
+    loudly instead of returning a CallResult built from an undrained proxy."""
+    if kwargs.get("stream"):
+        raise ValueError(
+            "promptkeep.call()/acall() are non-streaming. Drop stream=True, or call the "
+            "wrapped client's create(stream=True) directly and read response.promptkeep "
+            "once the stream finishes."
+        )
+
+
+def _warn_if_unwrapped(client) -> None:
+    """call() runs checks via the wrapper, so an unwrapped client silently does
+    nothing — verification would always be 'ok'. Warn rather than pretend."""
+    completions = getattr(getattr(client, "chat", None), "completions", None)
+    if completions is not None and not getattr(completions, "_pm_instrumented", False):
+        logger.warning(
+            "promptkeep.call(): client is not wrapped, so no tracking or checks ran "
+            "(verification will always be 'ok'). Pass promptkeep.wrap(client)."
+        )
+
+
 def call(client, **kwargs) -> CallResult:
     """Make a tracked, checked call and get a result object directly.
 
@@ -449,13 +469,18 @@ def call(client, **kwargs) -> CallResult:
 
     Same rows as the attach path — just a nicer shape for new code. Blocked
     calls raise PromptBlocked (or, under on_block="return", come back with
-    verification="failed" and text=None). Non-streaming only.
+    verification="failed" and text=None). Non-streaming only: passing
+    stream=True raises (use the wrapped client's create(stream=True) instead).
     """
+    _require_non_streaming(kwargs)
+    _warn_if_unwrapped(client)
     response = client.chat.completions.create(**kwargs)
     return _result_from_response(response)
 
 
 async def acall(client, **kwargs) -> CallResult:
-    """Async twin of call(), for AsyncOpenAI clients."""
+    """Async twin of call(), for AsyncOpenAI clients. Non-streaming only."""
+    _require_non_streaming(kwargs)
+    _warn_if_unwrapped(client)
     response = await client.chat.completions.create(**kwargs)
     return _result_from_response(response)

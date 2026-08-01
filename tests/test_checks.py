@@ -633,3 +633,18 @@ class TestCallHelper:
 
         result = asyncio.run(go())
         assert result.text == "Paris is the capital of France."
+
+    def test_call_rejects_streaming(self):
+        # A CallResult is settled; streaming has no reply/verdicts yet, so
+        # call() must refuse rather than build a result from an undrained proxy.
+        with pytest.raises(ValueError, match="non-streaming"):
+            call(_client(), model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
+
+    def test_call_warns_on_unwrapped_client(self, caplog):
+        # An unwrapped client runs no checks, so verification is a meaningless
+        # "ok" — call() should warn rather than pretend it verified anything.
+        raw = FakeClient(response=make_response())  # not wrapped
+        with caplog.at_level("WARNING", logger="promptkeep"):
+            result = call(raw, model="m", messages=[{"role": "user", "content": "hi"}])
+        assert result.verification == "ok"
+        assert any("not wrapped" in r.message for r in caplog.records)
