@@ -114,8 +114,9 @@ class RunRecord(BaseModel):
 
     version is nullable because a conversation turn need not involve a
     wrapped Prompt (a plain follow-up message still gets a row so the whole
-    session can be replayed); a run with neither a version nor a
-    conversation is never created.
+    session can be replayed). Usually a run has a version, a conversation, or
+    both; the one exception is a checked call outside any conversation with no
+    wrapped Prompt, whose row exists solely to anchor its check verdicts.
     """
 
     version = pw.ForeignKeyField(
@@ -241,33 +242,38 @@ def _get_db() -> Optional[pw.DatabaseProxy]:
 def _migrate(database: pw.SqliteDatabase) -> None:
     """Apply forward-only schema steps until the DB reaches _SCHEMA_VERSION.
 
-    Each step advances a local `user_version` so steps compose regardless of
-    which version a real DB starts at (e.g. 1 -> 3 must run both the v2 and
-    v3 steps). A brand-new DB is created straight from `_MODELS` at the
-    latest shape, so it's marked done immediately rather than re-running
+    Steps compose regardless of which version a real DB starts at (e.g. 1 -> 3
+    runs both the v2 and v3 steps) — each guard tests the version the DB began
+    at. Every step runs in its own transaction that also stamps the new
+    `user_version`, so a step and its version bump commit together: an
+    interrupted step rolls back whole and re-runs from the same version rather
+    than replaying half of it into a "duplicate column" error. A brand-new DB
+    is created straight from `_MODELS` at the latest shape, so it skips the
     legacy fix-up steps meant for pre-existing rows.
     """
     (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
-    started_at = user_version
     if user_version < 1:
-        database.create_tables(_MODELS, safe=True)
-        user_version = _SCHEMA_VERSION
+        with database.atomic():
+            database.create_tables(_MODELS, safe=True)
+            database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        return
     if user_version < 2:
         # v2: template_hash became a hash of the *normalized* template
         # (variable names canonicalized). Recompute stored hashes so old
         # rows keep deduping correctly against new registrations.
-        for row in PromptVersionRecord.select():
-            new_hash = template_hash(row.template)
-            if new_hash != row.template_hash:
-                try:
-                    PromptVersionRecord.update(template_hash=new_hash).where(
-                        PromptVersionRecord.id == row.id
-                    ).execute()
-                except pw.IntegrityError:
-                    # Two old versions differing only in variable names now
-                    # collide; keep the older row normalized, leave this one.
-                    pass
-        user_version = 2
+        with database.atomic():
+            for row in PromptVersionRecord.select():
+                new_hash = template_hash(row.template)
+                if new_hash != row.template_hash:
+                    try:
+                        PromptVersionRecord.update(template_hash=new_hash).where(
+                            PromptVersionRecord.id == row.id
+                        ).execute()
+                    except pw.IntegrityError:
+                        # Two old versions differing only in variable names now
+                        # collide; keep the older row normalized, leave this one.
+                        pass
+            database.execute_sql("PRAGMA user_version = 2")
     if user_version < 3:
         # v3: conversations. runs.version_id/rendered_text drop NOT NULL
         # because a conversation turn with no wrapped Prompt still gets a
@@ -275,22 +281,22 @@ def _migrate(database: pw.SqliteDatabase) -> None:
         # run to its conversation and turn position.
         from playhouse.migrate import SqliteMigrator, migrate
 
-        database.create_tables([ConversationRecord], safe=True)
-        migrator = SqliteMigrator(database)
-        migrate(
-            migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
-            migrator.add_column("runs", "turn_index", pw.IntegerField(null=True)),
-            migrator.add_column("runs", "input_text", pw.TextField(null=True)),
-            migrator.drop_not_null("runs", "version_id"),
-            migrator.drop_not_null("runs", "rendered_text"),
-        )
-        user_version = 3
+        with database.atomic():
+            database.create_tables([ConversationRecord], safe=True)
+            migrator = SqliteMigrator(database)
+            migrate(
+                migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
+                migrator.add_column("runs", "turn_index", pw.IntegerField(null=True)),
+                migrator.add_column("runs", "input_text", pw.TextField(null=True)),
+                migrator.drop_not_null("runs", "version_id"),
+                migrator.drop_not_null("runs", "rendered_text"),
+            )
+            database.execute_sql("PRAGMA user_version = 3")
     if user_version < 4:
         # v4: the checks table — one verdict per (run, check).
-        database.create_tables([CheckRecord], safe=True)
-        user_version = 4
-    if started_at < _SCHEMA_VERSION:
-        database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        with database.atomic():
+            database.create_tables([CheckRecord], safe=True)
+            database.execute_sql("PRAGMA user_version = 4")
 
 
 def reset_caches() -> None:
@@ -509,11 +515,11 @@ def record_run(
     queue; "off" drops it. Version registration is unaffected by the mode.
 
     version_id is optional: a conversation turn with no wrapped Prompt still
-    gets a row (there's simply nothing to attach to a lineage). At least one
-    of version_id / conversation_id should be set by the caller — a run tied
-    to neither is pointless — but that's a caller contract, not enforced
-    here, since failing loudly would violate the shielding this function
-    exists to provide.
+    gets a row (there's simply nothing to attach to a lineage). A row usually
+    has a version_id, a conversation_id, or both; the deliberate exception is a
+    checked call that has neither, whose row exists only to anchor its check
+    verdicts. Nothing is enforced here regardless — failing loudly would
+    violate the shielding this function exists to provide.
 
     turn_index is normally left unset and reserved here. Callers that write
     more than one row for the same physical API call (a message with more

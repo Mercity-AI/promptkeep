@@ -4,6 +4,7 @@ import sqlite3
 import threading
 
 import peewee as pw
+import pytest
 
 import promptkeep
 from promptkeep import Prompt, history
@@ -246,6 +247,40 @@ class TestSchemaMigration:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "checks" in tables
+        conn.close()
+
+    def test_interrupted_step_rolls_back_whole(self, isolated_db, monkeypatch):
+        """A step and its user_version bump commit together. If the v3 step
+        dies partway (here: after adding one column), the transaction rolls it
+        back entirely — no half-added columns, version stays 2 — and a clean
+        retry migrates all the way rather than hitting 'duplicate column'."""
+        import playhouse.migrate as pm
+
+        self._build_v2_database(isolated_db)
+        real_migrate = pm.migrate
+
+        def die_after_first_op(*ops):
+            real_migrate(ops[0])  # add conversation_id, then crash mid-step
+            raise RuntimeError("interrupted migration")
+
+        monkeypatch.setattr(pm, "migrate", die_after_first_op)
+        with pytest.raises(Exception):
+            history.runs("OLD")  # first touch triggers the (failing) migration
+
+        # Nothing partial survived: still at v2, no leaked column.
+        conn = sqlite3.connect(str(isolated_db))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert "conversation_id" not in cols
+        conn.close()
+
+        # A clean retry completes the migration.
+        monkeypatch.undo()
+        storage.reset_caches()
+        promptkeep.configure(db_path=isolated_db, enabled=True, strict=False)
+        assert history.runs("OLD")[0].rendered_text == "hi there"
+        conn = sqlite3.connect(str(isolated_db))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
         conn.close()
 
         # The checks table is usable: a run with bundled verdicts round-trips.
