@@ -1,7 +1,8 @@
 # promptkeep — Current State
 
-*Snapshot: 10 September 2026 · `main` at `d76a5ad` · v0.2.0 on PyPI (main is ahead of the
-release) · `feat/checks` open and unmerged*
+*Snapshot: 11 September 2026 · `main` after the v0.3 batch (hygiene, 0.3.0 release prep,
+conversation read model, sampling/redaction) · v0.2.0 on PyPI, **v0.3.0 tagged and built but
+not yet published** · no open branches*
 
 This is the handoff document: what the library is, what is actually built, how to use it, and
 where the edges are. Anyone picking this project up should be able to read this and be
@@ -16,10 +17,11 @@ A Python library that treats prompts as **first-class objects instead of strings
 
 A prompt gets a permanent name, its text gets versioned automatically, and every LLM call made
 with it gets recorded — which version ran, with which variables, against which model, what came
-back, how many tokens, how long it took. Multi-turn sessions are grouped into conversations.
-All of it lands in a local SQLite file, written off the request path by a background thread,
-and `promptkeep serve` opens a read-only local dashboard over it. No server, no account, no
-network calls.
+back, how many tokens, how long it took. Multi-turn sessions are grouped into conversations,
+and calls can be gated before they go out and audited after they come back (checks). All of
+it lands in a local SQLite file, written off the request path by a background thread — sampled
+and redacted first if you ask — and `promptkeep serve` opens a read-only local dashboard over
+it. No server, no account, no network calls.
 
 The design constraint that shapes everything: **it must never get in the way.** If you don't
 wrap your OpenAI client, `prompt.text` is a plain string and the library is just nice template
@@ -45,15 +47,15 @@ runs off it.
 
 | | |
 |---|---|
-| **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **Everything below from conversations onward is unreleased.** `pyproject.toml` still says 0.2.0; bump to 0.3.0 before the next `uv publish`. |
+| **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
-| **Branches** | `main` at `d76a5ad` (16 commits; PR #1 merged `feat/conversations-dashboard`). `origin/feat/checks` — 14 commits ahead of main, branched from `a72590c`, not merged. |
-| **Tests** | main: 147 passing (~1.8s, no network). `feat/checks`: 182 passing. |
-| **Size** | main: ~2,800 LOC Python + ~390 LOC HTML templates · ~1,700 LOC tests |
-| **Python** | ≥ 3.9, classifiers through 3.14 (no CI actually runs the matrix) |
-| **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2 |
+| **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. **Local main is ahead of `origin/main`** — the push was rejected because the stored GitHub token lacks the `workflow` scope needed to add `.github/workflows/*.yml`. |
+| **Tests** | 227 passing (~2.8s, no network), verified locally on Python 3.9, 3.11 and 3.14 on macOS. Coverage 91%. |
+| **Size** | ~4,600 LOC Python + ~450 LOC HTML templates · ~3,200 LOC tests |
+| **Python** | ≥ 3.9. CI (`.github/workflows/ci.yml`) runs ruff, the suite on 3.9–3.14 × Linux/macOS/Windows, and an 85% coverage gate — **it has never run yet** (push blocked, above). Windows is still untested. |
+| **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
-| **Maturity** | Beta. Core is solid and covered. Deployable now that writes are off the hot path. Still OpenAI-only. |
+| **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Still OpenAI `chat.completions`-only. |
 
 ```bash
 pip install promptkeep            # core
@@ -61,7 +63,6 @@ pip install "promptkeep[openai]"  # with the OpenAI integration
 pip install "promptkeep[serve]"   # with the local dashboard
 ```
 
-`docs/` (this file and the roadmap) is currently **untracked** — commit it.
 
 ---
 
@@ -91,10 +92,9 @@ around it does. Breaking this rule would make the version history useless within
 
 ### Tables
 
-`prompts` → `prompt_versions` → `runs` ← `conversations`. Schema version is tracked in
-`PRAGMA user_version` (**3** on main; **5** on `feat/checks`, which adds `checks`, `run_key`, and the rewrite audit columns) with a
-forward-only migration runner in `storage._migrate()`. Each migration step runs in its own
-transaction on the branch.
+`prompts` → `prompt_versions` → `runs` ← `conversations`, plus `checks` → `runs`. Schema
+version is tracked in `PRAGMA user_version` (**5**) with a forward-only migration runner in
+`storage._migrate()`; each step runs in its own transaction together with its version bump.
 
 `runs` columns added in v3: `conversation_id`, `turn_index`, `input_text` (the user turn's text,
 so a conversation can be replayed even when no `Prompt` was in the message). The roadmap's
@@ -169,9 +169,8 @@ p = summarize_prompt(max_words=100)       # -> a Prompt object
 ```
 
 The function returns the raw template; the decorator packages it into a `Prompt` with the call's
-arguments as the variables dict, and stores `fn_source_hash` on the version row. **Still breaks
-on `async def`** — the wrapper gets a coroutine and trips the "must return a template string"
-check. Roadmap item, not done on either branch.
+arguments as the variables dict, and stores `fn_source_hash` on the version row. An `async def`
+builder gets an async wrapper — `await summarize_prompt(...)` yields the `Prompt`.
 
 ### 4.5 The OpenAI wrapper
 
@@ -236,10 +235,13 @@ Every call inside a conversation gets a run row **whether or not a `Prompt` was 
 from in-process counters (`storage.reserve_turn_index`) because the DB's `MAX(turn_index)` is
 stale while rows sit in the write queue.
 
-Not built from the roadmap's conversation spec: `convo.replay()`, `versions_used`,
-`total_tokens`, `duration`, `history.conversations(prompt=, version=)` filtering,
-`parent_run_id`, and automatic chaining via `previous_response_id` (needs the Responses API
-first). Conversation inference from message-prefix matching remains deliberately unbuilt.
+The read model is complete: `convo.replay()` rebuilds the session as a chat `messages`
+list (system prompt re-emitted whenever the driving version changed, blocked/errored turns
+skipped, `system=` swaps in a new prompt for a re-run), plus `versions_used`, `total_tokens`
+and `duration`. `history.list_conversations(prompt=, version=)` answers "every session
+REVIEW_SYSTEM v4 drove". Not built: `parent_run_id` (tree-shaped conversations — they are
+linear) and automatic chaining via `previous_response_id` (needs the Responses API first).
+Conversation inference from message-prefix matching remains deliberately unbuilt.
 
 ### 4.8 Background writes *(new since v0.2.0)*
 
@@ -268,11 +270,15 @@ history.runs("REVIEW_SYSTEM", version=3, limit=20)   # [RunInfo(...)] newest fir
 history.all_runs(limit=100)                  # across every prompt
 history.list_prompts()                       # [PromptSummary] name + version/run counts
 history.list_conversations(limit=100)        # [ConversationSummary] id + turn count
-history.conversation("user-42-session-9")    # ConversationInfo: metadata + ordered turns
+history.list_conversations(prompt="REVIEW_SYSTEM", version=4)   # sessions that version drove
+convo = history.conversation("user-42-session-9")    # ConversationInfo: metadata + ordered turns
+convo.replay()                               # messages list; replay(system=p) to re-run on p
+convo.versions_used / .total_tokens / .duration
+history.checks(run_key) / history.verdict()  # check verdicts for one run; its headline
 ```
 
-`RunInfo` now also carries `conversation_id`, `turn_index`, `input_text`. Read paths raise
-normally — a broken query is a bug you want to see.
+`RunInfo` carries `run_key`, `conversation_id`, `turn_index`, `input_text`,
+`original_input_text`. Read paths raise normally — a broken query is a bug you want to see.
 
 ### 4.10 CLI and local dashboard *(new since v0.2.0)*
 
@@ -285,8 +291,9 @@ promptkeep serve --db path/to/prompts.db --port 8420
 `serve` is the **only** CLI subcommand. It launches a FastAPI + Jinja2 app that is read-only,
 localhost-bound, and fully offline (no CDN assets, no account, automatic light/dark). Pages:
 prompts overview → version lineage → diff between two versions; runs (filterable by prompt and
-version); conversations → turn-by-turn transcript with the driving version shown inline. The
-server stack is imported lazily by `cli.py`, never by `promptkeep/__init__.py`.
+version); conversations (filterable the same way) → turn-by-turn transcript with the driving
+version, check verdicts, and a stats line (turns, tokens, duration, versions used). The server
+stack is imported lazily by `cli.py`, never by `promptkeep/__init__.py`.
 
 `examples/seed_demo.py` populates a throwaway DB with rich demo data for the dashboard.
 
@@ -301,15 +308,40 @@ promptkeep.configure(
     queue_size=10_000,
     flush_interval=0.5,
     batch_size=100,
+    pre=[...], post=[...],          # global checks
+    on_block="raise",               # or "return" a stub
+    sample_rate=1.0,                # fraction of uneventful runs kept ($PROMPTKEEP_SAMPLE_RATE)
+    redact=None,                    # str -> str hook over every stored text field
 )
 ```
 
 Precedence, resolved fresh on every access: `configure()` overrides → env vars → defaults.
 Invalid values raise from `configure()`; a bad env value falls back to the default.
 
-### 4.12 Checks — on `feat/checks`, not yet on main
+### 4.12 Production controls
 
-The roadmap's v0.4 milestone is essentially complete on the branch. Public surface:
+Both act in `storage.record_run` / `record_check` — the one point every run row and verdict
+passes through — so the wrapper, `tracking` and direct storage calls are all covered.
+
+- **`sample_rate`** keeps that fraction of *uneventful* runs. Errors, blocked calls and runs
+  with any non-ok verdict (warnings included) are always kept. Inside a conversation the
+  decision is derived from the conversation's row id, so a session is kept or dropped whole
+  and every process sharing the file agrees. `0.0` = "only problems". Version registration
+  is never sampled. Known limit: the decision is made when the run is recorded, so an
+  *async* post-check's verdict can't rescue a dropped run — use `mode="blocking"` for checks
+  whose failures must be kept. A sampled-out run's `RunHandle.run_key` is `None`.
+- **`redact`** (`str -> str`) runs over `rendered_text`, `input_text`, `original_input_text`,
+  `output_text`, `error`, the JSON-encoded `variables` and `request_params`, and a verdict's
+  `message` / `rewritten`, before the row is queued or written — plaintext never enters the
+  background queue. Templates, prompt names and conversation metadata are not redacted. A
+  hook that raises or returns a non-string drops the row (logged) rather than storing it
+  unredacted.
+
+Not built: `store_outputs=False`, `retention_days`.
+
+### 4.13 Checks
+
+The roadmap's v0.4 milestone, merged as PR #3. Public surface:
 `check`, `Verdict`, `CheckContext`, `PromptBlocked`, `RunHandle`, `call`, `acall`, `suppress`.
 
 ```python
@@ -339,12 +371,11 @@ post `mode="async" | "blocking"` · `suppress()` contextvar so an LLM-judge chec
 itself · a crashing check records `status="error"` and never crashes the call · works on the
 streaming path · schema v5: `checks` table, `runs.run_key`, `runs.original_input_text`,
 `checks.rewritten` · `history.checks(run_key)` / `history.verdict()` · a checks view in the
-dashboard · `examples/pii_conversation_demo.py` · README section · 43 tests. The branch also
-fixes `__version__` to `"0.2.0"` (hardcoded, not `importlib.metadata`).
+dashboard · `examples/pii_conversation_demo.py` · README section · 39 tests.
 
-Durability, as of 10 September: runs are identified by a client-minted `run_key` (UUID), so
-checked calls go through the background writer like every other call — nothing on the request
-path waits for SQLite. Async verdicts queue behind their run row; `promptkeep.flush()` waits for
+Durability: runs are identified by a client-minted `run_key` (UUID), so checked calls go
+through the background writer like every other call — nothing on the request path waits for
+SQLite. Async verdicts queue behind their run row; `promptkeep.flush()` waits for
 in-flight post-checks, then drains the queue. A pre-check rewrite stores both the original turn
 and the rewritten one, and the rewriting check's verdict carries the replacement text.
 
@@ -356,16 +387,18 @@ Not built: `promptkeep.feedback()`.
 
 ```
 src/promptkeep/
-├── __init__.py        public API: Prompt, prompt, wrap, configure, history, conversation, flush
+├── __init__.py        public API (+ __version__ read from package metadata)
 ├── prompts.py         Prompt + RenderedText          (plural — `prompt` is the decorator)
 ├── rendering.py       render / normalize / placeholder extraction
-├── decorator.py       @prompt
-├── config.py          configure() / get_settings() / reset()
+├── decorator.py       @prompt (sync and async builders)
+├── config.py          configure() / get_settings() / reset(); sample_rate, redact
 ├── conversation.py    contextvar-based conversation() context manager
-├── storage.py         peewee models, migrations, register_version, record_run, write_batch, fetch_*
+├── checks.py          check.pre/post, Verdict, CheckContext, RunHandle, call()/acall(), suppress()
+├── storage.py         peewee models, migrations, register_version, record_run (+ sampling,
+│                      redaction), record_check, write_batch, fetch_*
 ├── writer.py          background queue + daemon thread, flush(), fork hook
 ├── tracking.py        provider-agnostic run recording (prompt runs and bare conversation turns)
-├── history.py         read side — dict rows -> frozen dataclasses
+├── history.py         read side — dict rows -> frozen dataclasses; ConversationInfo.replay()
 ├── cli.py             `promptkeep serve` (lazy-imports the server stack)
 ├── dashboard/
 │   ├── app.py         FastAPI routes, read-only
@@ -376,8 +409,9 @@ src/promptkeep/
 ```
 
 Flow: `Prompt.render()` → `storage.register_version()` (lazy, memoized, sync) → wrapper
-intercepts `chat.completions.create` → resolves the active conversation → `tracking` →
-`storage.record_run()` → `writer.submit()` → daemon thread → `storage.write_batch()`.
+intercepts `chat.completions.create` → resolves the active conversation → runs pre-checks →
+provider call → post-checks → `tracking` → `storage.record_run()` (sampling decision,
+redaction) → `writer.submit()` → daemon thread → `storage.write_batch()`.
 
 ### Load-bearing decisions
 
@@ -395,6 +429,8 @@ Breaking any of these breaks the library's contract:
 7. **Core never imports `openai`** or the server stack. Wrapper tests run against hand-rolled
    fakes; the dashboard is an optional extra.
 8. **Conversations are explicit only.** Never inferred from message-history prefixes.
+9. **Redaction fails closed; sampling never drops a problem.** A redact hook that raises drops
+   the row; errors, blocked calls and non-ok verdicts are stored at any sample rate.
 
 ### SQLite specifics (the sharp edges)
 
@@ -413,21 +449,23 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-147 tests on main, no network, no `openai` dependency, ~1.8s.
+227 tests, no network, no `openai` dependency, ~2.8s. Coverage 91% (`cli.py`, the uvicorn
+launcher, is excluded).
 
 | File | Tests | Covers |
 |---|---:|---|
+| `test_checks.py` | 39 | pre/post checks, verdicts, timeouts, rewrite, RunHandle, call()/acall(), streaming |
 | `test_rendering.py` | 30 | lenient/strict matrix, JSON braces, normalization |
+| `test_conversation.py` | 27 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing |
 | `test_prompt.py` | 25 | immutability, versioning, provenance, equality |
+| `test_storage.py` | 21 | dedup, version counters, concurrency, migrations, run_key, conversations |
 | `test_openai_wrapper.py` | 19 | substitution, run rows, streaming, async, error paths |
-| `test_storage.py` | 15 | dedup, version counters, concurrency, migrations, conversations |
-| `test_dashboard.py` | 15 | every route via `TestClient`, 404s, filters |
-| `test_conversation.py` | 14 | context manager, kwarg path, turn ordering, async, bare turns |
-| `test_decorator.py` | 14 | defaults, kwargs capture, fn source hash |
-| `test_writer.py` | 8 | batching, overflow/drop counting, flush, reset |
+| `test_dashboard.py` | 17 | every route via `TestClient`, 404s, filters, stats line |
+| `test_decorator.py` | 16 | defaults, kwargs capture, fn source hash, async builders |
+| `test_controls.py` | 15 | sampling (always-keep rules, per-conversation decision, env), redaction (every field, failure modes) |
+| `test_writer.py` | 9 | batching, overflow/drop counting, flush, reset, atexit |
 | `test_history.py` | 7 | versions/diff/runs shaping |
-
-`feat/checks` adds `test_checks.py` (32) and extends storage/writer tests → 182.
+| `test_package.py` | 2 | `__version__` matches `pyproject.toml`; `__all__` resolves |
 
 `tests/conftest.py` gives every test a fresh tmp DB, reset config, `write_mode="sync"`, and a
 reset writer — tests never touch a real `.promptkeep.db`.
@@ -438,7 +476,8 @@ change makes it flaky, the change is wrong, not the test.
 ```bash
 uv sync
 uv run pytest -q
-uv run ruff format src tests && uv run ruff check src tests   # line-length 100
+uv run pytest -q --cov --cov-fail-under=85       # the CI coverage gate
+uv run ruff format src tests examples && uv run ruff check src tests examples
 uv run python examples/seed_demo.py && uv run promptkeep serve --db demo.promptkeep.db
 ```
 
@@ -446,8 +485,8 @@ uv run python examples/seed_demo.py && uv run promptkeep serve --db demo.promptk
 
 ## 7. Roadmap scorecard
 
-Status against `ROADMAP-v1.md`, milestone by milestone. **Done** = on main. **Branch** = on
-`origin/feat/checks`, tests green, awaiting merge. **Open** = not started.
+Status against `ROADMAP-v1.md`, milestone by milestone. **Done** = on main. **Open** = not
+started.
 
 ### v0.3 — Foundations
 
@@ -458,26 +497,26 @@ Status against `ROADMAP-v1.md`, milestone by milestone. **Done** = on main. **Br
 | `write_mode="sync"` in tests | **Done** | conftest |
 | Conversations: schema v3, context manager, async twin, kwarg escape hatch | **Done** | linear only |
 | `history.conversation()` with ordered turns | **Done** | |
-| `convo.replay()`, `versions_used`, `total_tokens`, `duration` | Open | `ConversationInfo` has metadata + `turns` only |
-| `history.conversations(prompt=, version=)` filter | Open | only `list_conversations(limit)` |
+| `convo.replay()`, `versions_used`, `total_tokens`, `duration` | **Done** | `replay(system=)` for re-runs |
+| `history.conversations(prompt=, version=)` filter | **Done** | as `list_conversations(prompt=, version=)` — one name, not two |
 | `parent_run_id` (tree-shaped conversations) | Open | |
-| `@prompt` on `async def` | Open | still raises |
-| `sample_rate` | Open | |
-| `redact` hook | Open | `rendered_text`, `input_text`, `output_text` stored in full |
-| `__version__` via `importlib.metadata` | Open | main says `"0.1.0"`; branch hardcodes `"0.2.0"` |
-| `testing.py` → `examples/`, drop `testing.db` | Partial | `testing.db` is now gitignored and untracked; `testing.py` is still committed in the repo root |
-| CI (matrix, ruff, coverage gate) | Open | no `.github/` at all |
+| `@prompt` on `async def` | **Done** | |
+| `sample_rate` | **Done** | per-conversation decision; async verdicts can't rescue a dropped run |
+| `redact` hook | **Done** | fails closed |
+| `__version__` via `importlib.metadata` | **Done** | |
+| `testing.py` → `examples/`, drop `testing.db` | **Done** | `examples/playground.py` |
+| CI (matrix, ruff, coverage gate) | **Done** (unverified) | workflow written; first run blocked on the token scope, Windows never exercised |
 
 ### v0.4 — Checks
 
 | Item | Status | Notes |
 |---|---|---|
-| Pre/post checks, `Verdict`, `RunHandle`, `call()` / `acall()` | **Branch** | |
-| Schema v4 `checks` table, `history.checks()` | **Branch** | |
-| Three scopes, `on_block`, per-check timeout + `on_timeout`, `suppress()` | **Branch** | answers open question 3 |
-| Dashboard checks view | **Branch** | |
+| Pre/post checks, `Verdict`, `RunHandle`, `call()` / `acall()` | **Done** | PR #3 |
+| Schema v4 `checks` table, `history.checks()` | **Done** | schema is at v5 |
+| Three scopes, `on_block`, per-check timeout + `on_timeout`, `suppress()` | **Done** | answers open question 3 |
+| Dashboard checks view | **Done** | |
 | `promptkeep.feedback()` | Open | |
-| Docs page with real examples | Partial | README section + PII demo on branch; no docs site |
+| Docs page with real examples | Partial | README section + PII demo; no docs site |
 
 ### v0.5 — Reach and visibility (public beta)
 
@@ -506,10 +545,13 @@ Status against `ROADMAP-v1.md`, milestone by milestone. **Done** = on main. **Br
 
 ### Engineering standards (roadmap §8)
 
-None started: no CI, no release automation, no `CHANGELOG.md`, no `CONTRIBUTING.md` /
-`SECURITY.md` / issue templates, no `mypy --strict`, no benchmarks, no docs site. The README was
-updated for conversations, the dashboard and background writes, but not rewritten to the
-"sell in fifteen seconds" shape (no GIF).
+Done: CI workflow (matrix 3.9–3.14 × 3 OSes, ruff, 85% coverage gate), release automation
+(`release.yml`: a pushed `v*` tag re-runs the suite, checks the tag matches the declared
+version, publishes via PyPI Trusted Publishing, opens a GitHub Release), `CHANGELOG.md` in
+keep-a-changelog format, sdist trimmed to what a builder needs, badges on the README.
+Not started: `CONTRIBUTING.md` / `SECURITY.md` / issue templates, `mypy --strict`, benchmarks,
+docs site. The README documents every feature but is not yet rewritten to the "sell in
+fifteen seconds" shape (no GIF).
 
 ### Open questions (roadmap §10) — where they landed
 
@@ -522,13 +564,19 @@ updated for conversations, the dashboard and background writes, but not rewritte
 
 ### Suggested next moves, in order
 
-1. Merge `feat/checks` (rebase onto main first — it's one commit behind).
-2. Hygiene batch: `__version__` from `importlib.metadata`, move `testing.py` into
-   `examples/`, commit `docs/`, add CI. Cheap, and everything after this gets safer.
-3. Bump to 0.3.0 and publish — PyPI is two milestones behind main.
-4. Finish the conversation read model (`replay()`, `versions_used`, filtered listing); these
-   are the pieces the eval and compare work will consume.
-5. `sample_rate` + `redact` — the last v0.3 items and the blockers for regulated users.
+1. **Unblock the push.** Re-issue the GitHub token with the `workflow` scope (or push from a
+   client that has it), then `git push origin main`. Watch the first CI run — Windows has
+   never executed this suite; fix whatever it turns up before publishing.
+2. **Publish 0.3.0.** Either configure PyPI Trusted Publishing for this repo and
+   `.github/workflows/release.yml` (environment `pypi`) and `git push origin v0.3.0`, or from
+   the tag run `uv build && uv publish --token ...`. If the read model and production
+   controls should ship in the same release, move the tag first: `git tag -f -a v0.3.0`
+   on the current main and fold the "Unreleased" changelog entries into 0.3.0.
+3. v0.3 is then fully closed. Next milestone is **v0.5 reach**: the provider adapter
+   interface (`integrations/base.py`), the OpenAI Responses API (+ `previous_response_id`
+   chaining), the rest of the CLI (`list`, `versions`, `diff`, `runs`, `convo`, `stats`,
+   `export`), cost tracking, and `compare()`. `promptkeep.feedback()` (v0.4 leftover) is a
+   small one to fold in early.
 
 ---
 
@@ -536,7 +584,8 @@ updated for conversations, the dashboard and background writes, but not rewritte
 
 1. `README.md` — 5 minutes, the whole user-facing surface
 2. `uv run python examples/seed_demo.py` then `promptkeep serve --db demo.promptkeep.db` — see
-   versioning, conversations and run tracking in the dashboard
+   versioning, conversations, checks and run tracking in the dashboard; `CHANGELOG.md` for
+   what shipped when
 3. `CLAUDE.md` — the design decisions and the SQLite traps, already written down
 4. `src/promptkeep/prompts.py`, `storage.py`, `writer.py` — the three files that carry the model
 5. `docs/ROADMAP-v1.md` — where this goes next; section 7 above is the scorecard against it

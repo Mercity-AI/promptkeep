@@ -106,7 +106,14 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 - Schema changes: bump `_SCHEMA_VERSION`, add a forward-only step in `_migrate()` using
   `playhouse.migrate` operations. The DB tracks its schema in `PRAGMA user_version`.
 - `config.py` resolves settings fresh on every call: `configure()` overrides >
-  `PROMPTKEEP_DB`/`PROMPTKEEP_DISABLED` env vars > defaults (`./.promptkeep.db`, enabled).
+  `PROMPTKEEP_DB`/`PROMPTKEEP_DISABLED`/`PROMPTKEEP_WRITE_MODE`/`PROMPTKEEP_SAMPLE_RATE` env
+  vars > defaults (`./.promptkeep.db`, enabled, background, keep everything).
+- **Sampling and redaction live in `storage.record_run`/`record_check`**, the one point every
+  run row and verdict passes through, so they cover the wrapper, `tracking`, and direct
+  storage calls alike. Sampling always keeps non-ok runs/verdicts and decides per
+  conversation from its row id; a failing `redact` hook drops the row rather than storing it
+  unredacted. Templates are never redacted (they're code, and the version hash depends on
+  them).
 
 ## Tests
 

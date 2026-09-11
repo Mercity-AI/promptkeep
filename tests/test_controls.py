@@ -180,17 +180,22 @@ class TestRedaction:
         assert turn.input_text == "tell me the [X]"
         assert turn.output_text == "the [X] is 42"
 
-    def test_hook_that_raises_drops_the_run_silently(self):
-        """A broken redactor must neither crash the call nor store plaintext."""
+    def test_hook_that_raises_drops_the_row_silently(self):
+        """A broken redactor must neither crash the call nor store plaintext —
+        for run rows and for late verdicts alike."""
+        p = Prompt("s", name="REDACT_RAISE")
+        run_key = _ok_run(p)  # recorded before the hook breaks
 
         def broken(text):
             raise RuntimeError("regex exploded")
 
         promptkeep.configure(redact=broken)
-        p = Prompt("s", name="REDACT_RAISE")
         assert _ok_run(p, output_text="secret") is None
-        assert history.runs("REDACT_RAISE") == []
-        assert storage.record_check("some-key", {"name": "c", "message": "secret"}) is None
+        storage.record_check(
+            run_key, {"name": "late", "phase": "post", "status": "warn", "message": "secret"}
+        )
+        assert len(history.runs("REDACT_RAISE")) == 1
+        assert history.checks(run_key) == []
 
     def test_hook_returning_non_string_drops_the_run(self):
         promptkeep.configure(redact=lambda text: None)
