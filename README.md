@@ -86,6 +86,11 @@ variables used, the rendered text, the model, the output, token usage, and laten
 Streaming, async clients, and multi-part content are supported. Tracking failures never
 break the API call. Unwrapped clients work too — just pass `prompt.text`.
 
+OpenAI `chat.completions` is the only built-in provider today. The wrapper is built on a
+small adapter interface (`promptkeep.integrations.ProviderAdapter`), so another SDK is one
+adapter away — `register_adapter()` teaches `wrap()` a new client shape without touching
+the tracking machinery.
+
 ## Conversations
 
 Group calls into a session and promptkeep records the whole thread — every turn gets a

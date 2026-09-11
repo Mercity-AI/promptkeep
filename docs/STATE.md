@@ -50,8 +50,8 @@ runs off it.
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
 | **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. |
-| **Tests** | 227 passing (~2.8s, no network), verified locally on Python 3.9, 3.11 and 3.14 on macOS. Coverage 91%. |
-| **Size** | ~4,600 LOC Python + ~450 LOC HTML templates · ~3,200 LOC tests |
+| **Tests** | 252 passing (~2.9s, no network), verified locally on Python 3.9, 3.11 and 3.14 on macOS. Coverage 91%. |
+| **Size** | ~4,900 LOC Python + ~450 LOC HTML templates · ~3,500 LOC tests |
 | **Python** | ≥ 3.9. **No CI yet**: the workflows (ruff, the suite on 3.9–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
@@ -199,9 +199,12 @@ the run when the stream closes, including the context-manager form) · multi-par
 multiple tracked prompts per call · errors recorded with `status="error"` and re-raised
 unchanged · an explicit `promptkeep_conversation=` kwarg, stripped before the request goes out.
 
-Not supported: **`chat.completions` only** — no `responses.create`, no Anthropic, no LiteLLM,
-no provider adapter interface. Never monkey-patches the `openai` module; message dicts are
-copied, never mutated; idempotent via `_pm_instrumented`.
+Not supported: **`chat.completions` only** — no `responses.create`, no Anthropic, no LiteLLM.
+Each of those is now one adapter away: the wrapper is split into a provider-agnostic core
+(`integrations/core.py`) and a `ProviderAdapter` (`integrations/base.py`) that answers six
+questions about one SDK's shapes; `register_adapter()` adds a third-party one, and
+`tests/test_adapters.py` is the contract a new adapter must pass. Never monkey-patches a
+provider module; message dicts are copied, never mutated; idempotent via `_pm_instrumented`.
 
 ### 4.6 Provenance-carrying strings
 
@@ -404,8 +407,10 @@ src/promptkeep/
 │   ├── app.py         FastAPI routes, read-only
 │   └── templates/     base, prompts, prompt_detail, diff, runs, conversations, conversation_detail
 └── integrations/
-    ├── __init__.py    wrap() dispatcher
-    └── openai_wrapper.py
+    ├── __init__.py    wrap(), is_wrapped(), the adapter registry (register_adapter)
+    ├── base.py        ProviderAdapter / Request / ResponseFields / StreamAbsorber / Target
+    ├── core.py        the shared interceptor: conversations, checks, recording, stream proxies
+    └── openai_wrapper.py   OpenAIChatAdapter — the only adapter so far
 ```
 
 Flow: `Prompt.render()` → `storage.register_version()` (lazy, memoized, sync) → wrapper
@@ -449,13 +454,14 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-227 tests, no network, no `openai` dependency, ~2.8s. Coverage 91% (`cli.py`, the uvicorn
+252 tests, no network, no `openai` dependency, ~2.9s. Coverage 91% (`cli.py`, the uvicorn
 launcher, is excluded).
 
 | File | Tests | Covers |
 |---|---:|---|
 | `test_checks.py` | 39 | pre/post checks, verdicts, timeouts, rewrite, RunHandle, call()/acall(), streaming |
 | `test_rendering.py` | 30 | lenient/strict matrix, JSON braces, normalization |
+| `test_adapters.py` | 25 | the adapter contract, run per registered adapter; the registry |
 | `test_conversation.py` | 27 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing |
 | `test_prompt.py` | 25 | immutability, versioning, provenance, equality |
 | `test_storage.py` | 21 | dedup, version counters, concurrency, migrations, run_key, conversations |
@@ -524,7 +530,7 @@ started.
 |---|---|---|
 | `promptkeep serve` — read-only, localhost | **Done** | shipped early, ahead of the milestone |
 | Rest of the CLI: `list`, `versions`, `diff`, `runs`, `convo`, `stats`, `export` | Open | `serve` is the only subcommand |
-| Provider adapter interface (`integrations/base.py`) | Open | |
+| Provider adapter interface (`integrations/base.py`) | **Done** | OpenAI chat is the first adapter; contract suite in `test_adapters.py` |
 | OpenAI Responses API + automatic conversation chaining | Open | |
 | Anthropic adapter | Open | |
 | LiteLLM adapter | Open | |
@@ -573,9 +579,10 @@ fifteen seconds" shape (no GIF).
    v0.3.0`). If the read model and production controls should ship in the same release, move
    the tag first: `git tag -f -a v0.3.0` on the current main and fold the "Unreleased"
    changelog entries into 0.3.0.
-3. v0.3 is then fully closed. Next milestone is **v0.5 reach**: the provider adapter
-   interface (`integrations/base.py`), the OpenAI Responses API (+ `previous_response_id`
-   chaining), the rest of the CLI (`list`, `versions`, `diff`, `runs`, `convo`, `stats`,
+3. v0.3 is then fully closed and the adapter interface is in. Next in **v0.5 reach**: the
+   OpenAI Responses API adapter (+ `previous_response_id` chaining — needs a
+   `conversation_hint` adapter method and a response-id → conversation lookup in storage),
+   then Anthropic and LiteLLM adapters, the rest of the CLI (`list`, `versions`, `diff`, `runs`, `convo`, `stats`,
    `export`), cost tracking, and `compare()`. `promptkeep.feedback()` (v0.4 leftover) is a
    small one to fold in early.
 

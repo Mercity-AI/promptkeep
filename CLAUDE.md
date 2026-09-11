@@ -36,9 +36,10 @@ placeholder names to `{v0}`, `{v1}`, ... so renaming `{var1}` → `{x}` dedups t
 version; static text, repetition patterns, and format specs still distinguish versions.
 
 Flow between modules: `prompts.Prompt.render()` → lazily registers its template via
-`storage.register_version()` (memoized per object *and* per process) → integrations wrapper
-intercepts `chat.completions.create` → `tracking.record_prompt_run()` → `storage.record_run()`.
-`history.py` is the read side, turning storage's dict rows into frozen dataclasses.
+`storage.register_version()` (memoized per object *and* per process) → the shared interceptor
+in `integrations/core.py` (installed by `wrap()` on every surface a registered adapter
+locates) → `tracking.record_prompt_run()` → `storage.record_run()`. `history.py` is the read
+side, turning storage's dict rows into frozen dataclasses.
 
 Load-bearing design decisions (breaking these breaks the library's contract):
 
@@ -68,10 +69,22 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   whose run was evicted is skipped, not raised). `promptkeep.flush()` lives in `tracking.py`:
   it waits for in-flight async post-checks (`checks.wait_for_pending`), then `writer.drain()`.
   A pre-check rewrite stores both sides: `runs.original_input_text` and `checks.rewritten`.
-- **The wrapper never monkey-patches the `openai` module** — only the object passed to
-  `wrap()` gets its `create` replaced (idempotent via `_pm_instrumented`). Message dicts are
-  copied, never mutated. Streaming defers run recording until the stream ends
-  (`_StreamRecorder.finish()` is write-once).
+- **Provider knowledge lives only in adapters** (`integrations/base.ProviderAdapter`): where the
+  call method lives (`locate`), where Prompts hide in a request and which text is the current
+  turn (`parse_request`, `apply_rewrite`), how to read a response and fold a stream
+  (`read_response`, `stream_absorber`), the `on_block="return"` stub. Everything else —
+  conversations, checks, recording, the stream proxies — is written once in
+  `integrations/core.py` and must stay provider-agnostic; if core needs to know a provider's
+  shape, that's a new adapter method, not an `if provider ==`. Adapters are registered in
+  `integrations/__init__.py` (`register_adapter()` for third parties); `wrap()` instruments
+  every surface any adapter locates. Core shields adapter calls made inside the request path
+  (`read_response`, the absorber), so an adapter bug loses telemetry, never a call.
+  `tests/test_adapters.py` is the contract every adapter must pass — a new provider adds one
+  `Scenario` there. Today the only adapter is OpenAI `chat.completions`.
+- **The wrapper never monkey-patches a provider module** — only the object passed to
+  `wrap()` gets its method replaced (idempotent via `_pm_instrumented` on the method's owner).
+  Message dicts are copied, never mutated. Streaming defers run recording until the stream
+  ends (`_StreamRecorder.finish()` is write-once).
 - **Rendering is lenient by default** (`rendering.py`): unknown `{placeholders}` and JSON
   braces pass through literally; unparseable templates return unrendered. Strict mode is
   opt-in per Prompt or via `configure(strict=True)`.

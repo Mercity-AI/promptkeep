@@ -36,8 +36,9 @@ class TestWrapDispatch:
         assert wrap(client) is client
 
     def test_wrap_rejects_non_clients(self):
-        """Objects without chat.completions.create are a usage error."""
-        with pytest.raises(TypeError, match="OpenAI client"):
+        """Objects no adapter recognizes are a usage error, and the message
+        names what would have been recognized."""
+        with pytest.raises(TypeError, match="no supported provider surface.*openai"):
             wrap(42)
 
     def test_double_wrap_is_idempotent(self):

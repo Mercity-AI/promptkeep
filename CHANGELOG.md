@@ -9,6 +9,14 @@ public APIs; each such change is called out below.
 
 ### Added
 
+- Provider adapter interface (`promptkeep.integrations.ProviderAdapter`): all
+  provider-specific knowledge now lives in an adapter, and the tracking
+  orchestration (conversations, checks, recording, streaming) is written once
+  in `integrations/core.py`. `register_adapter()` lets a third party teach
+  `wrap()` a new client shape; `tests/test_adapters.py` is the contract every
+  adapter must pass. OpenAI `chat.completions` is the first (and so far only)
+  adapter; its behavior is unchanged.
+
 - Conversation read model: `ConversationInfo.replay()` rebuilds a session as a
   chat `messages` list (pass `system=` to re-run it against another prompt),
   plus `versions_used`, `total_tokens` and `duration`.
@@ -23,6 +31,14 @@ public APIs; each such change is called out below.
 - `configure(redact=fn)` passes every stored text field of a run or verdict
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
+
+### Changed
+
+- `wrap()` on an unrecognized object now raises
+  `TypeError: wrap() found no supported provider surface ...` naming the
+  registered adapters.
+- For a *streamed* checked call, a post-check's `ctx.response` is the
+  stream's `ResponseFields` summary rather than a synthetic response object.
 
 ## [0.3.0] - 2026-09-11
 

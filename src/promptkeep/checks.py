@@ -511,8 +511,9 @@ def _require_non_streaming(kwargs) -> None:
 def _warn_if_unwrapped(client) -> None:
     """call() runs checks via the wrapper, so an unwrapped client silently does
     nothing — verification would always be 'ok'. Warn rather than pretend."""
-    completions = getattr(getattr(client, "chat", None), "completions", None)
-    if completions is not None and not getattr(completions, "_pm_instrumented", False):
+    from .integrations import is_wrapped
+
+    if is_wrapped(client) is False:
         logger.warning(
             "promptkeep.call(): client is not wrapped, so no tracking or checks ran "
             "(verification will always be 'ok'). Pass promptkeep.wrap(client)."
