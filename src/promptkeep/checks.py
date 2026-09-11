@@ -211,7 +211,9 @@ class CheckContext:
     """What a check function receives.
 
     Pre-checks see the outgoing request (rendered, messages, prompt);
-    post-checks additionally see the response (output_text, response).
+    post-checks additionally see the response (output_text, response). For
+    a streamed call ``response`` is the stream's accumulated ResponseFields
+    summary — there is no single provider object to hand over.
     """
 
     rendered: str
