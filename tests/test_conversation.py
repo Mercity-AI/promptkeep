@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 import promptkeep
-from promptkeep import Prompt, history, storage, wrap
+from promptkeep import Prompt, history, storage, tracking, wrap
 from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response
 
 
@@ -182,3 +182,206 @@ class TestConversationContextManager:
             )
         (turn,) = history.conversation("sess-dev-role").turns
         assert turn.input_text is None
+
+
+class TestConversationReadModel:
+    """The derived views on ConversationInfo: replay(), versions_used,
+    total_tokens, duration — and the filtered listing."""
+
+    def _turn(self, cid, prompt=None, **fields):
+        """Record one turn; through a Prompt's lineage when one is given."""
+        defaults = dict(provider="openai", model="gpt-test", conversation_id=cid)
+        defaults.update(fields)
+        if prompt is None:
+            return storage.record_run(**defaults)
+        return tracking.record_prompt_run(prompt, prompt.variables, str(prompt.text), **defaults)
+
+    def test_replay_rebuilds_messages_in_order(self):
+        """System prompt once, then user/assistant pairs turn by turn."""
+        sys_prompt = Prompt("You are terse.", name="REPLAY_SYS")
+        cid = storage.get_or_create_conversation("replay-basic")
+        self._turn(cid, sys_prompt, input_text="hi", output_text="hello")
+        self._turn(cid, sys_prompt, input_text="more?", output_text="no")
+        assert history.conversation("replay-basic").replay() == [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "more?"},
+            {"role": "assistant", "content": "no"},
+        ]
+
+    def test_replay_emits_system_prompt_again_when_it_changes(self):
+        """A version switch mid-session shows up as a new system message at
+        the turn it took effect — that's the whole point of version-aware
+        conversations."""
+        v1 = Prompt("Be brief.", name="REPLAY_SW")
+        v2 = Prompt("Be brief and cite sources.", name="REPLAY_SW")
+        cid = storage.get_or_create_conversation("replay-switch")
+        self._turn(cid, v1, input_text="q1", output_text="a1")
+        self._turn(cid, v2, input_text="q2", output_text="a2")
+        messages = history.conversation("replay-switch").replay()
+        assert [m["role"] for m in messages] == [
+            "system",
+            "user",
+            "assistant",
+            "system",
+            "user",
+            "assistant",
+        ]
+        assert messages[3]["content"] == "Be brief and cite sources."
+
+    def test_replay_skips_turns_that_never_completed(self):
+        """Errors and blocked calls gave the model nothing to build on."""
+        cid = storage.get_or_create_conversation("replay-skip")
+        self._turn(cid, input_text="q1", output_text="a1")
+        self._turn(cid, input_text="q2", status="error", error="boom")
+        self._turn(cid, input_text="q2", status="blocked", error="blocked by check 'pii'")
+        self._turn(cid, input_text="q2 again", output_text="a2")
+        assert history.conversation("replay-skip").replay() == [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2 again"},
+            {"role": "assistant", "content": "a2"},
+        ]
+
+    def test_replay_uses_the_turn_as_sent_after_a_rewrite(self):
+        """input_text is what went out; the original stays in the audit trail."""
+        cid = storage.get_or_create_conversation("replay-rewrite")
+        self._turn(
+            cid,
+            input_text="my card is [REDACTED]",
+            original_input_text="my card is 4111",
+            output_text="ok",
+        )
+        (user, _assistant) = history.conversation("replay-rewrite").replay()
+        assert user == {"role": "user", "content": "my card is [REDACTED]"}
+
+    def test_replay_does_not_duplicate_a_prompt_that_was_the_user_turn(self):
+        """A tracked Prompt in the user message is the input, not a system prompt."""
+        ask = Prompt("Translate {word} to French.", {"word": "cat"}, name="REPLAY_USER")
+        cid = storage.get_or_create_conversation("replay-userprompt")
+        self._turn(cid, ask, input_text=str(ask.text), output_text="chat")
+        assert history.conversation("replay-userprompt").replay() == [
+            {"role": "user", "content": "Translate cat to French."},
+            {"role": "assistant", "content": "chat"},
+        ]
+
+    def test_replay_with_system_override_swaps_the_prompt(self):
+        """system= is the re-run-against-a-new-version hook: it goes first and
+        the stored system prompts are dropped. A Prompt object passes through
+        untouched so a wrapped client can track it."""
+        old = Prompt("Old instructions.", name="REPLAY_OVR")
+        new = Prompt("New instructions.", name="REPLAY_OVR")
+        cid = storage.get_or_create_conversation("replay-override")
+        self._turn(cid, old, input_text="q", output_text="a")
+        messages = history.conversation("replay-override").replay(system=new)
+        assert messages[0] == {"role": "system", "content": new}
+        assert messages[0]["content"] is new
+        assert [m["role"] for m in messages] == ["system", "user", "assistant"]
+        assert not any(m["content"] == "Old instructions." for m in messages)
+
+    def test_replay_through_the_wrapper_round_trips(self):
+        """End to end: what the wrapper recorded replays as the messages an app
+        would have accumulated itself."""
+        sys_prompt = Prompt("You are a bot.", name="REPLAY_E2E")
+        client = wrap(FakeClient(response=make_response(content="reply")))
+        with promptkeep.conversation("replay-e2e"):
+            client.chat.completions.create(
+                model="gpt-test",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": "first"},
+                ],
+            )
+            client.chat.completions.create(
+                model="gpt-test",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "reply"},
+                    {"role": "user", "content": "second"},
+                ],
+            )
+        assert history.conversation("replay-e2e").replay() == [
+            {"role": "system", "content": "You are a bot."},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "reply"},
+        ]
+
+    def test_versions_used_lists_each_name_in_order_of_first_use(self):
+        a1 = Prompt("a one", name="VU_A")
+        a2 = Prompt("a two", name="VU_A")
+        b1 = Prompt("b one", name="VU_B")
+        assert (a1.version, a2.version) == (1, 2)  # registration is lazy: pin the order
+        cid = storage.get_or_create_conversation("vu")
+        self._turn(cid, a2, output_text="x")  # v2 first
+        self._turn(cid, b1, output_text="x")
+        self._turn(cid, a1, output_text="x")
+        self._turn(cid, a2, output_text="x")  # repeat: not listed twice
+        self._turn(cid, output_text="x")  # bare turn: no lineage
+        assert history.conversation("vu").versions_used == {"VU_A": [2, 1], "VU_B": [1]}
+
+    def test_total_tokens_sums_reported_usage(self):
+        cid = storage.get_or_create_conversation("tokens")
+        self._turn(cid, total_tokens=30, output_text="x")
+        self._turn(cid, total_tokens=None, status="error")  # unknown counts as 0
+        self._turn(cid, total_tokens=12, output_text="y")
+        assert history.conversation("tokens").total_tokens == 42
+
+    def test_duration_spans_first_turn_start_to_last_turn_end(self):
+        """Timestamps are taken at record time (end of call), so the first
+        turn's latency is counted back from its timestamp."""
+        cid = storage.get_or_create_conversation("dur")
+        self._turn(cid, latency_ms=1500, output_text="x")
+        self._turn(cid, latency_ms=200, output_text="y")
+        duration = history.conversation("dur").duration
+        assert duration >= 1.5
+        assert duration < 30  # two immediate records: no wall-clock gap to speak of
+
+    def test_duration_is_computed_from_turn_fields(self):
+        """Pin the arithmetic on hand-built turns, independent of the clock."""
+        from dataclasses import replace
+
+        cid = storage.get_or_create_conversation("dur-fixed")
+        self._turn(cid, latency_ms=0, output_text="x")
+        convo = history.conversation("dur-fixed")
+        (turn,) = convo.turns
+        turns = [
+            replace(turn, created_at="2026-09-11T10:00:05+00:00", latency_ms=2000),
+            replace(turn, created_at="2026-09-11T10:01:03+00:00", latency_ms=500),
+        ]
+        assert replace(convo, turns=turns).duration == 60.0
+        assert replace(convo, turns=[]).duration == 0.0
+
+    def test_list_conversations_filters_by_prompt_and_version(self):
+        """prompt= keeps sessions the prompt drove; version= narrows to one
+        version; the turn count stays the session's full length."""
+        v1 = Prompt("one", name="LC")
+        v2 = Prompt("two", name="LC")
+        other = Prompt("other", name="LC_OTHER")
+        assert (v1.version, v2.version) == (1, 2)
+        a = storage.get_or_create_conversation("lc-a")
+        b = storage.get_or_create_conversation("lc-b")
+        c = storage.get_or_create_conversation("lc-c")
+        self._turn(a, v1, output_text="x")
+        self._turn(a, output_text="x")  # a bare turn — still counts as a turn
+        self._turn(b, v2, output_text="x")
+        self._turn(c, other, output_text="x")
+
+        def ids(**kw):
+            return sorted(s.external_id for s in history.list_conversations(**kw))
+
+        assert ids() == ["lc-a", "lc-b", "lc-c"]
+        assert ids(prompt="LC") == ["lc-a", "lc-b"]
+        assert ids(prompt="LC", version=1) == ["lc-a"]
+        assert ids(prompt="LC", version=2) == ["lc-b"]
+        assert ids(prompt="LC", version=9) == []
+        assert ids(prompt="NOPE") == []
+        (summary,) = history.list_conversations(prompt="LC", version=1)
+        assert summary.turn_count == 2
+
+    def test_list_conversations_version_without_prompt_is_an_error(self):
+        with pytest.raises(ValueError, match="requires prompt="):
+            history.list_conversations(version=1)

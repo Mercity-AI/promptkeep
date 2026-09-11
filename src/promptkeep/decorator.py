@@ -3,7 +3,8 @@
 The decorated function returns the *raw template* (placeholders intact); the
 decorator turns each call into a Prompt object, using the call's arguments as
 the variables dict. Both raw and rendered live on the returned Prompt, so
-lineage and run tracking work exactly like literal prompts.
+lineage and run tracking work exactly like literal prompts. ``async def``
+template functions are supported: awaiting the decorated call yields the Prompt.
 """
 
 from __future__ import annotations
@@ -53,32 +54,19 @@ def prompt(name: str, strict: Optional[bool] = None, exact_match: bool = False):
     if not isinstance(name, str) or not name.strip():
         raise ValueError("@prompt requires a non-empty name string")
 
-    def decorate(fn: Callable[..., str]):
-        """Wrap fn so each call yields a Prompt built from its return value."""
+    def decorate(fn: Callable[..., Any]):
+        """Wrap fn so each call yields a Prompt built from its return value.
+
+        An ``async def`` template function gets an async wrapper: awaiting it
+        yields the Prompt. Everything else — variable capture, validation,
+        lineage — is identical to the sync case.
+        """
         # Computed once at decoration time; identical for every call.
         fn_hash = _function_source_hash(fn)
         signature = inspect.signature(fn)
 
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Prompt:
-            """Call fn, then package its returned template into a Prompt."""
-            # Capture the full call (including defaults) as the variables dict.
-            bound = signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            variables: dict = {}
-            for param_name, value in bound.arguments.items():
-                kind = signature.parameters[param_name].kind
-                if kind is inspect.Parameter.VAR_KEYWORD:
-                    # **kwargs entries become top-level variables.
-                    variables.update(value)
-                elif kind is inspect.Parameter.VAR_POSITIONAL:
-                    # *args recorded as a list under the parameter's name.
-                    variables[param_name] = list(value)
-                else:
-                    variables[param_name] = value
-
-            # The function's return value is the raw template.
-            template = fn(*args, **kwargs)
+        def package(template: Any, variables: dict) -> Prompt:
+            """Validate fn's return value and wrap it as a Prompt."""
             if not isinstance(template, str):
                 raise TypeError(
                     f"@prompt function {fn.__name__!r} must return a template string,"
@@ -94,7 +82,41 @@ def prompt(name: str, strict: Optional[bool] = None, exact_match: bool = False):
                 fn_source_hash=fn_hash,
             )
 
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Prompt:
+                """Await fn, then package its returned template into a Prompt."""
+                variables = _call_variables(signature, args, kwargs)
+                return package(await fn(*args, **kwargs), variables)
+
+            async_wrapper.prompt_name = name  # type: ignore[attr-defined]
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Prompt:
+            """Call fn, then package its returned template into a Prompt."""
+            variables = _call_variables(signature, args, kwargs)
+            return package(fn(*args, **kwargs), variables)
+
         wrapper.prompt_name = name  # type: ignore[attr-defined]
         return wrapper
 
     return decorate
+
+
+def _call_variables(signature: inspect.Signature, args: tuple, kwargs: dict) -> dict:
+    """The full call (defaults applied) as the variables dict: **kwargs entries
+    become top-level variables, *args is recorded as a list under its name."""
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    variables: dict = {}
+    for param_name, value in bound.arguments.items():
+        kind = signature.parameters[param_name].kind
+        if kind is inspect.Parameter.VAR_KEYWORD:
+            variables.update(value)
+        elif kind is inspect.Parameter.VAR_POSITIONAL:
+            variables[param_name] = list(value)
+        else:
+            variables[param_name] = value
+    return variables

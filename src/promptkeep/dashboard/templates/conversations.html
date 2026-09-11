@@ -5,6 +5,17 @@
   <h1>Conversations</h1>
   <div class="sub">Multi-turn sessions, most recently active first</div>
 </div>
+<form class="inline" method="get" action="/conversations">
+  <select name="prompt">
+    <option value="">Any prompt</option>
+    {% for p in prompts %}
+    <option value="{{ p.name }}" {% if p.name == selected_prompt %}selected{% endif %}>{{ p.name }}</option>
+    {% endfor %}
+  </select>
+  <input type="number" name="version" placeholder="version" value="{{ selected_version or '' }}" style="width:90px">
+  <button type="submit">Filter</button>
+</form>
+
 {% if conversations %}
 <div class="card">
 <table>
@@ -22,6 +33,6 @@
 </table>
 </div>
 {% else %}
-<p class="empty">No conversations recorded yet.</p>
+<p class="empty">No conversations recorded{% if selected_prompt %} with {{ selected_prompt }}{% endif %} yet.</p>
 {% endif %}
 {% endblock %}

@@ -103,12 +103,29 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/conversations")
-    def conversations_page(request: Request):
-        """Every recorded conversation, most recently active first."""
+    def conversations_page(
+        request: Request, prompt: Optional[str] = None, version: Optional[str] = None
+    ):
+        """Every recorded conversation, most recently active first — or only
+        those a given prompt (version) drove. version is a str for the same
+        reason as on /runs: an empty form box must mean "no filter"."""
+        try:
+            version_number = int(version) if version else None
+        except ValueError:
+            version_number = None
+        conversations = history.list_conversations(
+            prompt=prompt or None, version=version_number if prompt else None
+        )
         return templates.TemplateResponse(
             request,
             "conversations.html",
-            {"active": "conversations", "conversations": history.list_conversations()},
+            {
+                "active": "conversations",
+                "prompts": history.list_prompts(),
+                "selected_prompt": prompt,
+                "selected_version": version,
+                "conversations": conversations,
+            },
         )
 
     @app.get("/conversations/{external_id}")

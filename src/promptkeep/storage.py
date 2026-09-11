@@ -872,8 +872,16 @@ def fetch_prompt_summaries() -> list:
     return list(query)
 
 
-def fetch_conversation_summaries(limit: int = 100) -> list:
-    """One row per conversation with its turn count, most recently active first."""
+def fetch_conversation_summaries(
+    limit: int = 100, prompt: Optional[str] = None, version: Optional[int] = None
+) -> list:
+    """One row per conversation with its turn count, most recently active first.
+
+    With ``prompt`` (and optionally ``version``), only conversations that have
+    at least one run driven by that prompt version are returned. The filter is
+    a separate EXISTS-style subquery rather than a condition on the counting
+    join, so turn_count stays the conversation's full length.
+    """
     if _get_db() is None:
         return []
     query = (
@@ -888,9 +896,18 @@ def fetch_conversation_summaries(limit: int = 100) -> list:
         .group_by(ConversationRecord.id)
         .order_by(ConversationRecord.updated_at.desc())
         .limit(limit)
-        .dicts()
     )
-    return list(query)
+    if prompt is not None:
+        driven_by = (
+            RunRecord.select(RunRecord.conversation)
+            .join(PromptVersionRecord)
+            .join(PromptRecord)
+            .where(PromptRecord.name == prompt)
+        )
+        if version is not None:
+            driven_by = driven_by.where(PromptVersionRecord.version == version)
+        query = query.where(ConversationRecord.id.in_(driven_by))
+    return list(query.dicts())
 
 
 def fetch_conversation(external_id: str) -> Optional[dict]:

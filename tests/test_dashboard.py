@@ -134,6 +134,31 @@ class TestConversationsRoutes:
         assert "q1" in r.text and "a1" in r.text
         assert "q2" in r.text and "a2" in r.text
 
+    def test_conversations_list_filters_by_prompt_and_version(self):
+        """The filter form narrows to sessions a prompt (version) drove; a
+        blank version box is not an error."""
+        _seed()
+        cid = storage.get_or_create_conversation("sess-review", title="Driven by REVIEW")
+        p1 = Prompt("hi {x}", {"x": 1}, name="REVIEW")
+        tracking.record_prompt_run(
+            p1, {"x": 1}, "hi 1", provider="openai", conversation_id=cid, output_text="o"
+        )
+        client = _client()
+        assert "sess-review" in client.get("/conversations").text
+        filtered = client.get("/conversations", params={"prompt": "REVIEW", "version": ""})
+        assert filtered.status_code == 200
+        assert "sess-review" in filtered.text
+        assert "sess-1" not in filtered.text
+        narrowed = client.get("/conversations", params={"prompt": "REVIEW", "version": "2"})
+        assert "sess-review" not in narrowed.text
+        assert "No conversations recorded with REVIEW" in narrowed.text
+
+    def test_conversation_detail_shows_stats(self):
+        """Turn count, tokens, duration and the driving versions head the page."""
+        _seed()
+        r = _client().get("/conversations/sess-1")
+        assert "2 turns" in r.text
+
     def test_conversation_detail_unknown_is_404(self):
         r = _client().get("/conversations/nope")
         assert r.status_code == 404

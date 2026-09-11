@@ -9,7 +9,9 @@ from __future__ import annotations
 import difflib
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from itertools import groupby
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import storage
 
@@ -67,7 +69,12 @@ class RunInfo:
 
 @dataclass(frozen=True)
 class ConversationInfo:
-    """One conversation: its own metadata plus every turn, oldest first."""
+    """One conversation: its own metadata plus every turn, oldest first.
+
+    ``turns`` holds one RunInfo per run row. A single API call that carried
+    more than one tracked Prompt produced several rows sharing a turn_index;
+    the derived views below treat those as one turn.
+    """
 
     external_id: str
     title: Optional[str]
@@ -75,6 +82,94 @@ class ConversationInfo:
     created_at: str
     updated_at: str
     turns: List[RunInfo]
+
+    @property
+    def versions_used(self) -> Dict[str, List[int]]:
+        """Which prompt versions drove this conversation, e.g.
+        ``{"REVIEW_SYSTEM": [4, 5], "SUMMARIZE": [2]}`` — each name's versions
+        in order of first use. Turns without a tracked Prompt contribute nothing."""
+        used: Dict[str, List[int]] = {}
+        for turn in self.turns:
+            if turn.prompt_name is None or turn.version is None:
+                continue
+            versions = used.setdefault(turn.prompt_name, [])
+            if turn.version not in versions:
+                versions.append(turn.version)
+        return used
+
+    @property
+    def total_tokens(self) -> int:
+        """Tokens across every turn, from the providers' reported usage. A turn
+        with no usage (an error, a stream without a usage chunk) counts as 0."""
+        return sum(turn.total_tokens or 0 for turn in self.turns)
+
+    @property
+    def duration(self) -> float:
+        """Wall-clock seconds from the start of the first turn to the end of the
+        last one; 0.0 for an empty conversation.
+
+        A run's timestamp is taken when it is recorded — at the end of its
+        call — so a turn's start is its timestamp less its latency. Turns whose
+        timestamp can't be parsed are ignored.
+        """
+        starts, ends = [], []
+        for turn in self.turns:
+            end = _parse_timestamp(turn.created_at)
+            if end is None:
+                continue
+            ends.append(end)
+            starts.append(end - timedelta(milliseconds=turn.latency_ms or 0))
+        if not ends:
+            return 0.0
+        return max(0.0, (max(ends) - min(starts)).total_seconds())
+
+    def replay(self, system: Any = None) -> List[Dict[str, Any]]:
+        """Rebuild the conversation as a chat ``messages`` list, ready to send
+        back to a provider — the raw material of every eval and re-run.
+
+        Completed turns (status "ok") are walked in order. Each contributes the
+        system prompt that was in play (the tracked Prompt's rendered text —
+        emitted only when it differs from the previous turn's, so an unchanged
+        system prompt appears once), then the user message as it was actually
+        sent (``input_text``, after any pre-check rewrite) and the assistant's
+        reply (``output_text``). Blocked calls and provider errors never gave
+        the model anything to build on, so they are left out. Content that was
+        multi-part when recorded was flattened to its text; replay is text-only.
+
+        To re-run the session against a different prompt, pass ``system=``: it
+        goes first as the one system message (a str, or a Prompt object — a
+        wrapped client tracks the latter like any other) and the stored system
+        prompts are dropped.
+        """
+        messages: List[Dict[str, Any]] = []
+        if system is not None:
+            messages.append({"role": "system", "content": system})
+        previous_prompts: set = set()
+        for _index, rows in self._completed_turns():
+            head = rows[0]
+            # A Prompt that *was* the user turn is already the input; it is
+            # not a system prompt, so don't emit it twice.
+            prompts = [r.rendered_text for r in rows if r.rendered_text]
+            prompts = [t for t in prompts if t != head.input_text]
+            if system is None:
+                for text in prompts:
+                    if text not in previous_prompts:
+                        messages.append({"role": "system", "content": text})
+            previous_prompts = set(prompts)
+            if head.input_text is not None:
+                messages.append({"role": "user", "content": head.input_text})
+            if head.output_text is not None:
+                messages.append({"role": "assistant", "content": head.output_text})
+        return messages
+
+    def _completed_turns(self) -> Iterator[Tuple[Optional[int], List[RunInfo]]]:
+        """Turns that completed, as (turn_index, rows) — rows sharing a
+        turn_index came from the same API call. Relies on ``turns`` being
+        ordered by turn_index, which the storage read guarantees."""
+        for index, group in groupby(self.turns, key=lambda t: t.turn_index):
+            rows = [r for r in group if r.status == "ok"]
+            if rows:
+                yield index, rows
 
 
 @dataclass(frozen=True)
@@ -143,6 +238,14 @@ def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
     if "warn" in statuses:
         return "warn"
     return "ok"
+
+
+def _parse_timestamp(value: str) -> Optional[datetime]:
+    """A stored ISO-8601 timestamp as a datetime; None when unparseable."""
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
 
 
 def _load_json(value: Optional[str]):
@@ -242,8 +345,18 @@ def list_prompts() -> List[PromptSummary]:
     ]
 
 
-def list_conversations(limit: int = 100) -> List[ConversationSummary]:
-    """Every conversation with its turn count, most recently active first."""
+def list_conversations(
+    limit: int = 100, prompt: Optional[str] = None, version: Optional[int] = None
+) -> List[ConversationSummary]:
+    """Every conversation with its turn count, most recently active first.
+
+    ``prompt=`` keeps only conversations in which that prompt drove at least
+    one turn; ``version=`` (which needs ``prompt=``) narrows to one version of
+    it — "every session where REVIEW_SYSTEM v4 was live". The turn count is
+    always the conversation's full length, not just the matching turns.
+    """
+    if version is not None and prompt is None:
+        raise ValueError("list_conversations(version=...) requires prompt= as well")
     return [
         ConversationSummary(
             external_id=row["external_id"],
@@ -252,7 +365,7 @@ def list_conversations(limit: int = 100) -> List[ConversationSummary]:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
-        for row in storage.fetch_conversation_summaries(limit=limit)
+        for row in storage.fetch_conversation_summaries(limit=limit, prompt=prompt, version=version)
     ]
 
 

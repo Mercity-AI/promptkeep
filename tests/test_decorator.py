@@ -1,5 +1,7 @@
 """Tests for the @prompt decorator: computed prompts and their versioning."""
 
+import asyncio
+
 import pytest
 
 from promptkeep import Prompt, history, prompt
@@ -91,6 +93,31 @@ class TestDecorator:
             @prompt
             def make():
                 return "hi"
+
+    def test_async_function_yields_prompt_when_awaited(self):
+        """An async template builder is awaited, then packaged like the sync
+        case — same variables capture, same lineage."""
+
+        @prompt(name="DECO_ASYNC")
+        async def make(topic="cats", n=2):
+            await asyncio.sleep(0)  # e.g. fetching examples from a store
+            return f"Give {n} facts about {{topic}}."
+
+        p = asyncio.run(make(topic="owls"))
+        assert isinstance(p, Prompt)
+        assert p.raw == "Give 2 facts about {topic}."
+        assert p.text == "Give 2 facts about owls."
+        assert p.variables == {"topic": "owls", "n": 2}
+        assert p.version == 1
+        assert make.prompt_name == "DECO_ASYNC"
+
+    def test_async_non_string_return_raises(self):
+        @prompt(name="DECO_ASYNC")
+        async def make():
+            return None
+
+        with pytest.raises(TypeError, match="must return a template string"):
+            asyncio.run(make())
 
     def test_wraps_preserves_function_identity(self):
         """functools.wraps keeps the function introspectable after decoration."""

@@ -61,7 +61,8 @@ def review_sys_prompt(var1="some value", n_examples=3):
 p = review_sys_prompt(var1="security")   # -> Prompt (raw + rendered + version)
 ```
 
-The function returns the raw template; the call's arguments become the variables.
+The function returns the raw template; the call's arguments become the variables. An
+`async def` builder works the same way — `await review_sys_prompt(...)` yields the Prompt.
 
 ## OpenAI integration
 
@@ -200,11 +201,20 @@ history.runs("REVIEW_SYSTEM", version=3)     # recorded runs, newest first
 convo = history.conversation("user-42-session-9")
 convo.turns                                  # ordered turns: input, output, version, usage
 convo.metadata                               # whatever you attached at the start
+convo.versions_used                          # {"REVIEW_SYSTEM": [4, 5]} — what drove it
+convo.total_tokens, convo.duration           # usage summed; wall-clock seconds
+convo.replay()                               # -> messages list, ready to send again
+convo.replay(system=new_prompt)              # ...against a different prompt version
 
 history.list_prompts()                       # every prompt + version/run counts
 history.list_conversations()                 # every session + turn counts
+history.list_conversations(prompt="REVIEW_SYSTEM", version=4)   # sessions v4 drove
 history.all_runs()                           # everything, newest first
 ```
+
+`replay()` walks the completed turns in order and emits the system prompt that was in play
+(again whenever it changed mid-session), then each user message as it was actually sent and
+the assistant's reply — the raw material for re-running a session against a new version.
 
 ## Local dashboard
 

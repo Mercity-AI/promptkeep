@@ -7,6 +7,17 @@ public APIs; each such change is called out below.
 
 ## [Unreleased]
 
+### Added
+
+- Conversation read model: `ConversationInfo.replay()` rebuilds a session as a
+  chat `messages` list (pass `system=` to re-run it against another prompt),
+  plus `versions_used`, `total_tokens` and `duration`.
+- `history.list_conversations(prompt=, version=)` filters sessions by the
+  prompt version that drove them; the dashboard's conversations page gets the
+  same filter and a per-conversation stats line.
+- `@prompt` on an `async def` template function: awaiting the call yields the
+  Prompt.
+
 ## [0.3.0] - 2026-09-11
 
 The release that makes promptkeep safe to deploy: run writes leave the request

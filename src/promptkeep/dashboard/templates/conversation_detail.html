@@ -5,6 +5,15 @@
 <div class="page-head">
   <h1>{{ convo.title or convo.external_id }}</h1>
   <div class="sub mono">{{ convo.external_id }} · started {{ convo.created_at[:19] }}</div>
+  <div class="sub">
+    {{ convo.turns|length }} turn{{ 's' if convo.turns|length != 1 }}
+    · <span class="num">{{ convo.total_tokens }}</span> tokens
+    · <span class="num">{{ '%.1f'|format(convo.duration) }}</span>s
+    {% for name, versions in convo.versions_used.items() %}
+    · <a href="/prompts/{{ name }}">{{ name }}</a>
+      {% for v in versions %}<span class="badge">v{{ v }}</span> {% endfor %}
+    {% endfor %}
+  </div>
 </div>
 
 {% for t in convo.turns %}
