@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import difflib
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import groupby
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 from . import storage
 
@@ -24,7 +25,7 @@ class VersionInfo:
     template: str
     template_hash: str
     source: str
-    fn_source_hash: Optional[str]
+    fn_source_hash: str | None
     created_at: str
 
 
@@ -45,26 +46,26 @@ class RunInfo:
 
     id: int
     run_key: str
-    prompt_name: Optional[str]
-    version: Optional[int]
-    variables: Optional[Dict[str, Any]]
-    rendered_text: Optional[str]
+    prompt_name: str | None
+    version: int | None
+    variables: dict[str, Any] | None
+    rendered_text: str | None
     provider: str
-    model: Optional[str]
-    request_params: Optional[Dict[str, Any]]
-    response_id: Optional[str]
-    output_text: Optional[str]
-    prompt_tokens: Optional[int]
-    completion_tokens: Optional[int]
-    total_tokens: Optional[int]
-    latency_ms: Optional[int]
+    model: str | None
+    request_params: dict[str, Any] | None
+    response_id: str | None
+    output_text: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int | None
     status: str
-    error: Optional[str]
+    error: str | None
     created_at: str
-    conversation_id: Optional[str] = None
-    turn_index: Optional[int] = None
-    input_text: Optional[str] = None
-    original_input_text: Optional[str] = None
+    conversation_id: str | None = None
+    turn_index: int | None = None
+    input_text: str | None = None
+    original_input_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,18 +78,18 @@ class ConversationInfo:
     """
 
     external_id: str
-    title: Optional[str]
-    metadata: Optional[Dict[str, Any]]
+    title: str | None
+    metadata: dict[str, Any] | None
     created_at: str
     updated_at: str
-    turns: List[RunInfo]
+    turns: list[RunInfo]
 
     @property
-    def versions_used(self) -> Dict[str, List[int]]:
+    def versions_used(self) -> dict[str, list[int]]:
         """Which prompt versions drove this conversation, e.g.
         ``{"REVIEW_SYSTEM": [4, 5], "SUMMARIZE": [2]}`` — each name's versions
         in order of first use. Turns without a tracked Prompt contribute nothing."""
-        used: Dict[str, List[int]] = {}
+        used: dict[str, list[int]] = {}
         for turn in self.turns:
             if turn.prompt_name is None or turn.version is None:
                 continue
@@ -123,7 +124,7 @@ class ConversationInfo:
             return 0.0
         return max(0.0, (max(ends) - min(starts)).total_seconds())
 
-    def replay(self, system: Any = None) -> List[Dict[str, Any]]:
+    def replay(self, system: Any = None) -> list[dict[str, Any]]:
         """Rebuild the conversation as a chat ``messages`` list, ready to send
         back to a provider — the raw material of every eval and re-run.
 
@@ -141,7 +142,7 @@ class ConversationInfo:
         wrapped client tracks the latter like any other) and the stored system
         prompts are dropped.
         """
-        messages: List[Dict[str, Any]] = []
+        messages: list[dict[str, Any]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
         previous_prompts: set = set()
@@ -162,7 +163,7 @@ class ConversationInfo:
                 messages.append({"role": "assistant", "content": head.output_text})
         return messages
 
-    def _completed_turns(self) -> Iterator[Tuple[Optional[int], List[RunInfo]]]:
+    def _completed_turns(self) -> Iterator[tuple[int | None, list[RunInfo]]]:
         """Turns that completed, as (turn_index, rows) — rows sharing a
         turn_index came from the same API call. Relies on ``turns`` being
         ordered by turn_index, which the storage read guarantees."""
@@ -187,7 +188,7 @@ class ConversationSummary:
     """One conversation's row in an overview listing: id plus turn count."""
 
     external_id: str
-    title: Optional[str]
+    title: str | None
     turn_count: int
     created_at: str
     updated_at: str
@@ -201,12 +202,12 @@ class CheckInfo:
     name: str
     phase: str  # 'pre' | 'post'
     status: str  # 'ok' | 'warn' | 'block' | 'error'
-    score: Optional[float]
-    message: Optional[str]
-    rewritten: Optional[str] = None
+    score: float | None
+    message: str | None
+    rewritten: str | None = None
 
 
-def checks(run_key: str) -> List[CheckInfo]:
+def checks(run_key: str) -> list[CheckInfo]:
     """Every check verdict for a run (by its key), oldest first."""
     return [
         CheckInfo(
@@ -221,7 +222,7 @@ def checks(run_key: str) -> List[CheckInfo]:
     ]
 
 
-def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
+def verdict(run_status: str, check_infos: list[CheckInfo]) -> str | None:
     """The one-word headline for a run's checks, for a badge in the UI.
 
     'blocked' if the call was gated, else 'failed' if any check errored,
@@ -240,7 +241,7 @@ def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
     return "ok"
 
 
-def _parse_timestamp(value: str) -> Optional[datetime]:
+def _parse_timestamp(value: str) -> datetime | None:
     """A stored ISO-8601 timestamp as a datetime; None when unparseable."""
     try:
         return datetime.fromisoformat(value)
@@ -248,7 +249,7 @@ def _parse_timestamp(value: str) -> Optional[datetime]:
         return None
 
 
-def _load_json(value: Optional[str]):
+def _load_json(value: str | None):
     """Decode a stored JSON column; malformed/missing data becomes None."""
     if value is None:
         return None
@@ -258,7 +259,7 @@ def _load_json(value: Optional[str]):
         return None
 
 
-def versions(name: str) -> List[VersionInfo]:
+def versions(name: str) -> list[VersionInfo]:
     """All versions of a prompt, oldest first."""
     return [
         VersionInfo(
@@ -290,7 +291,7 @@ def diff(name: str, old: int, new: int) -> str:
     return "\n".join(lines)
 
 
-def _run_info_from_row(row: Dict[str, Any]) -> RunInfo:
+def _run_info_from_row(row: dict[str, Any]) -> RunInfo:
     """Shape one raw run/turn dict row (from either fetch_runs or
     fetch_conversation_turns) into a RunInfo. Missing optional columns
     (older query shapes) default to None via dict.get."""
@@ -320,19 +321,19 @@ def _run_info_from_row(row: Dict[str, Any]) -> RunInfo:
     )
 
 
-def runs(name: str, version: Optional[int] = None, limit: int = 50) -> List[RunInfo]:
+def runs(name: str, version: int | None = None, limit: int = 50) -> list[RunInfo]:
     """Recorded runs for a prompt (optionally one version), newest first."""
     return [
         _run_info_from_row(row) for row in storage.fetch_runs(name, version=version, limit=limit)
     ]
 
 
-def all_runs(limit: int = 100) -> List[RunInfo]:
+def all_runs(limit: int = 100) -> list[RunInfo]:
     """Every recorded run regardless of prompt (or with none), newest first."""
     return [_run_info_from_row(row) for row in storage.fetch_all_runs(limit=limit)]
 
 
-def list_prompts() -> List[PromptSummary]:
+def list_prompts() -> list[PromptSummary]:
     """Every prompt with its version/run counts, for an overview listing."""
     return [
         PromptSummary(
@@ -346,8 +347,8 @@ def list_prompts() -> List[PromptSummary]:
 
 
 def list_conversations(
-    limit: int = 100, prompt: Optional[str] = None, version: Optional[int] = None
-) -> List[ConversationSummary]:
+    limit: int = 100, prompt: str | None = None, version: int | None = None
+) -> list[ConversationSummary]:
     """Every conversation with its turn count, most recently active first.
 
     ``prompt=`` keeps only conversations in which that prompt drove at least

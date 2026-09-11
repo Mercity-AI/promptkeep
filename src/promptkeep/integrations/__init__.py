@@ -8,7 +8,7 @@ instruments each one it finds with the shared interceptor in ``core``.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any
 
 from .base import ProviderAdapter, Request, ResponseFields, StreamAbsorber, Target
 from .core import instrument, is_instrumented
@@ -16,10 +16,10 @@ from .openai_wrapper import OpenAIChatAdapter
 
 # Registration order is also search order. Built-ins first; third parties
 # append with register_adapter().
-_ADAPTERS: List[ProviderAdapter] = [OpenAIChatAdapter()]
+_ADAPTERS: list[ProviderAdapter] = [OpenAIChatAdapter()]
 
 
-def adapters() -> List[ProviderAdapter]:
+def adapters() -> list[ProviderAdapter]:
     """The registered adapters, in search order (a copy)."""
     return list(_ADAPTERS)
 
@@ -59,7 +59,7 @@ def wrap(target):
     return target
 
 
-def is_wrapped(client: Any) -> Optional[bool]:
+def is_wrapped(client: Any) -> bool | None:
     """Whether a client's provider surfaces carry promptkeep's tracking:
     True/False when at least one adapter recognizes the client, None when
     none does (nothing to be wrapped or unwrapped)."""

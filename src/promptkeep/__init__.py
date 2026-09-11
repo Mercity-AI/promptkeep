@@ -5,7 +5,8 @@ Public API:
     from promptkeep import Prompt, prompt, wrap, configure, history
 """
 
-from importlib.metadata import PackageNotFoundError, version as _distribution_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 
 from . import history
 from .checks import CheckContext, PromptBlocked, Verdict, acall, call, check, suppress

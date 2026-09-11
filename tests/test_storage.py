@@ -7,9 +7,8 @@ import peewee as pw
 import pytest
 
 import promptkeep
-from promptkeep import Prompt, history
+from promptkeep import Prompt, history, storage, tracking
 from promptkeep import config as pm_config
-from promptkeep import storage, tracking
 
 
 class TestLineage:

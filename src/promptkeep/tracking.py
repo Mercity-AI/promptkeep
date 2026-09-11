@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 
 from . import checks, writer
 from .prompts import Prompt
@@ -20,27 +20,27 @@ logger = logging.getLogger("promptkeep")
 
 def record_prompt_run(
     prompt: Prompt,
-    variables: Optional[Dict[str, Any]],
+    variables: dict[str, Any] | None,
     rendered_text: str,
     *,
-    run_key: Optional[str] = None,
+    run_key: str | None = None,
     provider: str,
-    model: Optional[str] = None,
-    request_params: Optional[Dict[str, Any]] = None,
-    response_id: Optional[str] = None,
-    output_text: Optional[str] = None,
-    prompt_tokens: Optional[int] = None,
-    completion_tokens: Optional[int] = None,
-    total_tokens: Optional[int] = None,
-    latency_ms: Optional[int] = None,
+    model: str | None = None,
+    request_params: dict[str, Any] | None = None,
+    response_id: str | None = None,
+    output_text: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    latency_ms: int | None = None,
     status: str = "ok",
-    error: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-    turn_index: Optional[int] = None,
-    input_text: Optional[str] = None,
-    original_input_text: Optional[str] = None,
-    checks: Optional[list] = None,
-) -> Optional[str]:
+    error: str | None = None,
+    conversation_id: int | None = None,
+    turn_index: int | None = None,
+    input_text: str | None = None,
+    original_input_text: str | None = None,
+    checks: list | None = None,
+) -> str | None:
     """Record one execution of a prompt: resolve its version, insert a run row.
     Returns the run's key when recorded (see storage.record_run).
 
@@ -83,24 +83,24 @@ def record_prompt_run(
 
 def record_conversation_turn(
     *,
-    run_key: Optional[str] = None,
+    run_key: str | None = None,
     provider: str,
-    model: Optional[str] = None,
-    request_params: Optional[Dict[str, Any]] = None,
-    response_id: Optional[str] = None,
-    output_text: Optional[str] = None,
-    prompt_tokens: Optional[int] = None,
-    completion_tokens: Optional[int] = None,
-    total_tokens: Optional[int] = None,
-    latency_ms: Optional[int] = None,
+    model: str | None = None,
+    request_params: dict[str, Any] | None = None,
+    response_id: str | None = None,
+    output_text: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    latency_ms: int | None = None,
     status: str = "ok",
-    error: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-    turn_index: Optional[int] = None,
-    input_text: Optional[str] = None,
-    original_input_text: Optional[str] = None,
-    checks: Optional[list] = None,
-) -> Optional[str]:
+    error: str | None = None,
+    conversation_id: int | None = None,
+    turn_index: int | None = None,
+    input_text: str | None = None,
+    original_input_text: str | None = None,
+    checks: list | None = None,
+) -> str | None:
     """Record a turn with no wrapped Prompt — a plain message, or a checked
     call whose only reason to exist as a run is to hang check verdicts off.
     Returns the run's key when recorded.
@@ -136,7 +136,7 @@ def record_conversation_turn(
     )
 
 
-def flush(timeout: Optional[float] = None) -> bool:
+def flush(timeout: float | None = None) -> bool:
     """Block until everything recorded so far is on disk, or ``timeout`` passes.
 
     Two things can still be in flight after a call returns: async post-checks
@@ -150,7 +150,7 @@ def flush(timeout: Optional[float] = None) -> bool:
     """
     deadline = None if timeout is None else time.monotonic() + timeout
 
-    def remaining() -> Optional[float]:
+    def remaining() -> float | None:
         return None if deadline is None else max(0.0, deadline - time.monotonic())
 
     if not checks.wait_for_pending(remaining()):

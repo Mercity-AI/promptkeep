@@ -33,9 +33,10 @@ import contextvars
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 logger = logging.getLogger("promptkeep")
 
@@ -51,7 +52,7 @@ _suppressed: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # checks (pre and blocking-post) do NOT use this pool: each runs in its own
 # thread (see _run_with_timeout), so a saturated pool can't make a fast check
 # look slow or cap how many requests can be in flight.
-_executor: Optional[ThreadPoolExecutor] = None
+_executor: ThreadPoolExecutor | None = None
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -64,11 +65,11 @@ def _get_executor() -> ThreadPoolExecutor:
 
 # Async post-checks still running. flush() waits on these before draining the
 # writer queue, so a verdict that was mid-flight is on disk when flush returns.
-_pending: Set[Future] = set()
+_pending: set[Future] = set()
 _pending_lock = threading.Lock()
 
 
-def schedule_async(chk: "Check", ctx: "CheckContext", run_key: Optional[str]) -> Future:
+def schedule_async(chk: Check, ctx: CheckContext, run_key: str | None) -> Future:
     """Run an async post-check on the shared pool; persist its verdict when it lands.
 
     Returns the Future (the RunHandle waits on it for ``wait()``). The check
@@ -79,7 +80,7 @@ def schedule_async(chk: "Check", ctx: "CheckContext", run_key: Optional[str]) ->
     """
     from . import storage
 
-    def _work() -> "CheckResult":
+    def _work() -> CheckResult:
         result = chk.run_inline(ctx)
         storage.record_check(run_key, result.to_row())
         return result
@@ -98,7 +99,7 @@ def _forget_pending(future: Future) -> None:
         _pending.discard(future)
 
 
-def wait_for_pending(timeout: Optional[float] = None) -> bool:
+def wait_for_pending(timeout: float | None = None) -> bool:
     """Block until every async post-check in flight has finished, or ``timeout``
     seconds pass. Returns True when none remain, False on timeout."""
     with _pending_lock:
@@ -109,7 +110,7 @@ def wait_for_pending(timeout: Optional[float] = None) -> bool:
     return not not_done
 
 
-def _run_with_timeout(fn: Callable[[], Any], timeout: float) -> Tuple[bool, Any]:
+def _run_with_timeout(fn: Callable[[], Any], timeout: float) -> tuple[bool, Any]:
     """Run ``fn()`` in a dedicated daemon thread, waiting up to ``timeout`` seconds.
 
     A fresh thread per call — not a shared pool — is deliberate. It means the
@@ -126,7 +127,7 @@ def _run_with_timeout(fn: Callable[[], Any], timeout: float) -> Tuple[bool, Any]
     nor permanently retires a pooled worker (both of which the old shared pool
     was prone to).
     """
-    box: List[Any] = []
+    box: list[Any] = []
     thread = threading.Thread(target=lambda: box.append(fn()), name="promptkeep-check", daemon=True)
     thread.start()
     thread.join(timeout)
@@ -164,27 +165,27 @@ class Verdict:
     """
 
     status: str
-    message: Optional[str] = None
-    score: Optional[float] = None
-    rewritten: Optional[str] = None
+    message: str | None = None
+    score: float | None = None
+    rewritten: str | None = None
 
     @classmethod
-    def ok(cls, message: Optional[str] = None) -> "Verdict":
+    def ok(cls, message: str | None = None) -> Verdict:
         """Pass — continue normally."""
         return cls("ok", message)
 
     @classmethod
-    def warn(cls, message: str) -> "Verdict":
+    def warn(cls, message: str) -> Verdict:
         """Continue, but record a concern on the run."""
         return cls("warn", message)
 
     @classmethod
-    def block(cls, message: str) -> "Verdict":
+    def block(cls, message: str) -> Verdict:
         """Stop — do not call the provider (pre-checks only)."""
         return cls("block", message)
 
     @classmethod
-    def rewrite(cls, text: str, message: Optional[str] = None) -> "Verdict":
+    def rewrite(cls, text: str, message: str | None = None) -> Verdict:
         """Continue, but replace the newest outgoing message with ``text``
         (pre-checks only). Build ``text`` from ``ctx.last_text`` (the current
         turn), not ``ctx.rendered`` (every message joined) — the latter would
@@ -194,8 +195,8 @@ class Verdict:
 
     @classmethod
     def from_score(
-        cls, score: float, threshold: float = 0.5, message: Optional[str] = None
-    ) -> "Verdict":
+        cls, score: float, threshold: float = 0.5, message: str | None = None
+    ) -> Verdict:
         """A numeric check: 'ok' at/above the threshold, 'warn' below it."""
         status = "ok" if score >= threshold else "warn"
         return cls(status, message, score=score)
@@ -215,19 +216,19 @@ class CheckContext:
     rendered: str
     messages: Any = None
     prompt: Any = None
-    variables: Optional[Dict[str, Any]] = None
-    model: Optional[str] = None
+    variables: dict[str, Any] | None = None
+    model: str | None = None
     provider: str = "openai"
-    output_text: Optional[str] = None
+    output_text: str | None = None
     response: Any = None
     # The newest outgoing message's text (the current turn). This — not
     # `rendered`, which is every message joined for scanning — is what a
     # rewrite should be built from, since rewrite replaces exactly this.
-    last_text: Optional[str] = None
+    last_text: str | None = None
     # The current turn as the caller passed it, before any pre-check rewrote
     # it. None until a rewrite happens; from then on every later check (the
     # remaining pre-checks and the post-checks) can compare the two.
-    original_text: Optional[str] = None
+    original_text: str | None = None
 
 
 # --- a registered check --------------------------------------------------------
@@ -241,10 +242,10 @@ class Check:
     name: str
     phase: str  # 'pre' | 'post'
     mode: str = "blocking"  # post only: 'async' | 'blocking'
-    timeout: Optional[float] = 5.0
+    timeout: float | None = 5.0
     on_timeout: str = "open"  # 'open' (continue) | 'closed' (block)
 
-    def _execute(self, ctx: CheckContext) -> "CheckResult":
+    def _execute(self, ctx: CheckContext) -> CheckResult:
         """Call the function under suppression, shielded. Never raises — a
         crash becomes an 'error' result rather than touching the caller."""
         start = time.perf_counter()
@@ -272,7 +273,7 @@ class Check:
             rewritten=verdict.rewritten,
         )
 
-    def run(self, ctx: CheckContext) -> "CheckResult":
+    def run(self, ctx: CheckContext) -> CheckResult:
         """Hot-path execution with a timeout. On timeout, fail open (record a
         warning and continue) unless on_timeout='closed' on a pre-check, which
         blocks. A slow check must never become an outage.
@@ -294,7 +295,7 @@ class Check:
         logger.warning("promptkeep: check %r timed out — failing open", self.name)
         return CheckResult(self.name, self.phase, "warn", None, msg, latency)
 
-    def run_inline(self, ctx: CheckContext) -> "CheckResult":
+    def run_inline(self, ctx: CheckContext) -> CheckResult:
         """Execution without the timeout wrapper — for async post-checks, which
         already run off the caller's thread so no nested pool submit is needed."""
         return self._execute(ctx)
@@ -307,10 +308,10 @@ class CheckResult:
     name: str
     phase: str
     status: str
-    score: Optional[float] = None
-    message: Optional[str] = None
-    latency_ms: Optional[int] = None
-    rewritten: Optional[str] = None
+    score: float | None = None
+    message: str | None = None
+    latency_ms: int | None = None
+    rewritten: str | None = None
 
     def to_row(self) -> dict:
         """As a storage row. ``rewritten`` rides along so the audit trail names
@@ -333,7 +334,7 @@ class _CheckFactory:
     """The `check` object: `@check.pre(...)` / `@check.post(...)` decorators."""
 
     def pre(
-        self, name: Optional[str] = None, timeout: Optional[float] = 5.0, on_timeout: str = "open"
+        self, name: str | None = None, timeout: float | None = 5.0, on_timeout: str = "open"
     ) -> Callable[[Callable], Check]:
         """Register a pre-check (a gate). Blocking by nature."""
 
@@ -344,9 +345,9 @@ class _CheckFactory:
 
     def post(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         mode: str = "async",
-        timeout: Optional[float] = 5.0,
+        timeout: float | None = 5.0,
         on_timeout: str = "open",
     ) -> Callable[[Callable], Check]:
         """Register a post-check (an audit). Async by default (non-blocking)."""
@@ -367,12 +368,12 @@ check = _CheckFactory()
 class PreOutcome:
     """Result of running all pre-checks: what to record, and whether to stop."""
 
-    results: List[CheckResult] = field(default_factory=list)
-    blocked: Optional[CheckResult] = None
-    rewritten: Optional[str] = None
+    results: list[CheckResult] = field(default_factory=list)
+    blocked: CheckResult | None = None
+    rewritten: str | None = None
 
 
-def run_pre_checks(checks: List[Check], ctx: CheckContext) -> PreOutcome:
+def run_pre_checks(checks: list[Check], ctx: CheckContext) -> PreOutcome:
     """Run pre-checks in order. Stop at the first block; apply rewrites."""
     outcome = PreOutcome()
     rendered = ctx.rendered
@@ -400,7 +401,7 @@ def run_pre_checks(checks: List[Check], ctx: CheckContext) -> PreOutcome:
 class PromptBlocked(Exception):
     """Raised when a pre-check blocks a call and on_block='raise' (the default)."""
 
-    def __init__(self, check_name: str, message: Optional[str]):
+    def __init__(self, check_name: str, message: str | None):
         self.check_name = check_name
         self.message = message
         super().__init__(f"blocked by check {check_name!r}: {message}")
@@ -441,7 +442,7 @@ class RunHandle:
     def _pending(self) -> bool:
         return any(not f.done() for f in self._futures)
 
-    def wait(self, timeout: Optional[float] = None) -> "RunHandle":
+    def wait(self, timeout: float | None = None) -> RunHandle:
         """Block until async post-checks finish (or timeout), then return self."""
         for future in self._futures:
             try:
@@ -453,7 +454,7 @@ class RunHandle:
         self._futures = []
         return self
 
-    async def awaited(self, timeout: Optional[float] = None) -> "RunHandle":
+    async def awaited(self, timeout: float | None = None) -> RunHandle:
         """Async twin of wait(): await the async post-checks off the event loop,
         then return self. Use from async code so waiting never blocks the loop."""
         import asyncio
@@ -474,9 +475,9 @@ class CallResult:
     is the untouched provider object, still available if you need it.
     """
 
-    text: Optional[str]
+    text: str | None
     verification: str
-    run_key: Optional[str]
+    run_key: str | None
     checks: list
     response: Any
 

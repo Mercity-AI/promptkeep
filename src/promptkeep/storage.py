@@ -19,9 +19,9 @@ import logging
 import random
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import peewee as pw
 
@@ -32,7 +32,7 @@ _SCHEMA_VERSION = 5
 # The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
 _db_lock = threading.Lock()
-_current_path: Optional[str] = None
+_current_path: str | None = None
 
 # Registration results memoized per (db, name, template-hash) so repeated
 # renders of the same prompt cost zero DB round-trips.
@@ -199,7 +199,7 @@ _MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord, Che
 
 def _utcnow() -> str:
     """Current UTC time as an ISO-8601 string (how all timestamps are stored)."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def new_run_key() -> str:
@@ -231,7 +231,7 @@ def template_hash(text: str, exact: bool = False) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _json_or_none(obj: Any) -> Optional[str]:
+def _json_or_none(obj: Any) -> str | None:
     """Serialize to JSON for storage; non-serializable values fall back to repr()."""
     if obj is None:
         return None
@@ -241,7 +241,7 @@ def _json_or_none(obj: Any) -> Optional[str]:
 # --- database lifecycle ----------------------------------------------------------
 
 
-def _get_db() -> Optional[pw.DatabaseProxy]:
+def _get_db() -> pw.DatabaseProxy | None:
     """Bind the proxy to the configured DB (once), or None when disabled.
 
     First-time setup (connect, WAL switch, table creation) runs under a lock:
@@ -396,9 +396,9 @@ def register_version(
     name: str,
     template: str,
     source: str = "literal",
-    fn_source_hash: Optional[str] = None,
+    fn_source_hash: str | None = None,
     exact_match: bool = False,
-) -> Optional[Tuple[int, int]]:
+) -> tuple[int, int] | None:
     """Idempotently record (name, template) and return (version_id, version).
 
     Deduplicated by template content hash (normalized by default; raw text
@@ -433,7 +433,7 @@ def register_version(
     return result
 
 
-def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int, int]:
+def _register(name, template, content_hash, source, fn_source_hash) -> tuple[int, int]:
     """Insert the prompt/version rows, deduping and racing safely.
 
     Retry: two writers can race on the same next-version number; the unique
@@ -483,9 +483,9 @@ def _register(name, template, content_hash, source, fn_source_hash) -> Tuple[int
 
 def get_or_create_conversation(
     external_id: str,
-    title: Optional[str] = None,
-    metadata: Optional[dict] = None,
-) -> Optional[int]:
+    title: str | None = None,
+    metadata: dict | None = None,
+) -> int | None:
     """Idempotently resolve a conversation by its caller-supplied id.
 
     Creates the row on first sight (the "never break the caller" rule
@@ -552,27 +552,27 @@ def reserve_turn_index(conversation_id: int) -> int:
 
 def record_run(
     *,
-    run_key: Optional[str] = None,
-    version_id: Optional[int] = None,
-    variables: Optional[dict] = None,
-    rendered_text: Optional[str] = None,
+    run_key: str | None = None,
+    version_id: int | None = None,
+    variables: dict | None = None,
+    rendered_text: str | None = None,
     provider: str,
-    model: Optional[str] = None,
-    request_params: Optional[dict] = None,
-    response_id: Optional[str] = None,
-    output_text: Optional[str] = None,
-    prompt_tokens: Optional[int] = None,
-    completion_tokens: Optional[int] = None,
-    total_tokens: Optional[int] = None,
-    latency_ms: Optional[int] = None,
+    model: str | None = None,
+    request_params: dict | None = None,
+    response_id: str | None = None,
+    output_text: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    latency_ms: int | None = None,
     status: str = "ok",
-    error: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-    turn_index: Optional[int] = None,
-    input_text: Optional[str] = None,
-    original_input_text: Optional[str] = None,
-    checks: Optional[list] = None,
-) -> Optional[str]:
+    error: str | None = None,
+    conversation_id: int | None = None,
+    turn_index: int | None = None,
+    input_text: str | None = None,
+    original_input_text: str | None = None,
+    checks: list | None = None,
+) -> str | None:
     """Record one run row, honoring the configured write_mode. Never raises.
 
     Returns the run's key — the identity everything else references it by
@@ -681,7 +681,7 @@ _REDACTED_RUN_FIELDS = (
 _REDACTED_CHECK_FIELDS = ("message", "rewritten")
 
 
-def _keep_run(settings, row: dict, conversation_id: Optional[int]) -> bool:
+def _keep_run(settings, row: dict, conversation_id: int | None) -> bool:
     """The sampling decision for one run.
 
     Anything worth investigating is always kept: a call that failed or was
@@ -734,7 +734,7 @@ def _redact_run(redact, row: dict) -> dict:
     return redacted
 
 
-def record_check(run_key: Optional[str], check_row: dict) -> None:
+def record_check(run_key: str | None, check_row: dict) -> None:
     """Record one late verdict — an async post-check that finished after its
     run was recorded — honoring the configured write_mode. Never raises.
 
@@ -899,7 +899,7 @@ def fetch_versions(name: str) -> list:
     return list(query)
 
 
-def fetch_runs(name: str, version: Optional[int] = None, limit: int = 50) -> list:
+def fetch_runs(name: str, version: int | None = None, limit: int = 50) -> list:
     """Run rows for a prompt (optionally one version) as dicts, newest first."""
     if _get_db() is None:
         return []
@@ -966,7 +966,7 @@ def fetch_prompt_summaries() -> list:
 
 
 def fetch_conversation_summaries(
-    limit: int = 100, prompt: Optional[str] = None, version: Optional[int] = None
+    limit: int = 100, prompt: str | None = None, version: int | None = None
 ) -> list:
     """One row per conversation with its turn count, most recently active first.
 
@@ -1003,7 +1003,7 @@ def fetch_conversation_summaries(
     return list(query.dicts())
 
 
-def fetch_conversation(external_id: str) -> Optional[dict]:
+def fetch_conversation(external_id: str) -> dict | None:
     """A conversation's own row (not its turns) as a dict, or None if unknown."""
     if _get_db() is None:
         return None

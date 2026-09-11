@@ -25,8 +25,9 @@ import functools
 import inspect
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple
 
 from ..checks import (
     CheckContext,
@@ -88,7 +89,7 @@ def _instrument_target(target: Target, adapter: ProviderAdapter) -> None:
 # --- conversation resolution --------------------------------------------------------
 
 
-def _resolve_conversation(kwargs) -> Tuple[Optional[str], Optional[str], dict]:
+def _resolve_conversation(kwargs) -> tuple[str | None, str | None, dict]:
     """Which conversation (if any) this call belongs to.
 
     The explicit per-call kwarg always wins over the ambient `with
@@ -105,7 +106,7 @@ def _resolve_conversation(kwargs) -> Tuple[Optional[str], Optional[str], dict]:
     return None, None, {}
 
 
-def _prepare_conversation(external_id, title, metadata) -> Tuple[Optional[int], Optional[int]]:
+def _prepare_conversation(external_id, title, metadata) -> tuple[int | None, int | None]:
     """Resolve/create the conversation row and reserve this call's turn number.
 
     One reservation per physical API call, reused for every run row it
@@ -137,10 +138,10 @@ class _RunContext(NamedTuple):
     """
 
     run_key: str
-    conversation_id: Optional[int]
-    turn_index: Optional[int]
-    input_text: Optional[str]
-    original_input_text: Optional[str] = None
+    conversation_id: int | None
+    turn_index: int | None
+    input_text: str | None
+    original_input_text: str | None = None
 
 
 # --- adapter calls, shielded ---------------------------------------------------------
@@ -186,10 +187,10 @@ def _record_runs(
     fields: ResponseFields,
     latency_ms: int,
     status: str = "ok",
-    error: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-    turn_index: Optional[int] = None,
-    input_text: Optional[str] = None,
+    error: str | None = None,
+    conversation_id: int | None = None,
+    turn_index: int | None = None,
+    input_text: str | None = None,
 ) -> None:
     """Write one run row per tracked prompt, sharing the response metadata.
 
@@ -672,7 +673,7 @@ class _StreamRecorder:
             )
             return ResponseFields()
 
-    def finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+    def finish(self, status: str = "ok", error: str | None = None) -> None:
         """Write the run exactly once."""
         if self.recorded:
             return
@@ -711,7 +712,7 @@ class _CheckedStreamRecorder(_StreamRecorder):
         self.post_checks = post_checks
         self.handle = handle
 
-    def finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+    def finish(self, status: str = "ok", error: str | None = None) -> None:
         """Record once: post-checks on success, or a checked error run."""
         if self.recorded:
             return
@@ -849,7 +850,7 @@ class _AsyncStreamProxy:
     def __aiter__(self):
         return self
 
-    async def _finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+    async def _finish(self, status: str = "ok", error: str | None = None) -> None:
         """Finalize off the event loop.
 
         recorder.finish() runs post-checks and a synchronous DB insert. On the
@@ -909,4 +910,4 @@ class _AsyncStreamProxy:
         return getattr(self._stream, name)
 
 
-__all__: List[str] = ["instrument", "is_instrumented"]
+__all__: list[str] = ["instrument", "is_instrumented"]

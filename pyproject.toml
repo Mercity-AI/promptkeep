@@ -67,3 +67,8 @@ omit = ["*/promptkeep/cli.py"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Defaults (pyflakes + the pycodestyle errors) plus import sorting and the
+# 3.11 syntax dialect (`list[str]`, `X | None`), so new code stays consistent.
+select = ["E4", "E7", "E9", "F", "I", "UP"]

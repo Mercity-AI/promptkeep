@@ -8,7 +8,7 @@ being traceable back to their source for run tracking.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Set
+from typing import Any
 
 from .rendering import extract_placeholders, render
 
@@ -25,10 +25,10 @@ class RenderedText(str):
     `prompt.text` instead of the Prompt object itself.
     """
 
-    _pm_prompt: Optional["Prompt"]
-    _pm_variables: Dict[str, Any]
+    _pm_prompt: Prompt | None
+    _pm_variables: dict[str, Any]
 
-    def __new__(cls, value: str, prompt: Optional["Prompt"] = None, variables=None):
+    def __new__(cls, value: str, prompt: Prompt | None = None, variables=None):
         """Build the string value and attach its provenance attributes."""
         self = super().__new__(cls, value)
         self._pm_prompt = prompt
@@ -36,12 +36,12 @@ class RenderedText(str):
         return self
 
     @property
-    def prompt(self) -> Optional["Prompt"]:
+    def prompt(self) -> Prompt | None:
         """The Prompt this string was rendered from (None if constructed bare)."""
         return self._pm_prompt
 
     @property
-    def variables(self) -> Dict[str, Any]:
+    def variables(self) -> dict[str, Any]:
         """A copy of the variables used for this particular rendering."""
         return dict(self._pm_variables)
 
@@ -75,14 +75,14 @@ class Prompt:
     def __init__(
         self,
         text: str,
-        variables: Optional[Dict[str, Any]] = None,
-        name: Optional[str] = None,
-        strict: Optional[bool] = None,
+        variables: dict[str, Any] | None = None,
+        name: str | None = None,
+        strict: bool | None = None,
         exact_match: bool = False,
         source: str = "literal",
-        fn_source_hash: Optional[str] = None,
-        pre: Optional[list] = None,
-        post: Optional[list] = None,
+        fn_source_hash: str | None = None,
+        pre: list | None = None,
+        post: list | None = None,
     ):
         """Validate inputs and freeze the instance (source/fn_source_hash are
         internal, set by the @prompt decorator).
@@ -144,12 +144,12 @@ class Prompt:
         return self._template
 
     @property
-    def variables(self) -> Dict[str, Any]:
+    def variables(self) -> dict[str, Any]:
         """A copy of the stored variables (mutating it cannot affect the Prompt)."""
         return dict(self._variables)
 
     @property
-    def placeholders(self) -> Set[str]:
+    def placeholders(self) -> set[str]:
         """Variable names the template references, e.g. {'var1', 'topic'}."""
         return extract_placeholders(self._template)
 
@@ -159,7 +159,7 @@ class Prompt:
         return self._source
 
     @property
-    def fn_source_hash(self) -> Optional[str]:
+    def fn_source_hash(self) -> str | None:
         """Hash of the @prompt function's source code (None for literal prompts)."""
         return self._fn_source_hash
 
@@ -193,7 +193,7 @@ class Prompt:
         """The rendered prompt — a real string, safe to pass anywhere."""
         return self.render()
 
-    def format(self, **overrides: Any) -> "Prompt":
+    def format(self, **overrides: Any) -> Prompt:
         """Return a new Prompt with updated variables (same name/template/version)."""
         return Prompt(
             self._template,
@@ -238,7 +238,7 @@ class Prompt:
         return registration
 
     @property
-    def version(self) -> Optional[int]:
+    def version(self) -> int | None:
         """This template's version number under its name (None if tracking is off)."""
         registration = self._ensure_registered()
         return registration[1] if registration else None

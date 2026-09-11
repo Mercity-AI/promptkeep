@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any
 
-_current: "contextvars.ContextVar[Optional[_Active]]" = contextvars.ContextVar(
+_current: contextvars.ContextVar[_Active | None] = contextvars.ContextVar(
     "promptkeep_conversation", default=None
 )
 
@@ -29,8 +29,8 @@ class _Active:
     """The ambient conversation: what `conversation()` stashes in the contextvar."""
 
     external_id: str
-    title: Optional[str]
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    title: str | None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class conversation:
@@ -45,18 +45,18 @@ class conversation:
     first time this external_id is seen).
     """
 
-    def __init__(self, external_id: str, title: Optional[str] = None, **metadata: Any):
+    def __init__(self, external_id: str, title: str | None = None, **metadata: Any):
         if not isinstance(external_id, str) or not external_id.strip():
             raise ValueError("conversation() requires a non-empty external_id")
         self._active = _Active(external_id, title, metadata)
-        self._token: Optional[contextvars.Token] = None
+        self._token: contextvars.Token | None = None
 
     @property
     def external_id(self) -> str:
         """The id passed in — the same one you'll look history up by."""
         return self._active.external_id
 
-    def __enter__(self) -> "conversation":
+    def __enter__(self) -> conversation:
         self._token = _current.set(self._active)
         return self
 
@@ -64,14 +64,14 @@ class conversation:
         _current.reset(self._token)
         return False
 
-    async def __aenter__(self) -> "conversation":
+    async def __aenter__(self) -> conversation:
         return self.__enter__()
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         return self.__exit__(exc_type, exc, tb)
 
 
-def current() -> Optional[_Active]:
+def current() -> _Active | None:
     """The ambient conversation set by an enclosing `with conversation(...)`,
     or None outside any block."""
     return _current.get()

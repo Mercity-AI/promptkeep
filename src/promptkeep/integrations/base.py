@@ -16,13 +16,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from ..prompts import Prompt
 
 # (prompt, variables used, rendered text) — everything a run row needs from
 # the request side.
-TrackedPrompt = Tuple[Prompt, Dict[str, Any], str]
+TrackedPrompt = tuple[Prompt, dict[str, Any], str]
 
 
 @dataclass(frozen=True)
@@ -50,12 +50,12 @@ class Request:
     request_params: kwargs minus the message payload, recorded on the run.
     """
 
-    kwargs: Dict[str, Any]
-    tracked: List[TrackedPrompt]
+    kwargs: dict[str, Any]
+    tracked: list[TrackedPrompt]
     payload: Any
-    input_text: Optional[str]
+    input_text: str | None
     joined_text: str
-    request_params: Dict[str, Any]
+    request_params: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -63,12 +63,12 @@ class ResponseFields:
     """What a run row records from a response. Every field is optional: an
     error has no response, a stream may never report usage."""
 
-    model: Optional[str] = None
-    response_id: Optional[str] = None
-    output_text: Optional[str] = None
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
+    model: str | None = None
+    response_id: str | None = None
+    output_text: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class StreamAbsorber(ABC):
@@ -98,12 +98,12 @@ class ProviderAdapter(ABC):
     provider: str = ""
 
     @abstractmethod
-    def locate(self, client: Any) -> Optional[Target]:
+    def locate(self, client: Any) -> Target | None:
         """The call method to instrument on this client, or None if the client
         does not expose this provider's surface."""
 
     @abstractmethod
-    def parse_request(self, kwargs: Dict[str, Any]) -> Request:
+    def parse_request(self, kwargs: dict[str, Any]) -> Request:
         """Find the Prompts in a call's kwargs, substitute their rendered text,
         and pick out the current turn. Must not mutate ``kwargs`` or anything
         inside it. Called after promptkeep's own kwargs have been stripped."""

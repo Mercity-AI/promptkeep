@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Union
 
 DEFAULT_DB_FILENAME = ".promptkeep.db"
 
@@ -40,22 +40,22 @@ class Settings:
     post: tuple
     on_block: str
     sample_rate: float
-    redact: Optional[Callable[[str], str]]
+    redact: Callable[[str], str] | None
 
 
 def configure(
-    db_path: Optional[Union[str, Path]] = None,
-    enabled: Optional[bool] = None,
-    strict: Optional[bool] = None,
-    write_mode: Optional[str] = None,
-    queue_size: Optional[int] = None,
-    flush_interval: Optional[float] = None,
-    batch_size: Optional[int] = None,
-    pre: Optional[list] = None,
-    post: Optional[list] = None,
-    on_block: Optional[str] = None,
-    sample_rate: Optional[float] = None,
-    redact: Optional[Callable[[str], str]] = None,
+    db_path: str | Path | None = None,
+    enabled: bool | None = None,
+    strict: bool | None = None,
+    write_mode: str | None = None,
+    queue_size: int | None = None,
+    flush_interval: float | None = None,
+    batch_size: int | None = None,
+    pre: list | None = None,
+    post: list | None = None,
+    on_block: str | None = None,
+    sample_rate: float | None = None,
+    redact: Callable[[str], str] | None = None,
 ) -> None:
     """Override library settings. Only the arguments you pass are changed.
 
@@ -196,7 +196,7 @@ def _valid_sample_rate(value) -> bool:
     return 0.0 <= value <= 1.0
 
 
-def _sample_rate_from_env(raw: Optional[str]) -> float:
+def _sample_rate_from_env(raw: str | None) -> float:
     """Parse $PROMPTKEEP_SAMPLE_RATE; invalid or missing falls back to 1.0."""
     if not raw:
         return 1.0

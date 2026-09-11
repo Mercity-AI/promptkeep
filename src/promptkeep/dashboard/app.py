@@ -9,7 +9,6 @@ tracking already recorded. Imported lazily by `promptkeep.cli`, never from
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -66,8 +65,8 @@ def create_app() -> FastAPI:
     @app.get("/runs")
     def runs_page(
         request: Request,
-        prompt: Optional[str] = None,
-        version: Optional[str] = None,
+        prompt: str | None = None,
+        version: str | None = None,
         limit: int = 100,
     ):
         """All runs, or one prompt's (optionally one version's), newest first.
@@ -103,9 +102,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/conversations")
-    def conversations_page(
-        request: Request, prompt: Optional[str] = None, version: Optional[str] = None
-    ):
+    def conversations_page(request: Request, prompt: str | None = None, version: str | None = None):
         """Every recorded conversation, most recently active first — or only
         those a given prompt (version) drove. version is a str for the same
         reason as on /runs: an empty form box must mean "no filter"."""

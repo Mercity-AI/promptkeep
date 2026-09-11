@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from ..prompts import Prompt, RenderedText
 from .base import ProviderAdapter, Request, ResponseFields, StreamAbsorber, Target, TrackedPrompt
@@ -32,13 +32,13 @@ class OpenAIChatAdapter(ProviderAdapter):
 
     provider = "openai"
 
-    def locate(self, client: Any) -> Optional[Target]:
+    def locate(self, client: Any) -> Target | None:
         completions = getattr(getattr(client, "chat", None), "completions", None)
         if completions is not None and callable(getattr(completions, "create", None)):
             return Target(completions, "create")
         return None
 
-    def parse_request(self, kwargs: Dict[str, Any]) -> Request:
+    def parse_request(self, kwargs: dict[str, Any]) -> Request:
         tracked, messages = _process_messages(kwargs.get("messages"))
         new_kwargs = dict(kwargs)
         if "messages" in kwargs:
@@ -91,9 +91,9 @@ class _ChatStreamAbsorber(StreamAbsorber):
     every ``choices[0].delta.content`` piece as the reply text."""
 
     def __init__(self) -> None:
-        self.parts: List[str] = []
-        self.model: Optional[str] = None
-        self.response_id: Optional[str] = None
+        self.parts: list[str] = []
+        self.model: str | None = None
+        self.response_id: str | None = None
         self.usage: Any = None
 
     def absorb(self, chunk: Any) -> None:
@@ -123,7 +123,7 @@ class _ChatStreamAbsorber(StreamAbsorber):
 # --- message processing --------------------------------------------------------
 
 
-def _resolve_text(value) -> Optional[Tuple[str, List[TrackedPrompt]]]:
+def _resolve_text(value) -> tuple[str, list[TrackedPrompt]] | None:
     """If value is a Prompt or provenance-carrying string, return
     (plain string for the API, tracked prompts). Otherwise None."""
     if isinstance(value, Prompt):
@@ -146,7 +146,7 @@ def _process_messages(messages):
     Returns (tracked prompts, new messages). Original message dicts are
     never mutated. Handles both string content and content-block lists.
     """
-    tracked: List[TrackedPrompt] = []
+    tracked: list[TrackedPrompt] = []
     if not isinstance(messages, (list, tuple)):
         return tracked, messages
     new_messages = []
@@ -177,7 +177,7 @@ def _process_messages(messages):
     return tracked, new_messages
 
 
-def _extract_input_text(messages) -> Optional[str]:
+def _extract_input_text(messages) -> str | None:
     """The newest message's text content — what's actually new at this turn.
 
     Earlier turns (including the model's own prior reply) already live in
@@ -254,7 +254,7 @@ def _apply_rewrite(messages, new_text):
     return new_messages
 
 
-def _extract_output_text(response) -> Optional[str]:
+def _extract_output_text(response) -> str | None:
     """The assistant's text reply, or None (errors, empty, non-string)."""
     choices = getattr(response, "choices", None)
     if choices:

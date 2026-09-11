@@ -14,7 +14,7 @@ Run from the repo root:  uv run python examples/seed_demo.py
 import random
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -387,7 +387,7 @@ promptkeep.flush(timeout=10)
 
 conn = sqlite3.connect(DB_PATH)
 run_ids = [r[0] for r in conn.execute("SELECT id FROM runs ORDER BY id")]
-now = datetime.now(timezone.utc)
+now = datetime.now(UTC)
 start = now - timedelta(days=6, hours=3)
 step = (now - start) / max(len(run_ids), 1)
 for i, run_id in enumerate(run_ids):

@@ -9,9 +9,10 @@ test_openai_wrapper.py / test_checks.py / test_conversation.py; this file is
 about the seam between it and an adapter.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, List
+from typing import Any
 
 import pytest
 
@@ -38,9 +39,9 @@ class Scenario:
     make_async_client: Callable[[], Any]
     request: Callable[[Any, str], dict]  # (system prompt, user text) -> call kwargs
     system_only: Callable[[Any], dict]  # (system prompt,) -> kwargs with no user turn
-    texts: Callable[[dict], List[Any]]  # every content value in the kwargs' payload
+    texts: Callable[[dict], list[Any]]  # every content value in the kwargs' payload
     response: Callable[[str], Any]  # reply text -> provider response object
-    chunks: Callable[[List[str]], list]  # text pieces -> stream chunks (usage on the last)
+    chunks: Callable[[list[str]], list]  # text pieces -> stream chunks (usage on the last)
 
 
 def _chat_scenario() -> Scenario:

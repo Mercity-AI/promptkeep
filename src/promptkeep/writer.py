@@ -30,13 +30,12 @@ import os
 import queue
 import threading
 import time
-from typing import Optional
 
 logger = logging.getLogger("promptkeep")
 
 _lock = threading.Lock()
-_queue: Optional["queue.Queue[dict]"] = None
-_thread: Optional[threading.Thread] = None
+_queue: queue.Queue[dict] | None = None
+_thread: threading.Thread | None = None
 _dropped_total = 0
 _last_drop_log = 0.0
 _DROP_LOG_INTERVAL = 5.0
@@ -88,7 +87,7 @@ def submit(item: dict) -> None:
         logger.warning("promptkeep: failed to enqueue run", exc_info=True)
 
 
-def drain(timeout: Optional[float] = None) -> bool:
+def drain(timeout: float | None = None) -> bool:
     """Block until every queued item is written (or timeout seconds pass).
 
     Returns True when the queue fully drained, False on timeout. A process
@@ -140,7 +139,7 @@ def reset() -> None:
         _dropped_total = 0
 
 
-def _ensure_started() -> "queue.Queue[dict]":
+def _ensure_started() -> queue.Queue[dict]:
     """Create the queue and start the daemon thread on first use."""
     global _queue, _thread
     q = _queue
