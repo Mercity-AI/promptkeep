@@ -1,10 +1,10 @@
 """Global library configuration: DB location, tracking on/off, strict rendering,
-and the run-write mode.
+the run-write mode, and the production controls (sampling, redaction).
 
 Settings are resolved fresh on every access with a simple precedence:
 explicit ``configure()`` overrides win, then environment variables
-(``PROMPTKEEP_DB``, ``PROMPTKEEP_DISABLED``, ``PROMPTKEEP_WRITE_MODE``),
-then defaults.
+(``PROMPTKEEP_DB``, ``PROMPTKEEP_DISABLED``, ``PROMPTKEEP_WRITE_MODE``,
+``PROMPTKEEP_SAMPLE_RATE``), then defaults.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 DEFAULT_DB_FILENAME = ".promptkeep.db"
 
@@ -39,6 +39,8 @@ class Settings:
     pre: tuple
     post: tuple
     on_block: str
+    sample_rate: float
+    redact: Optional[Callable[[str], str]]
 
 
 def configure(
@@ -52,6 +54,8 @@ def configure(
     pre: Optional[list] = None,
     post: Optional[list] = None,
     on_block: Optional[str] = None,
+    sample_rate: Optional[float] = None,
+    redact: Optional[Callable[[str], str]] = None,
 ) -> None:
     """Override library settings. Only the arguments you pass are changed.
 
@@ -81,6 +85,19 @@ def configure(
     - on_block: what a blocking pre-check does — "raise" (default, raises
       PromptBlocked) or "return" a response-shaped stub so a service can
       degrade instead of erroring.
+    - sample_rate: the fraction of *uneventful* runs to store, 0.0-1.0
+      (default 1.0, or the PROMPTKEEP_SAMPLE_RATE env var). Errors, blocked
+      calls and runs with a non-ok verdict are always stored, whatever the
+      rate. Inside a conversation the decision is made once per session
+      (from the conversation's id, so every process agrees), so a kept
+      session is complete rather than full of holes. 0.0 means "store only
+      problems". Version registration is never sampled.
+    - redact: a function ``str -> str`` applied to every stored text field
+      of a run — rendered prompt, input and output, variables and request
+      params (as JSON), error text — and of a check verdict (message,
+      rewritten text) before it is written. Templates, prompt names and
+      conversation metadata are not passed through it. If the hook raises or
+      returns a non-string the row is dropped, never stored unredacted.
     """
     with _lock:
         if db_path is not None:
@@ -113,6 +130,16 @@ def configure(
             if on_block not in ("raise", "return"):
                 raise ValueError(f"on_block must be 'raise' or 'return', got {on_block!r}")
             _overrides["on_block"] = on_block
+        if sample_rate is not None:
+            if not _valid_sample_rate(sample_rate):
+                raise ValueError(f"sample_rate must be between 0.0 and 1.0, got {sample_rate!r}")
+            _overrides["sample_rate"] = float(sample_rate)
+        if redact is not None:
+            if not callable(redact):
+                raise TypeError(
+                    f"redact must be callable (str -> str), got {type(redact).__name__}"
+                )
+            _overrides["redact"] = redact
 
 
 def get_settings() -> Settings:
@@ -140,6 +167,12 @@ def get_settings() -> Settings:
             env_mode = os.environ.get("PROMPTKEEP_WRITE_MODE", "").strip().lower()
             write_mode = env_mode if env_mode in _WRITE_MODES else "background"
 
+        # Sampling: override, then $PROMPTKEEP_SAMPLE_RATE; anything unparseable
+        # or out of range means "keep everything" — the safe direction.
+        sample_rate = _overrides.get("sample_rate")
+        if sample_rate is None:
+            sample_rate = _sample_rate_from_env(os.environ.get("PROMPTKEEP_SAMPLE_RATE"))
+
         return Settings(
             db_path=db_path,
             enabled=enabled,
@@ -151,7 +184,27 @@ def get_settings() -> Settings:
             pre=_overrides.get("pre", ()),
             post=_overrides.get("post", ()),
             on_block=_overrides.get("on_block", "raise"),
+            sample_rate=sample_rate,
+            redact=_overrides.get("redact"),
         )
+
+
+def _valid_sample_rate(value) -> bool:
+    """A real number in [0, 1] (bool excluded: True would silently mean 1.0)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return 0.0 <= value <= 1.0
+
+
+def _sample_rate_from_env(raw: Optional[str]) -> float:
+    """Parse $PROMPTKEEP_SAMPLE_RATE; invalid or missing falls back to 1.0."""
+    if not raw:
+        return 1.0
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return 1.0
+    return value if _valid_sample_rate(value) else 1.0
 
 
 def reset() -> None:

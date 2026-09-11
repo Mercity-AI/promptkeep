@@ -415,7 +415,8 @@ class RunHandle:
     Carries the run's key (its identity — pass it to ``history.checks()``),
     the prompt version that ran, and the check results. ``wait()`` blocks for
     async post-checks if you need their verdicts. run_key is None when the
-    run was not recorded (tracking disabled or write_mode "off").
+    run was not recorded (tracking disabled, write_mode "off", or sampled out
+    by ``sample_rate``); the checks still ran and the verdicts are still here.
     """
 
     def __init__(self, run_key, prompt_version, results, futures=None):

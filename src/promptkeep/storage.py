@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -576,10 +577,11 @@ def record_run(
 
     Returns the run's key — the identity everything else references it by
     (a RunHandle, history.checks(), a verdict landing later) — or None when
-    nothing was recorded (tracking disabled, write_mode "off", or the write
-    failed). The key is minted here when the caller didn't bring one, and it
-    is valid the moment this returns: in background mode the row may still
-    be in the queue, but the key already names it.
+    nothing was recorded (tracking disabled, write_mode "off", sampled out,
+    a failed redaction, or the write failed). The key is minted here when
+    the caller didn't bring one, and it is valid the moment this returns: in
+    background mode the row may still be in the queue, but the key already
+    names it.
 
     "sync" inserts before returning; "background" builds the complete row
     (timestamps and turn number included — they must reflect *call* time,
@@ -636,6 +638,19 @@ def record_run(
         }
         if checks:
             row["_checks"] = list(checks)
+        # The production controls, applied at the one point every run row
+        # passes through, before it can reach a queue or a disk.
+        if not _keep_run(settings, row, conversation_id):
+            return None
+        if settings.redact is not None:
+            try:
+                row = _redact_run(settings.redact, row)
+            except Exception:
+                logger.warning(
+                    "promptkeep: redact hook failed — run dropped rather than stored unredacted",
+                    exc_info=True,
+                )
+                return None
         if settings.write_mode == "background":
             from . import writer
 
@@ -648,6 +663,75 @@ def record_run(
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
         return None
+
+
+# --- production controls: sampling and redaction --------------------------------
+
+# Run-row fields that can carry user data, and the check-row ones. Everything
+# else on a row is an id, a number, a status or a timestamp.
+_REDACTED_RUN_FIELDS = (
+    "rendered_text",
+    "variables",
+    "request_params",
+    "output_text",
+    "error",
+    "input_text",
+    "original_input_text",
+)
+_REDACTED_CHECK_FIELDS = ("message", "rewritten")
+
+
+def _keep_run(settings, row: dict, conversation_id: Optional[int]) -> bool:
+    """The sampling decision for one run.
+
+    Anything worth investigating is always kept: a call that failed or was
+    blocked, or one carrying a verdict that isn't plain ok (a warning
+    included — ``Verdict.from_score`` below its threshold is a warn). Only an
+    uneventful run is subject to ``sample_rate``.
+
+    Inside a conversation the decision is derived from the conversation's id
+    rather than drawn per turn, so one session is kept whole or dropped whole
+    (no holes in a replay) and every process writing to the same file makes
+    the same call. Async post-check verdicts land after this decision and
+    can't rescue a dropped run — use ``mode="blocking"`` for a check whose
+    failures must always be kept.
+    """
+    rate = settings.sample_rate
+    if rate >= 1.0:
+        return True
+    if row["status"] != "ok":
+        return True
+    if any(check.get("status") != "ok" for check in row.get("_checks", ())):
+        return True
+    if conversation_id is None:
+        return random.random() < rate
+    digest = hashlib.sha256(str(conversation_id).encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64 < rate
+
+
+def _redact_fields(redact, row: dict, fields: tuple) -> dict:
+    """A copy of ``row`` with each string-valued field in ``fields`` passed
+    through the hook. Raises if the hook does — the caller decides what a
+    failed redaction means (it always means "don't store")."""
+    redacted = dict(row)
+    for field in fields:
+        value = redacted.get(field)
+        if isinstance(value, str):
+            result = redact(value)
+            if not isinstance(result, str):
+                raise TypeError(f"redact hook must return a str, got {type(result).__name__}")
+            redacted[field] = result
+    return redacted
+
+
+def _redact_run(redact, row: dict) -> dict:
+    """Redact a run row and any check rows bundled with it."""
+    redacted = _redact_fields(redact, row, _REDACTED_RUN_FIELDS)
+    if redacted.get("_checks"):
+        redacted["_checks"] = [
+            _redact_fields(redact, check, _REDACTED_CHECK_FIELDS) for check in redacted["_checks"]
+        ]
+    return redacted
 
 
 def record_check(run_key: Optional[str], check_row: dict) -> None:
@@ -668,6 +752,15 @@ def record_check(run_key: Optional[str], check_row: dict) -> None:
         if not settings.enabled or settings.write_mode == "off":
             return
         item = {"_kind": "check", "run_key": run_key, "created_at": _utcnow(), **check_row}
+        if settings.redact is not None:
+            try:
+                item = _redact_fields(settings.redact, item, _REDACTED_CHECK_FIELDS)
+            except Exception:
+                logger.warning(
+                    "promptkeep: redact hook failed — verdict dropped rather than stored unredacted",
+                    exc_info=True,
+                )
+                return
         if settings.write_mode == "background":
             from . import writer
 

@@ -251,6 +251,34 @@ then drains the queue, and returns `False` if the timeout ran out first.
 An `atexit` hook flushes automatically on interpreter shutdown, so short-lived scripts
 don't lose rows. `write_mode="off"` drops run telemetry entirely (versioning still works).
 
+## Production controls
+
+Two knobs for running this in anger — a busy service that doesn't need every row, and a
+regulated one that must never store certain text:
+
+```python
+promptkeep.configure(
+    sample_rate=0.1,          # store 10% of uneventful runs ($PROMPTKEEP_SAMPLE_RATE)
+    redact=scrub_pii,         # str -> str, applied to every stored text field
+)
+```
+
+**Sampling** never drops what you'd want to look at: errors, blocked calls, and any run
+whose checks returned something other than `ok` are always stored. Inside a conversation
+the decision is made once per session (derived from the session's id, so every worker
+process agrees), so a kept conversation is complete rather than full of holes. `0.0` means
+"store only problems". Version lineage is never sampled. Because the decision is made when
+the run is recorded, a verdict from an *async* post-check can't rescue a dropped run — use
+`mode="blocking"` for a check whose failures must always be kept. A sampled-out run's
+`response.promptkeep.run_key` is `None`; its verdicts are still on the handle.
+
+**Redaction** runs before anything is written, in every write mode — plaintext never even
+enters the background queue. The hook sees each stored text field of a run (rendered prompt,
+input and output, the JSON-encoded variables and request params, error text) and of a check
+verdict (message, rewritten text). Templates, prompt names and conversation metadata are not
+passed through it: templates are code, and the metadata is what you attached on purpose. If
+the hook raises or returns a non-string, the row is dropped rather than stored unredacted.
+
 ## Configuration
 
 ```python
@@ -267,6 +295,8 @@ promptkeep.configure(
     pre=[...],                      # global pre-checks (gates), run on every tracked call
     post=[...],                     # global post-checks (audits), run on every tracked call
     on_block="raise",               # blocked pre-check: "raise" PromptBlocked | "return" a stub
+    sample_rate=1.0,                # fraction of uneventful runs to store ($PROMPTKEEP_SAMPLE_RATE)
+    redact=None,                    # str -> str hook applied to every stored text field
 )
 ```
 

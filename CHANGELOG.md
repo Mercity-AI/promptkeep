@@ -17,6 +17,12 @@ public APIs; each such change is called out below.
   same filter and a per-conversation stats line.
 - `@prompt` on an `async def` template function: awaiting the call yields the
   Prompt.
+- `configure(sample_rate=...)` (or `PROMPTKEEP_SAMPLE_RATE`) stores a fraction
+  of uneventful runs while always keeping errors, blocked calls and runs with a
+  non-ok verdict; conversations are kept or dropped whole.
+- `configure(redact=fn)` passes every stored text field of a run or verdict
+  through `fn` before it is written, in every write mode; a failing hook drops
+  the row rather than storing it unredacted.
 
 ## [0.3.0] - 2026-09-11
 
