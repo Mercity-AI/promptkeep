@@ -312,4 +312,4 @@ uv run pytest                            # run the test suite
 uv run ruff format src tests examples && uv run ruff check src tests examples
 ```
 
-Supported on Python 3.9–3.14. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+Supported on Python 3.11–3.14. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).

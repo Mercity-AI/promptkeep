@@ -6,7 +6,7 @@ Two GitHub Actions workflows are written and ready in `docs/workflows/`, but not
 enabled: the GitHub token used for pushes lacks the `workflow` scope, and GitHub
 rejects any push that adds a file under `.github/workflows/` from such a token.
 
-- `docs/workflows/ci.yml` — ruff, pytest on Python 3.9–3.14 across Linux, macOS
+- `docs/workflows/ci.yml` — ruff, pytest on Python 3.11–3.14 across Linux, macOS
   and Windows, and an 85% coverage gate, on every push to `main` and every PR.
 - `docs/workflows/release.yml` — a pushed `v*` tag re-runs the suite, checks the
   tag matches the declared version, publishes to PyPI via Trusted Publishing

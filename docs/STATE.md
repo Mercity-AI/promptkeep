@@ -50,9 +50,9 @@ runs off it.
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
 | **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. |
-| **Tests** | 252 passing (~2.9s, no network), verified locally on Python 3.9, 3.11 and 3.14 on macOS. Coverage 91%. |
+| **Tests** | 252 passing (~2.9s, no network), verified locally on Python 3.11 and 3.14 on macOS. Coverage 91%. |
 | **Size** | ~4,900 LOC Python + ~450 LOC HTML templates · ~3,500 LOC tests |
-| **Python** | ≥ 3.9. **No CI yet**: the workflows (ruff, the suite on 3.9–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
+| **Python** | ≥ 3.11. **No CI yet**: the workflows (ruff, the suite on 3.11–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
 | **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Still OpenAI `chat.completions`-only. |
@@ -553,7 +553,7 @@ started.
 
 Done: `CHANGELOG.md` in keep-a-changelog format, sdist trimmed to what a builder needs, PyPI
 badges on the README. Written but **not enabled** (`docs/workflows/`, see `TODO.md`): the CI
-workflow (matrix 3.9–3.14 × 3 OSes, ruff, 85% coverage gate) and release automation (a pushed
+workflow (matrix 3.11–3.14 × 3 OSes, ruff, 85% coverage gate) and release automation (a pushed
 `v*` tag re-runs the suite, checks the tag matches the declared version, publishes via PyPI
 Trusted Publishing, opens a GitHub Release).
 Not started: `CONTRIBUTING.md` / `SECURITY.md` / issue templates, `mypy --strict`, benchmarks,

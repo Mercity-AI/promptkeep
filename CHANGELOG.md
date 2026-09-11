@@ -34,6 +34,7 @@ public APIs; each such change is called out below.
 
 ### Changed
 
+- **Python 3.11 is now the minimum** (was 3.9; 3.9 and 3.10 are end-of-life).
 - `wrap()` on an unrecognized object now raises
   `TypeError: wrap() found no supported provider surface ...` naming the
   registered adapters.
@@ -76,7 +77,7 @@ path, multi-turn sessions become first-class, and calls can be gated and audited
 - `examples/seed_demo.py` (rich demo data for the dashboard),
   `examples/pii_conversation_demo.py`, and `examples/playground.py` (moved from
   the repository root).
-- GitHub Actions workflows for CI (ruff, the test suite on Python 3.9–3.14
+- GitHub Actions workflows for CI (ruff, the test suite on Python 3.11–3.14
   across Linux, macOS and Windows, an 85% coverage gate) and tag-driven PyPI
   publishing, staged in `docs/workflows/` — not yet enabled (see `TODO.md`).
 
