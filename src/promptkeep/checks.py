@@ -38,6 +38,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from . import storage
+
 logger = logging.getLogger("promptkeep")
 
 # Set while a check function runs. The wrapper treats a call made under
@@ -78,7 +80,6 @@ def schedule_async(chk: Check, ctx: CheckContext, run_key: str | None) -> Future
     through ``storage.record_check``, which follows the configured write_mode:
     in background mode the verdict queues behind its own run row.
     """
-    from . import storage
 
     def _work() -> CheckResult:
         result = chk.run_inline(ctx)

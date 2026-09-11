@@ -29,6 +29,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any, NamedTuple
 
+from .. import storage
 from ..checks import (
     CheckContext,
     PromptBlocked,
@@ -37,9 +38,10 @@ from ..checks import (
     schedule_async,
     suppressed,
 )
+from ..config import get_settings
 from ..conversation import current as current_conversation
-from ..storage import new_run_key
-from ..tracking import record_conversation_turn, record_prompt_run
+from ..models import new_run_key
+from ..tracking import record_prompt_run
 from .base import ProviderAdapter, Request, ResponseFields, Target
 
 logger = logging.getLogger("promptkeep")
@@ -116,8 +118,6 @@ def _prepare_conversation(external_id, title, metadata) -> tuple[int | None, int
     if external_id is None:
         return None, None
     try:
-        from .. import storage
-
         conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
         if conversation_id is None:
             return None, None
@@ -181,6 +181,17 @@ def _row_fields(request: Request, fields: ResponseFields) -> dict:
 # --- run recording ---------------------------------------------------------------
 
 
+def _record_bare(**fields: Any) -> str | None:
+    """A run row with no Prompt — a bare conversation turn, or the anchor a
+    checked call's verdicts hang off — shielded like every write made from
+    the request path."""
+    try:
+        return storage.record_run(**fields)
+    except Exception:
+        logger.warning("promptkeep: failed to record run", exc_info=True)
+        return None
+
+
 def _record_runs(
     adapter: ProviderAdapter,
     request: Request,
@@ -215,7 +226,7 @@ def _record_runs(
         for prompt_obj, variables, rendered in request.tracked:
             record_prompt_run(prompt_obj, variables, rendered, **common)
     else:
-        record_conversation_turn(**common)
+        _record_bare(**common)
 
 
 def _record_checked(adapter, request, fields, latency_ms, status, error, conv, check_rows):
@@ -252,7 +263,7 @@ def _record_checked(adapter, request, fields, latency_ms, status, error, conv, c
         for prompt_obj, variables, rendered in tracked[1:]:
             record_prompt_run(prompt_obj, variables, rendered, **common)
         return run_key
-    return record_conversation_turn(run_key=conv.run_key, checks=check_rows, **common)
+    return _record_bare(run_key=conv.run_key, checks=check_rows, **common)
 
 
 # --- checks -----------------------------------------------------------------------
@@ -277,8 +288,6 @@ def _collect_checks(tracked, per_call_pre, per_call_post):
     Deduplicated by name (most specific wins), preserving order. A tracked
     prompt contributes its own pre/post; global comes from configure().
     """
-    from ..config import get_settings
-
     settings = get_settings()
     pre, post = [], []
     for prompt_obj, _vars, _rendered in tracked:
@@ -374,8 +383,6 @@ def _checked_block(adapter, outcome, request, conv, version):
     or return a response-shaped stub. Returns None when nothing blocked."""
     if outcome.blocked is None:
         return None
-    from ..config import get_settings
-
     pre_rows = [r.to_row() for r in outcome.results]
     run_key = _record_checked(
         adapter,

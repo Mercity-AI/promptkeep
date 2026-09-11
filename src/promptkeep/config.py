@@ -208,9 +208,7 @@ def _sample_rate_from_env(raw: str | None) -> float:
 
 
 def reset() -> None:
-    """Clear all configure() overrides and drop cached DB state. Mainly for tests."""
+    """Clear every configure() override. Mainly for tests — pair it with
+    ``storage.reset_caches()`` to also drop the DB binding and memoized state."""
     with _lock:
         _overrides.clear()
-    from . import storage
-
-    storage.reset_caches()

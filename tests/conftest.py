@@ -4,6 +4,7 @@ import pytest
 
 import promptkeep
 from promptkeep import config as pm_config
+from promptkeep import storage
 
 
 @pytest.fixture(autouse=True)
@@ -15,8 +16,10 @@ def isolated_db(tmp_path):
     tests opt back into background mode explicitly.
     """
     pm_config.reset()
+    storage.reset_caches()
     promptkeep.configure(
         db_path=tmp_path / "prompts.db", enabled=True, strict=False, write_mode="sync"
     )
     yield tmp_path / "prompts.db"
     pm_config.reset()
+    storage.reset_caches()

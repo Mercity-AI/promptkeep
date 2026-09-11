@@ -8,6 +8,7 @@ Strict mode raises instead.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterable, Mapping
 from string import Formatter
@@ -152,3 +153,17 @@ def render(template: str, variables: Mapping | None = None, strict: bool = False
     if strict and missing:
         raise MissingVariableError(missing)
     return "".join(out)
+
+
+def template_hash(text: str, exact: bool = False) -> str:
+    """Content hash used as a template's version identity.
+
+    Default: hashes the *normalized* template (variable names canonicalized
+    to positional tokens), so renaming a placeholder — {var1} -> {x} —
+    resolves to the same version; only static text and placeholder structure
+    matter. With exact=True the raw text is hashed, making placeholder names
+    part of the identity.
+    """
+    if not exact:
+        text = normalize_template(text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

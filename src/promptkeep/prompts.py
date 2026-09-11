@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import storage
+from .config import get_settings
 from .rendering import extract_placeholders, render
 
 # Sentinel distinguishing "registration not attempted yet" from "attempted,
@@ -211,8 +213,6 @@ class Prompt:
         """Per-prompt strict flag if set, otherwise the global configured default."""
         if self._strict is not None:
             return self._strict
-        from .config import get_settings
-
         return get_settings().strict
 
     # --- versioning ---------------------------------------------------------
@@ -225,8 +225,6 @@ class Prompt:
         """
         registration = self._registration
         if registration is _UNSET:
-            from . import storage
-
             registration = storage.register_version(
                 self._name,
                 self._template,

@@ -7,7 +7,7 @@ import peewee as pw
 import pytest
 
 import promptkeep
-from promptkeep import Prompt, history, storage, tracking
+from promptkeep import Prompt, history, migrations, storage, tracking
 from promptkeep import config as pm_config
 
 
@@ -78,6 +78,7 @@ class TestLineage:
     def test_disabled_creates_no_db_file(self, tmp_path):
         """Disabled tracking must do zero filesystem I/O."""
         pm_config.reset()
+        storage.reset_caches()
         promptkeep.configure(db_path=tmp_path / "nope.db", enabled=False)
         p = Prompt("hi {x}", {"x": 1}, name="X")
         assert p.text == "hi 1"
@@ -212,7 +213,7 @@ class TestSchemaMigration:
         assert history.runs("OLD")[0].rendered_text == "hi there"
 
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
         assert {"conversation_id", "turn_index", "input_text"} <= columns
         conn.close()
@@ -246,7 +247,7 @@ class TestSchemaMigration:
         assert legacy.original_input_text is None
 
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "checks" in tables
         run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
@@ -289,7 +290,7 @@ class TestSchemaMigration:
         assert legacy.run_key
 
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         check_cols = {r[1] for r in conn.execute("PRAGMA table_info(checks)")}
         assert "rewritten" in check_cols
         # run_key is unique from here on.
@@ -333,7 +334,7 @@ class TestSchemaMigration:
         promptkeep.configure(db_path=isolated_db, enabled=True, strict=False)
         assert history.runs("OLD")[0].rendered_text == "hi there"
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         conn.close()
 
         # The checks table is usable: a run with bundled verdicts round-trips.
@@ -351,7 +352,7 @@ class TestSchemaMigration:
                 }
             ],
         )
-        assert [c["name"] for c in storage.fetch_checks(run_key)] == ["g"]
+        assert [c.name for c in history.checks(run_key)] == ["g"]
 
 
 class TestLateVerdicts:
@@ -372,8 +373,8 @@ class TestLateVerdicts:
     def test_late_verdict_attaches_to_its_run_by_key(self):
         run_key = storage.record_run(provider="openai", model="m")
         storage.record_check(run_key, self._row())
-        (chk,) = storage.fetch_checks(run_key)
-        assert chk["name"] == "late" and chk["score"] == 0.9
+        (chk,) = history.checks(run_key)
+        assert chk.name == "late" and chk.score == 0.9
 
     def test_verdict_for_a_never_persisted_run_is_skipped_not_raised(self, caplog):
         """The run may have been evicted on queue overflow. The verdict is
@@ -390,7 +391,7 @@ class TestLateVerdicts:
                 {"_kind": "check", "run_key": good, "created_at": "t", **self._row("kept")},
             ]
         )
-        assert [c["name"] for c in storage.fetch_checks(good)] == ["kept"]
+        assert [c.name for c in history.checks(good)] == ["kept"]
 
     def test_verdict_without_a_run_key_is_a_no_op(self):
         storage.record_check(None, self._row())  # tracking was off: nothing to attach to
