@@ -140,6 +140,7 @@ response = client.chat.completions.create(...)
 response.choices[0].message.content     # unchanged
 response.promptkeep.verification        # "ok" | "warn" | "failed" | "pending"
 response.promptkeep.checks              # each check's verdict
+response.promptkeep.run_key             # the run's identity — history.checks(run_key)
 response.promptkeep.wait(timeout=5)     # block for async post-checks if you want them
 ```
 
@@ -151,7 +152,7 @@ from promptkeep import call
 result = call(client, model="gpt-5.5", messages=[...])
 result.text            # the reply
 result.verification    # "ok" | "warn" | "failed" | "pending"
-result.run_id
+result.run_key
 # async: await promptkeep.acall(client, ...), and response.promptkeep.awaited()
 ```
 
@@ -168,13 +169,20 @@ and on async calls nothing runs on the event loop, not even a streamed
 response's post-checks. A check reads the current turn as `ctx.last_text` even
 when the message carries image content, and a `pre` rewrite is applied
 consistently to the outgoing request, the post-check that audits it, and the
-row that's stored. An LLM-judge check doesn't record itself.
+row that's stored. The record keeps both sides of a rewrite — the turn as the
+caller passed it (`original_input_text`) next to what was sent (`input_text`) —
+and the rewriting check's verdict carries the replacement text, so an audit can
+see exactly what changed and which check changed it. An LLM-judge check doesn't
+record itself.
 
 Checks run on every call path — sync or async, streaming or not (post-checks
 fire once a stream finishes). Every verdict is saved to the `checks` table, tied
 to the run it graded (and, when a `Prompt` drove the call, that prompt's
-version). Because the verdicts need a run to hang off, a checked call records
-its run synchronously even in background write mode.
+version). Runs are identified by a `run_key` minted at call time, so a checked
+call goes through the background writer like any other — nothing on the request
+path waits for the database. Async verdicts queue behind their run row, and
+`promptkeep.flush()` waits for any post-check still running before draining the
+queue: once it returns, every verdict is on disk.
 
 ## History
 
@@ -222,6 +230,9 @@ notebooks that read their own writes immediately should either flush or switch m
 promptkeep.flush(timeout=5)                   # block until everything queued is on disk
 promptkeep.configure(write_mode="sync")       # or: write before the call returns
 ```
+
+`flush()` covers check verdicts too: it waits for async post-checks still running,
+then drains the queue, and returns `False` if the timeout ran out first.
 
 An `atexit` hook flushes automatically on interpreter shutdown, so short-lived scripts
 don't lose rows. `write_mode="off"` drops run telemetry entirely (versioning still works).

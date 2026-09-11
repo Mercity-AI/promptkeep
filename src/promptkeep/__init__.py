@@ -13,7 +13,7 @@ from .decorator import prompt
 from .integrations import wrap
 from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
-from .writer import flush
+from .tracking import flush
 
 __version__ = "0.2.0"
 

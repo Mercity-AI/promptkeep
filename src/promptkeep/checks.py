@@ -20,6 +20,11 @@ Two safety rules, same spirit as the rest of the library:
   inside ``suppress()``, a contextvar the wrapper honors to skip tracking for
   nested calls — otherwise a groundedness judge would log its own runs and,
   worse, recurse into its own checks.
+
+Verdicts persist through the same write path as run rows (``storage``), so
+``write_mode`` governs them too, and ``promptkeep.flush()`` waits for async
+post-checks still running (``wait_for_pending``) before draining the queue —
+"everything is on disk" includes the verdicts that were mid-flight.
 """
 
 from __future__ import annotations
@@ -28,9 +33,9 @@ import contextvars
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("promptkeep")
 
@@ -55,6 +60,53 @@ def _get_executor() -> ThreadPoolExecutor:
     if _executor is None:
         _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
     return _executor
+
+
+# Async post-checks still running. flush() waits on these before draining the
+# writer queue, so a verdict that was mid-flight is on disk when flush returns.
+_pending: Set[Future] = set()
+_pending_lock = threading.Lock()
+
+
+def schedule_async(chk: "Check", ctx: "CheckContext", run_key: Optional[str]) -> Future:
+    """Run an async post-check on the shared pool; persist its verdict when it lands.
+
+    Returns the Future (the RunHandle waits on it for ``wait()``). The check
+    is tracked as pending until it finishes so ``wait_for_pending`` — and
+    therefore ``promptkeep.flush()`` — can wait for it. Persistence goes
+    through ``storage.record_check``, which follows the configured write_mode:
+    in background mode the verdict queues behind its own run row.
+    """
+    from . import storage
+
+    def _work() -> "CheckResult":
+        result = chk.run_inline(ctx)
+        storage.record_check(run_key, result.to_row())
+        return result
+
+    future = _get_executor().submit(_work)
+    # Register before attaching the done-callback: a check that finishes
+    # between the two would otherwise leave a stale entry behind.
+    with _pending_lock:
+        _pending.add(future)
+    future.add_done_callback(_forget_pending)
+    return future
+
+
+def _forget_pending(future: Future) -> None:
+    with _pending_lock:
+        _pending.discard(future)
+
+
+def wait_for_pending(timeout: Optional[float] = None) -> bool:
+    """Block until every async post-check in flight has finished, or ``timeout``
+    seconds pass. Returns True when none remain, False on timeout."""
+    with _pending_lock:
+        snapshot = list(_pending)
+    if not snapshot:
+        return True
+    _done, not_done = wait(snapshot, timeout=timeout)
+    return not not_done
 
 
 def _run_with_timeout(fn: Callable[[], Any], timeout: float) -> Tuple[bool, Any]:
@@ -172,6 +224,10 @@ class CheckContext:
     # `rendered`, which is every message joined for scanning — is what a
     # rewrite should be built from, since rewrite replaces exactly this.
     last_text: Optional[str] = None
+    # The current turn as the caller passed it, before any pre-check rewrote
+    # it. None until a rewrite happens; from then on every later check (the
+    # remaining pre-checks and the post-checks) can compare the two.
+    original_text: Optional[str] = None
 
 
 # --- a registered check --------------------------------------------------------
@@ -257,7 +313,8 @@ class CheckResult:
     rewritten: Optional[str] = None
 
     def to_row(self) -> dict:
-        """As a storage row (drops rewritten — it lives on the run, not here)."""
+        """As a storage row. ``rewritten`` rides along so the audit trail names
+        which check changed the turn and to what."""
         return {
             "name": self.name,
             "phase": self.phase,
@@ -265,6 +322,7 @@ class CheckResult:
             "score": self.score,
             "message": self.message,
             "latency_ms": self.latency_ms,
+            "rewritten": self.rewritten,
         }
 
 
@@ -328,15 +386,13 @@ def run_pre_checks(checks: List[Check], ctx: CheckContext) -> PreOutcome:
             outcome.rewritten = result.rewritten
             rendered = result.rewritten
             # Later checks see the rewritten text (as both the scan target and
-            # the current turn — a rewrite replaces the newest message).
-            ctx = CheckContext(
+            # the current turn — a rewrite replaces the newest message), and
+            # keep sight of the original: the first rewrite pins it.
+            ctx = replace(
+                ctx,
                 rendered=rendered,
-                messages=ctx.messages,
-                prompt=ctx.prompt,
-                variables=ctx.variables,
-                model=ctx.model,
-                provider=ctx.provider,
                 last_text=result.rewritten,
+                original_text=ctx.original_text if ctx.original_text is not None else ctx.last_text,
             )
     return outcome
 
@@ -356,12 +412,14 @@ class PromptBlocked(Exception):
 class RunHandle:
     """Attached to a response as ``response.promptkeep``.
 
-    Carries the run id, the prompt version that ran, and the check results.
-    ``wait()`` blocks for async post-checks if you need their verdicts.
+    Carries the run's key (its identity — pass it to ``history.checks()``),
+    the prompt version that ran, and the check results. ``wait()`` blocks for
+    async post-checks if you need their verdicts. run_key is None when the
+    run was not recorded (tracking disabled or write_mode "off").
     """
 
-    def __init__(self, run_id, prompt_version, results, futures=None):
-        self.run_id = run_id
+    def __init__(self, run_key, prompt_version, results, futures=None):
+        self.run_key = run_key
         self.prompt_version = prompt_version
         self.checks = list(results)
         self._futures = futures or []
@@ -410,14 +468,14 @@ class RunHandle:
 class CallResult:
     """What ``call()`` returns — the explicit shape, no attribute-poking.
 
-    text is the model's reply; verification is the aggregate verdict; run_id
+    text is the model's reply; verification is the aggregate verdict; run_key
     and checks come from the same RunHandle the attach path exposes. response
     is the untouched provider object, still available if you need it.
     """
 
     text: Optional[str]
     verification: str
-    run_id: Optional[int]
+    run_key: Optional[str]
     checks: list
     response: Any
 
@@ -433,7 +491,7 @@ def _result_from_response(response) -> CallResult:
             text = content
     handle = getattr(response, "promptkeep", None)
     if handle is not None:
-        return CallResult(text, handle.verification, handle.run_id, handle.checks, response)
+        return CallResult(text, handle.verification, handle.run_key, handle.checks, response)
     return CallResult(text, "ok", None, [], response)
 
 

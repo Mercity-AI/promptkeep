@@ -61,7 +61,7 @@ class TestPreChecks:
         # A blocked run is still recorded, with the block verdict.
         (run,) = history.all_runs()
         assert run.status == "blocked"
-        (chk,) = storage.fetch_checks(run.id)
+        (chk,) = storage.fetch_checks(run.run_key)
         assert chk["name"] == "no_pii" and chk["status"] == "block"
 
     def test_block_return_mode_yields_stub(self):
@@ -189,6 +189,54 @@ class TestPreChecks:
         (turn,) = history.conversation("c-redact").turns
         assert turn.input_text == "my [redacted] token"
 
+    def test_rewrite_keeps_the_original_and_names_the_check(self):
+        # The audit trail must show both sides of a rewrite: what the caller
+        # passed, what went out, and which check made the change. The
+        # post-check sees the same pair.
+        seen = {}
+
+        @check.pre(name="redact")
+        def redact(ctx):
+            return Verdict.rewrite((ctx.last_text or "").replace("SECRET", "[redacted]"))
+
+        @check.post(name="audit", mode="blocking")
+        def audit(ctx):
+            seen["original"] = ctx.original_text
+            seen["sent"] = ctx.last_text
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[redact], post=[audit])
+        resp = _client().chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {"role": "user", "content": "my SECRET token"},
+            ],
+        )
+        assert seen == {"original": "my SECRET token", "sent": "my [redacted] token"}
+
+        (run,) = history.all_runs()
+        assert run.run_key == resp.promptkeep.run_key
+        assert run.input_text == "my [redacted] token"
+        assert run.original_input_text == "my SECRET token"
+        (redact_verdict,) = [c for c in history.checks(run.run_key) if c.name == "redact"]
+        assert redact_verdict.rewritten == "my [redacted] token"
+        (audit_verdict,) = [c for c in history.checks(run.run_key) if c.name == "audit"]
+        assert audit_verdict.rewritten is None
+
+    def test_no_rewrite_means_no_original(self):
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[gate])
+        _client().chat.completions.create(
+            model="m",
+            messages=[{"role": "developer", "content": p}, {"role": "user", "content": "hi"}],
+        )
+        (run,) = history.all_runs()
+        assert run.original_input_text is None
+
     def test_rewrite_targets_multimodal_user_turn(self):
         # A rewrite on a vision message must edit the user's text block and
         # keep the image, not overwrite the system prompt.
@@ -246,8 +294,26 @@ class TestPostChecks:
         assert resp.promptkeep.verification == "pending"
         resp.promptkeep.wait(timeout=5)
         assert resp.promptkeep.verification == "ok"
-        names = [c["name"] for c in storage.fetch_checks(resp.promptkeep.run_id)]
+        names = [c["name"] for c in storage.fetch_checks(resp.promptkeep.run_key)]
         assert "slow" in names
+
+    def test_async_post_still_runs_when_nothing_is_persisted(self):
+        # With tracking off there is no run to attach a verdict to, but the
+        # check itself must still run: wait() is how the caller reads it.
+        promptkeep.configure(enabled=False)
+
+        @check.post(name="judge", mode="async")
+        def grade(ctx):
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="P", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert resp.promptkeep.run_key is None
+        resp.promptkeep.wait(timeout=5)
+        assert [c.name for c in resp.promptkeep.checks] == ["judge"]
+        assert resp.promptkeep.verification == "ok"
 
 
 class TestSafety:
@@ -422,7 +488,7 @@ class TestPIIConversationFlow:
         # the blocked turn has the block verdict and no output.
         blocked = convo.turns[1]
         assert blocked.output_text is None
-        (chk,) = storage.fetch_checks(blocked.id)
+        (chk,) = storage.fetch_checks(blocked.run_key)
         assert chk["name"] == "no_secrets" and chk["status"] == "block"
         # the secret never reached the provider on any call.
         assert not any("sk-live" in str(c.get("messages")) for c in client.calls)
@@ -609,7 +675,7 @@ class TestCallHelper:
         result = call(_client(), model="m", messages=[{"role": "developer", "content": p}])
         assert result.text == "Paris is the capital of France."
         assert result.verification == "ok"
-        assert result.run_id is not None
+        assert result.run_key is not None
         assert [c.name for c in result.checks] == ["grounded"]
 
     def test_call_on_block_return_gives_failed_result(self):
@@ -648,3 +714,103 @@ class TestCallHelper:
             result = call(raw, model="m", messages=[{"role": "user", "content": "hi"}])
         assert result.verification == "ok"
         assert any("not wrapped" in r.message for r in caplog.records)
+
+
+class TestDurability:
+    """Checked calls in background write mode: nothing on the hot path, and
+    flush() means every verdict is on disk."""
+
+    def test_checked_call_goes_through_the_background_writer(self, monkeypatch):
+        # Hold the writer thread on a gate: if the checked call still wrote
+        # inline, the run would be on disk before the gate opens.
+        import threading
+
+        promptkeep.configure(write_mode="background")
+        gate = threading.Event()
+        real_write_batch = storage.write_batch
+
+        def held(items):
+            gate.wait(timeout=10)
+            real_write_batch(items)
+
+        monkeypatch.setattr(storage, "write_batch", held)
+
+        @check.pre(name="gate")
+        def pre(ctx):
+            return Verdict.ok()
+
+        @check.post(name="grade", mode="blocking")
+        def post(ctx):
+            return Verdict.from_score(0.9, 0.5)
+
+        p = Prompt("sys", name="BG", pre=[pre], post=[post])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        handle = resp.promptkeep
+        assert handle.run_key  # identity exists before the row does
+        assert handle.verification == "ok"
+        assert history.all_runs() == []  # not written inline
+
+        gate.set()
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert run.run_key == handle.run_key
+        assert {c.name for c in history.checks(run.run_key)} == {"gate", "grade"}
+
+    def test_flush_waits_for_async_post_checks(self):
+        # No wait() on the handle: flush alone must be enough for the verdict
+        # to be on disk, because it waits for the check and then the queue.
+        promptkeep.configure(write_mode="background")
+
+        @check.post(name="slow_judge", mode="async")
+        def grade(ctx):
+            time.sleep(0.2)
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="BG", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert resp.promptkeep.verification == "pending"
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        (chk,) = history.checks(run.run_key)
+        assert chk.name == "slow_judge" and chk.score == 0.8
+
+    def test_flush_reports_a_timeout_while_a_check_is_still_running(self):
+        promptkeep.configure(write_mode="background")
+
+        @check.post(name="stuck", mode="async")
+        def grade(ctx):
+            time.sleep(0.6)
+            return Verdict.ok()
+
+        p = Prompt("sys", name="BG", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert promptkeep.flush(timeout=0.05) is False
+        # Let it finish so the next test starts clean.
+        resp.promptkeep.wait(timeout=5)
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert [c.name for c in history.checks(run.run_key)] == ["stuck"]
+
+    def test_blocked_call_is_recorded_in_background_mode_too(self):
+        promptkeep.configure(write_mode="background")
+
+        @check.pre(name="no_pii")
+        def gate(ctx):
+            return Verdict.block("email")
+
+        p = Prompt("sys", name="BG", pre=[gate])
+        with pytest.raises(PromptBlocked):
+            _client().chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert run.status == "blocked"
+        (chk,) = history.checks(run.run_key)
+        assert chk.status == "block"

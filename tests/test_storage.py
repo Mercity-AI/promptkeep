@@ -237,17 +237,71 @@ class TestSchemaMigration:
         # Must not raise.
         assert history.runs("OLD")[0].rendered_text == "hi there"
 
-    def test_v2_all_the_way_to_v4_adds_checks_table(self, isolated_db):
-        """A v2 file migrates through v3 and v4 in one pass: the checks table
-        appears and the pre-existing run still reads back."""
+    def test_v2_all_the_way_to_latest(self, isolated_db):
+        """A v2 file migrates through every later step in one pass: the checks
+        table appears, the legacy run gets a run_key, and it still reads back."""
         self._build_v2_database(isolated_db)
-        assert history.runs("OLD")[0].rendered_text == "hi there"
+        (legacy,) = history.runs("OLD")
+        assert legacy.rendered_text == "hi there"
+        assert legacy.run_key  # backfilled by the v5 step
+        assert legacy.original_input_text is None
 
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "checks" in tables
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert {"run_key", "original_input_text"} <= run_cols
+        check_cols = {r[1] for r in conn.execute("PRAGMA table_info(checks)")}
+        assert "rewritten" in check_cols
         conn.close()
+
+    def _build_v4_database(self, path):
+        """The shape the checks branch first shipped (v4): a checks table
+        without `rewritten`, runs without `run_key`, one verdict on file."""
+        self._build_v2_database(path)
+        raw = pw.SqliteDatabase(str(path), pragmas={"journal_mode": "wal", "foreign_keys": 1})
+        raw.connect()
+        raw.execute_sql(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, external_id TEXT UNIQUE, "
+            "title TEXT, metadata TEXT, created_at TEXT, updated_at TEXT)"
+        )
+        raw.execute_sql("ALTER TABLE runs ADD COLUMN conversation_id INTEGER")
+        raw.execute_sql("ALTER TABLE runs ADD COLUMN turn_index INTEGER")
+        raw.execute_sql("ALTER TABLE runs ADD COLUMN input_text TEXT")
+        raw.execute_sql(
+            "CREATE TABLE checks (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, "
+            "name TEXT, phase TEXT, status TEXT, score REAL, message TEXT, "
+            "latency_ms INTEGER, created_at TEXT)"
+        )
+        raw.execute_sql(
+            "INSERT INTO checks (run_id, name, phase, status, created_at) "
+            "VALUES (1, 'legacy_gate', 'pre', 'ok', '2020-01-01')"
+        )
+        raw.execute_sql("PRAGMA user_version = 4")
+        raw.close()
+
+    def test_v4_database_gains_run_keys_and_the_rewrite_columns(self, isolated_db):
+        """A v4 file (checks table already present, in its first shape) gets
+        the v5 additions without tripping on the existing checks table, and
+        its legacy verdict is reachable through the run's new key."""
+        self._build_v4_database(isolated_db)
+        (legacy,) = history.runs("OLD")
+        assert legacy.run_key
+
+        conn = sqlite3.connect(str(isolated_db))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == storage._SCHEMA_VERSION
+        check_cols = {r[1] for r in conn.execute("PRAGMA table_info(checks)")}
+        assert "rewritten" in check_cols
+        # run_key is unique from here on.
+        index_sql = " ".join(
+            r[0] or "" for r in conn.execute("SELECT sql FROM sqlite_master WHERE type='index'")
+        )
+        assert "UNIQUE" in index_sql and "run_key" in index_sql
+        conn.close()
+
+        (chk,) = history.checks(legacy.run_key)
+        assert chk.name == "legacy_gate" and chk.rewritten is None
 
     def test_interrupted_step_rolls_back_whole(self, isolated_db, monkeypatch):
         """A step and its user_version bump commit together. If the v3 step
@@ -284,7 +338,7 @@ class TestSchemaMigration:
         conn.close()
 
         # The checks table is usable: a run with bundled verdicts round-trips.
-        run_id = storage.record_run(
+        run_key = storage.record_run(
             provider="openai",
             model="m",
             checks=[
@@ -298,4 +352,47 @@ class TestSchemaMigration:
                 }
             ],
         )
-        assert [c["name"] for c in storage.fetch_checks(run_id)] == ["g"]
+        assert [c["name"] for c in storage.fetch_checks(run_key)] == ["g"]
+
+
+class TestLateVerdicts:
+    """record_check / the writer's check items: verdicts that arrive after
+    their run was recorded."""
+
+    def _row(self, name="late"):
+        return {
+            "name": name,
+            "phase": "post",
+            "status": "ok",
+            "score": 0.9,
+            "message": None,
+            "latency_ms": 3,
+            "rewritten": None,
+        }
+
+    def test_late_verdict_attaches_to_its_run_by_key(self):
+        run_key = storage.record_run(provider="openai", model="m")
+        storage.record_check(run_key, self._row())
+        (chk,) = storage.fetch_checks(run_key)
+        assert chk["name"] == "late" and chk["score"] == 0.9
+
+    def test_verdict_for_a_never_persisted_run_is_skipped_not_raised(self, caplog):
+        """The run may have been evicted on queue overflow. The verdict is
+        dropped with a warning; nothing raises, and a batch carrying it still
+        lands its other items."""
+        with caplog.at_level("WARNING", logger="promptkeep"):
+            storage.record_check("no-such-run", self._row())
+        assert any("never persisted" in r.message for r in caplog.records)
+
+        good = storage.record_run(provider="openai", model="m")
+        storage.write_batch(
+            [
+                {"_kind": "check", "run_key": "no-such-run", "created_at": "t", **self._row()},
+                {"_kind": "check", "run_key": good, "created_at": "t", **self._row("kept")},
+            ]
+        )
+        assert [c["name"] for c in storage.fetch_checks(good)] == ["kept"]
+
+    def test_verdict_without_a_run_key_is_a_no_op(self):
+        storage.record_check(None, self._row())  # tracking was off: nothing to attach to
+        assert history.all_runs() == []

@@ -54,6 +54,13 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   in-process counters (`storage.reserve_turn_index`, reserve semantics — calling it claims the
   turn), because the DB's `MAX(turn_index)` is stale while rows sit in the queue. Tests run
   `write_mode="sync"` via the conftest fixture.
+- **Runs are identified by a client-minted `run_key`** (`storage.new_run_key`, a UUID), never
+  by the integer row id. That is what lets checked calls use the background writer too: the
+  `RunHandle` and any late verdict name the run before its row exists. Check verdicts travel
+  the same queue (`_kind: "check"` items, resolved to the run by key at write time; a verdict
+  whose run was evicted is skipped, not raised). `promptkeep.flush()` lives in `tracking.py`:
+  it waits for in-flight async post-checks (`checks.wait_for_pending`), then `writer.drain()`.
+  A pre-check rewrite stores both sides: `runs.original_input_text` and `checks.rewritten`.
 - **The wrapper never monkey-patches the `openai` module** — only the object passed to
   `wrap()` gets its `create` replaced (idempotent via `_pm_instrumented`). Message dicts are
   copied, never mutated. Streaming defers run recording until the stream ends
@@ -66,10 +73,10 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   (async by default via a shared `ThreadPoolExecutor`, blocking opt-in). Attach at three
   scopes merged most-specific-wins: global (`configure(pre=/post=)`) < prompt (`Prompt(pre=/
   post=)`) < per-call (`promptkeep_pre=/promptkeep_post=` kwargs, stripped before the request).
-  A checked call records its run **synchronously** (bypassing the background queue) so the
-  `run_id` exists for the check rows and the attached `RunHandle` (`response.promptkeep`);
-  pre + blocking-post verdicts bundle into that insert, async-post verdicts write via
-  `storage.record_check` when they land. Two invariants: a crashing/timing-out check never
+  A checked call records its run through the normal write path (background queue included):
+  the `RunHandle` (`response.promptkeep`) carries the client-minted `run_key`, pre +
+  blocking-post verdicts bundle into the run row, and async-post verdicts go through
+  `storage.record_check` when they land — queued behind their run in background mode. Two invariants: a crashing/timing-out check never
   breaks the call (recorded `status="error"`/fail-open `warn`; `on_timeout="closed"` opts a
   pre-check into fail-closed), and check execution runs under `checks.suppress()` — a
   contextvar the wrapper honors to make an LLM-judge check's own calls untracked, so it can't
@@ -79,8 +86,8 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   loop, and streaming running post-checks in `_CheckedStreamRecorder.finish()` (output only
   exists once the stream drains) into a `RunHandle` already attached to the proxy.
   `promptkeep.call()`/`acall()` return the explicit `CallResult` shape; `RunHandle.awaited()`
-  is the async twin of `wait()`. Schema v4 adds the `checks` table (the label store for later
-  optimization).
+  is the async twin of `wait()`. Schema v4 added the `checks` table (the label store for later
+  optimization); v5 added `run_key`, `original_input_text`, and `checks.rewritten`.
 
 ## SQLite/peewee specifics
 

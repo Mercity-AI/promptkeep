@@ -1,18 +1,21 @@
-"""The background run writer: a bounded queue drained by one daemon thread.
+"""The background writer: a bounded queue drained by one daemon thread.
 
-In write_mode="background" (the default), `storage.record_run` enqueues the
-row here and returns immediately; this module's worker thread batches queued
-rows into single transactions off the caller's hot path. Design rules, each
-a known telemetry-library footgun:
+In write_mode="background" (the default), `storage.record_run` and
+`storage.record_check` enqueue their items here and return immediately; this
+module's worker thread batches queued items into single transactions off the
+caller's hot path. Design rules, each a known telemetry-library footgun:
 
-- **Bounded queue, drop-oldest.** A full queue drops the oldest run and
+- **Bounded queue, drop-oldest.** A full queue drops the oldest item and
   counts it (rate-limited warning) — a slow disk must never become an OOM.
 - **The worker never dies.** Every batch is exception-shielded; a broken DB
   loses telemetry, never the thread.
-- **flush() and an atexit hook** give short-lived processes (scripts,
-  Lambdas, tests) a way to guarantee queued rows are on disk.
+- **drain() and an atexit hook** give short-lived processes (scripts,
+  Lambdas, tests) a way to guarantee queued items are on disk. The public
+  `promptkeep.flush()` (in `tracking`) first waits for async post-checks
+  still running, then calls drain() — by exit time the check pool has
+  already been joined by the interpreter, so the hook only needs drain().
 - **Fork safety.** A forked child inherits a dead thread and a queue of
-  rows the parent will also write; the child resets to empty state instead
+  items the parent will also write; the child resets to empty state instead
   of double-writing or hanging (os.register_at_fork, POSIX only).
 
 The thread starts lazily on the first enqueue — importing promptkeep never
@@ -46,9 +49,10 @@ _atexit_registered = False
 
 
 def submit(item: dict) -> None:
-    """Enqueue one run row for the background thread; never blocks, never raises.
+    """Enqueue one item (a run row or a late verdict) for the background
+    thread; never blocks, never raises.
 
-    On overflow the oldest queued row is discarded (and counted) to make
+    On overflow the oldest queued item is discarded (and counted) to make
     room — recent telemetry is worth more than old telemetry.
     """
     global _dropped_total, _last_drop_log
@@ -84,11 +88,12 @@ def submit(item: dict) -> None:
         logger.warning("promptkeep: failed to enqueue run", exc_info=True)
 
 
-def flush(timeout: Optional[float] = None) -> bool:
-    """Block until every queued run is written (or timeout seconds pass).
+def drain(timeout: Optional[float] = None) -> bool:
+    """Block until every queued item is written (or timeout seconds pass).
 
     Returns True when the queue fully drained, False on timeout. A process
-    that never wrote in background mode returns True immediately.
+    that never wrote in background mode returns True immediately. This is the
+    queue half of `promptkeep.flush()`; use that from application code.
     """
     q = _queue
     if q is None:
@@ -104,7 +109,7 @@ def flush(timeout: Optional[float] = None) -> bool:
 
 
 def dropped_count() -> int:
-    """Total runs discarded because the queue was full (for tests/diagnostics)."""
+    """Total items discarded because the queue was full (for tests/diagnostics)."""
     return _dropped_total
 
 
@@ -152,12 +157,12 @@ def _ensure_started() -> "queue.Queue[dict]":
             _thread = threading.Thread(target=_worker, name="promptkeep-writer", daemon=True)
             _thread.start()
             # Drain on interpreter exit: atexit runs in the main thread while
-            # daemon threads are still alive, so queued rows can still land.
+            # daemon threads are still alive, so queued items can still land.
             # Registered once per process (see _atexit_registered) — restarts
             # after reset() must not stack duplicate hooks.
             global _atexit_registered
             if not _atexit_registered:
-                atexit.register(flush, 2.0)
+                atexit.register(drain, 2.0)
                 _atexit_registered = True
         return _queue
 
@@ -192,7 +197,7 @@ def _worker() -> None:
                 storage.write_batch(batch)
             except Exception:
                 logger.warning(
-                    "promptkeep: background writer failed to persist %d run(s)",
+                    "promptkeep: background writer failed to persist %d item(s)",
                     len(batch),
                     exc_info=True,
                 )

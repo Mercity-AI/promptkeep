@@ -24,17 +24,19 @@ import logging
 import time
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from ..checks import (
     CheckContext,
     PromptBlocked,
     RunHandle,
     run_pre_checks,
+    schedule_async,
     suppressed,
 )
 from ..conversation import current as current_conversation
 from ..prompts import Prompt, RenderedText
+from ..storage import new_run_key
 from ..tracking import record_conversation_turn, record_prompt_run
 
 logger = logging.getLogger("promptkeep")
@@ -221,6 +223,23 @@ def _prepare_conversation(
         return None, None, None
 
 
+class _RunContext(NamedTuple):
+    """What identifies a checked call's run row before anything is written.
+
+    run_key is minted up front (see storage.new_run_key) so the RunHandle and
+    any late verdict can name the run while its row is still in the write
+    queue. The conversation slot and turn text come from _prepare_conversation.
+    original_input_text is filled in only when a pre-check rewrote the turn:
+    input_text then holds what was sent, this holds what the caller passed.
+    """
+
+    run_key: str
+    conversation_id: Optional[int]
+    turn_index: Optional[int]
+    input_text: Optional[str]
+    original_input_text: Optional[str] = None
+
+
 # --- run recording ---------------------------------------------------------------
 
 
@@ -401,31 +420,38 @@ def _attach_handle(response, handle):
 
 
 def _record_checked(tracked, kwargs, response, latency_ms, status, error, conv, check_rows):
-    """Record the run for a checked call (checks bundled), returning run_id.
+    """Record the run for a checked call (checks bundled), returning its run_key
+    — or None when nothing was recorded (tracking disabled, write_mode "off").
 
-    Mirrors _record_runs but returns the primary run's id and attaches the
-    verdicts. For multiple tracked prompts, checks bundle onto the first;
-    the rest record normally.
+    Mirrors _record_runs but returns the primary run's key and attaches the
+    verdicts. For multiple tracked prompts, checks bundle onto the first —
+    the run whose key the RunHandle carries; the rest record normally under
+    keys of their own.
     """
-    conversation_id, turn_index, input_text = conv
     usage_kw = dict(
         provider="openai",
         latency_ms=latency_ms,
         status=status,
         error=error,
-        conversation_id=conversation_id,
-        turn_index=turn_index,
-        input_text=input_text,
+        conversation_id=conv.conversation_id,
+        turn_index=conv.turn_index,
+        input_text=conv.input_text,
+        original_input_text=conv.original_input_text,
         **_response_fields(response, kwargs),
     )
     if tracked:
-        run_id = record_prompt_run(
-            tracked[0][0], tracked[0][1], tracked[0][2], checks=check_rows, **usage_kw
+        run_key = record_prompt_run(
+            tracked[0][0],
+            tracked[0][1],
+            tracked[0][2],
+            run_key=conv.run_key,
+            checks=check_rows,
+            **usage_kw,
         )
         for prompt_obj, variables, rendered in tracked[1:]:
             record_prompt_run(prompt_obj, variables, rendered, **usage_kw)
-        return run_id
-    return record_conversation_turn(checks=check_rows, **usage_kw)
+        return run_key
+    return record_conversation_turn(run_key=conv.run_key, checks=check_rows, **usage_kw)
 
 
 def _extract_output_text(response):
@@ -437,20 +463,6 @@ def _extract_output_text(response):
         if isinstance(content, str):
             return content
     return None
-
-
-def _schedule_async_post(chk, ctx, run_id):
-    """Run one async post-check off-thread; write its verdict when it lands."""
-    from ..checks import _get_executor
-
-    def _work():
-        result = chk.run_inline(ctx)
-        from .. import storage
-
-        storage.record_check(run_id, result.to_row())
-        return result
-
-    return _get_executor().submit(_work)
 
 
 # The checked-call flow is split into pure-sync phases (run pre-checks, handle
@@ -495,19 +507,28 @@ def _apply_pre_rewrite(outcome, kwargs, messages, pre_ctx, conv):
     A rewrite has to reach three places, not just the wire: the outgoing
     request (so the provider sees it), the post-check context (so the audit
     grades what was actually sent), and the recorded ``input_text`` (so the
-    stored turn isn't the pre-rewrite original — e.g. a scrubbed secret must
-    not be written back in the clear). Returns the updated
+    stored turn is what actually went out). The turn as the caller passed it
+    is kept alongside — ``original_input_text`` on the row, ``original_text``
+    on the context — so the record shows both sides of the change and which
+    check made it (its verdict row carries the rewritten text). Anything
+    that must never be stored in the clear belongs to redaction, which runs
+    on every stored field, not to a rewrite. Returns the updated
     (messages, pre_ctx, conv).
     """
     if outcome.rewritten is None:
         return messages, pre_ctx, conv
+    original = pre_ctx.last_text
     messages = _apply_rewrite(messages, outcome.rewritten)
     kwargs["messages"] = messages
     last_text = _extract_input_text(messages)
     pre_ctx = replace(
-        pre_ctx, rendered=_joined_text(messages), last_text=last_text, messages=messages
+        pre_ctx,
+        rendered=_joined_text(messages),
+        last_text=last_text,
+        messages=messages,
+        original_text=original,
     )
-    conv = (conv[0], conv[1], last_text)
+    conv = conv._replace(input_text=last_text, original_input_text=original)
     return messages, pre_ctx, conv
 
 
@@ -519,7 +540,7 @@ def _checked_block(outcome, tracked, kwargs, conv, version):
     from ..config import get_settings
 
     pre_rows = [r.to_row() for r in outcome.results]
-    run_id = _record_checked(
+    run_key = _record_checked(
         tracked,
         kwargs,
         None,
@@ -532,7 +553,7 @@ def _checked_block(outcome, tracked, kwargs, conv, version):
     if get_settings().on_block == "raise":
         raise PromptBlocked(outcome.blocked.name, outcome.blocked.message)
     stub = _blocked_stub(outcome.blocked, kwargs)
-    _attach_handle(stub, RunHandle(run_id, version, outcome.results))
+    _attach_handle(stub, RunHandle(run_key, version, outcome.results))
     return stub
 
 
@@ -552,6 +573,8 @@ def _checked_post(
 
     The post context is the pre context with the response fields filled in, so
     any pre-check rewrite (already folded into pre_ctx) is what the audit sees.
+    Async post-checks run whether or not the run was persisted — the handle's
+    wait() still collects their verdicts; only the DB write is skipped then.
     """
     post_ctx = replace(
         pre_ctx,
@@ -565,15 +588,13 @@ def _checked_post(
 
     known_results = list(outcome.results) + blocking_results
     check_rows = [r.to_row() for r in known_results]
-    run_id = _record_checked(tracked, kwargs, response, latency, "ok", None, conv, check_rows)
+    run_key = _record_checked(tracked, kwargs, response, latency, "ok", None, conv, check_rows)
 
-    futures = []
-    if asyncs and run_id is not None:
-        futures = [_schedule_async_post(c, post_ctx, run_id) for c in asyncs]
+    futures = [schedule_async(c, post_ctx, run_key) for c in asyncs]
     if handle is None:
-        _attach_handle(response, RunHandle(run_id, version, known_results, futures))
+        _attach_handle(response, RunHandle(run_key, version, known_results, futures))
     else:
-        handle.run_id = run_id
+        handle.run_key = run_key
         handle.checks = list(known_results)
         handle._futures = futures
     return response
@@ -658,10 +679,10 @@ def _make_sync_create(original):
         conversation_id, turn_index, input_text = _prepare_conversation(
             external_id, title, metadata, messages
         )
-        conv = (conversation_id, turn_index, input_text)
 
         pre_checks, post_checks = _collect_checks(tracked, per_call_pre, per_call_post)
         if pre_checks or post_checks:
+            conv = _RunContext(new_run_key(), conversation_id, turn_index, input_text)
             if kwargs.get("stream"):
                 return _run_checked_stream(
                     original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
@@ -725,10 +746,10 @@ def _make_async_create(original):
         conversation_id, turn_index, input_text = _prepare_conversation(
             external_id, title, metadata, messages
         )
-        conv = (conversation_id, turn_index, input_text)
 
         pre_checks, post_checks = _collect_checks(tracked, per_call_pre, per_call_post)
         if pre_checks or post_checks:
+            conv = _RunContext(new_run_key(), conversation_id, turn_index, input_text)
             if kwargs.get("stream"):
                 return await _run_checked_stream_async(
                     original, args, kwargs, tracked, messages, conv, pre_checks, post_checks
@@ -844,7 +865,9 @@ class _CheckedStreamRecorder(_StreamRecorder):
     def __init__(
         self, tracked, kwargs, start, conv, outcome, pre_ctx, version, post_checks, handle
     ):
-        super().__init__(tracked, kwargs, start, conv[0], conv[1], conv[2])
+        super().__init__(
+            tracked, kwargs, start, conv.conversation_id, conv.turn_index, conv.input_text
+        )
         self.conv = conv
         self.outcome = outcome
         self.pre_ctx = pre_ctx

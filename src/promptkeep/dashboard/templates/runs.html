@@ -31,7 +31,7 @@
   <td class="num">{{ r.total_tokens if r.total_tokens is not none else '—' }}</td>
   <td><span class="pill status-{{ r.status }}">{{ r.status }}</span></td>
   <td>
-    {% set v = verdicts.get(r.id) %}
+    {% set v = verdicts.get(r.run_key) %}
     {% if v %}<span class="pill status-{{ v }}">{{ v }}</span>{% else %}<span class="muted">—</span>{% endif %}
   </td>
   <td class="muted mono">{{ r.created_at[:19] }}</td>
