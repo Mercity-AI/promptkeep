@@ -15,11 +15,11 @@ uv run python examples/playground.py             # narrated sandbox (throwaway D
 uv build                                         # build sdist+wheel into dist/
 ```
 
-CI (`.github/workflows/ci.yml`) runs ruff, the test suite on Python 3.9–3.14 across Linux, macOS
-and Windows, and an 85% coverage gate, on every push to `main` and every PR. Releases: bump
-`version` in `pyproject.toml` (the only place it lives — `__version__` reads it back from
-package metadata), add the `CHANGELOG.md` entry, tag `vX.Y.Z` and push the tag;
-`.github/workflows/release.yml` builds and publishes to PyPI via Trusted Publishing.
+**There is no CI yet.** The workflows are written (`docs/workflows/ci.yml`, `release.yml`) but
+not enabled — see `TODO.md` for why and how. Run the lint + coverage gate above locally before
+pushing. Releases, for now: bump `version` in `pyproject.toml` (the only place it lives —
+`__version__` reads it back from package metadata), add the `CHANGELOG.md` entry, tag
+`vX.Y.Z`, then `uv build && uv publish --token pypi-...`.
 
 Published on PyPI as `promptkeep`; GitHub remote is `Mercity-AI/promptkeep`. The directory is
 still named `prompt-manager` — everything inside uses `promptkeep`. `plan.md` is the original

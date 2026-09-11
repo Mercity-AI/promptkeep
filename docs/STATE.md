@@ -49,10 +49,10 @@ runs off it.
 |---|---|
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
-| **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. **Local main is ahead of `origin/main`** — the push was rejected because the stored GitHub token lacks the `workflow` scope needed to add `.github/workflows/*.yml`. |
+| **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. |
 | **Tests** | 227 passing (~2.8s, no network), verified locally on Python 3.9, 3.11 and 3.14 on macOS. Coverage 91%. |
 | **Size** | ~4,600 LOC Python + ~450 LOC HTML templates · ~3,200 LOC tests |
-| **Python** | ≥ 3.9. CI (`.github/workflows/ci.yml`) runs ruff, the suite on 3.9–3.14 × Linux/macOS/Windows, and an 85% coverage gate — **it has never run yet** (push blocked, above). Windows is still untested. |
+| **Python** | ≥ 3.9. **No CI yet**: the workflows (ruff, the suite on 3.9–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
 | **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Still OpenAI `chat.completions`-only. |
@@ -505,7 +505,7 @@ started.
 | `redact` hook | **Done** | fails closed |
 | `__version__` via `importlib.metadata` | **Done** | |
 | `testing.py` → `examples/`, drop `testing.db` | **Done** | `examples/playground.py` |
-| CI (matrix, ruff, coverage gate) | **Done** (unverified) | workflow written; first run blocked on the token scope, Windows never exercised |
+| CI (matrix, ruff, coverage gate) | Partial | workflows written in `docs/workflows/`, not enabled — `TODO.md` |
 
 ### v0.4 — Checks
 
@@ -545,10 +545,11 @@ started.
 
 ### Engineering standards (roadmap §8)
 
-Done: CI workflow (matrix 3.9–3.14 × 3 OSes, ruff, 85% coverage gate), release automation
-(`release.yml`: a pushed `v*` tag re-runs the suite, checks the tag matches the declared
-version, publishes via PyPI Trusted Publishing, opens a GitHub Release), `CHANGELOG.md` in
-keep-a-changelog format, sdist trimmed to what a builder needs, badges on the README.
+Done: `CHANGELOG.md` in keep-a-changelog format, sdist trimmed to what a builder needs, PyPI
+badges on the README. Written but **not enabled** (`docs/workflows/`, see `TODO.md`): the CI
+workflow (matrix 3.9–3.14 × 3 OSes, ruff, 85% coverage gate) and release automation (a pushed
+`v*` tag re-runs the suite, checks the tag matches the declared version, publishes via PyPI
+Trusted Publishing, opens a GitHub Release).
 Not started: `CONTRIBUTING.md` / `SECURITY.md` / issue templates, `mypy --strict`, benchmarks,
 docs site. The README documents every feature but is not yet rewritten to the "sell in
 fifteen seconds" shape (no GIF).
@@ -564,14 +565,14 @@ fifteen seconds" shape (no GIF).
 
 ### Suggested next moves, in order
 
-1. **Unblock the push.** Re-issue the GitHub token with the `workflow` scope (or push from a
-   client that has it), then `git push origin main`. Watch the first CI run — Windows has
-   never executed this suite; fix whatever it turns up before publishing.
-2. **Publish 0.3.0.** Either configure PyPI Trusted Publishing for this repo and
-   `.github/workflows/release.yml` (environment `pypi`) and `git push origin v0.3.0`, or from
-   the tag run `uv build && uv publish --token ...`. If the read model and production
-   controls should ship in the same release, move the tag first: `git tag -f -a v0.3.0`
-   on the current main and fold the "Unreleased" changelog entries into 0.3.0.
+1. **Enable CI** (`TODO.md`): re-issue the token with the `workflow` scope, move
+   `docs/workflows/` to `.github/workflows/`, and watch the first run — Windows has never
+   executed this suite; fix whatever it turns up before publishing.
+2. **Publish 0.3.0** from the tag: `uv build && uv publish --token ...` (or, once
+   `release.yml` is enabled and PyPI Trusted Publishing is configured, `git push origin
+   v0.3.0`). If the read model and production controls should ship in the same release, move
+   the tag first: `git tag -f -a v0.3.0` on the current main and fold the "Unreleased"
+   changelog entries into 0.3.0.
 3. v0.3 is then fully closed. Next milestone is **v0.5 reach**: the provider adapter
    interface (`integrations/base.py`), the OpenAI Responses API (+ `previous_response_id`
    chaining), the rest of the CLI (`list`, `versions`, `diff`, `runs`, `convo`, `stats`,

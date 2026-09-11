@@ -60,9 +60,9 @@ path, multi-turn sessions become first-class, and calls can be gated and audited
 - `examples/seed_demo.py` (rich demo data for the dashboard),
   `examples/pii_conversation_demo.py`, and `examples/playground.py` (moved from
   the repository root).
-- CI on GitHub Actions: ruff, the test suite on Python 3.9–3.14 across Linux,
-  macOS and Windows, and an 85% coverage gate. Tagged releases publish to PyPI
-  through Trusted Publishing.
+- GitHub Actions workflows for CI (ruff, the test suite on Python 3.9–3.14
+  across Linux, macOS and Windows, an 85% coverage gate) and tag-driven PyPI
+  publishing, staged in `docs/workflows/` — not yet enabled (see `TODO.md`).
 
 ### Changed
 
