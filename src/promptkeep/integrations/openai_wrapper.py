@@ -33,12 +33,16 @@ class OpenAIChatAdapter(ProviderAdapter):
     provider = "openai"
 
     def locate(self, client: Any) -> Target | None:
+        """``client.chat.completions.create`` is the surface; anything without
+        it is not this provider."""
         completions = getattr(getattr(client, "chat", None), "completions", None)
         if completions is not None and callable(getattr(completions, "create", None)):
             return Target(completions, "create")
         return None
 
     def parse_request(self, kwargs: dict[str, Any]) -> Request:
+        """Substitute the Prompts in ``messages``; the newest non-system
+        message is the current turn."""
         tracked, messages = _process_messages(kwargs.get("messages"))
         new_kwargs = dict(kwargs)
         if "messages" in kwargs:
@@ -53,6 +57,8 @@ class OpenAIChatAdapter(ProviderAdapter):
         )
 
     def apply_rewrite(self, request: Request, text: str) -> Request:
+        """Put the rewrite on the newest non-system message and re-derive the
+        current-turn and joined texts from the result."""
         messages = _apply_rewrite(request.payload, text)
         return replace(
             request,
@@ -63,6 +69,7 @@ class OpenAIChatAdapter(ProviderAdapter):
         )
 
     def read_response(self, response: Any) -> ResponseFields:
+        """Reply text from ``choices[0].message.content``, counts from ``usage``."""
         usage = getattr(response, "usage", None)
         return ResponseFields(
             model=getattr(response, "model", None),
@@ -74,9 +81,12 @@ class OpenAIChatAdapter(ProviderAdapter):
         )
 
     def stream_absorber(self) -> StreamAbsorber:
+        """A fresh chunk absorber for one streamed completion."""
         return _ChatStreamAbsorber()
 
     def blocked_stub(self, request: Request, blocked: Any) -> Any:
+        """A chat-completion-shaped object with no choices and the block noted
+        on it, so ``response.choices`` code degrades instead of crashing."""
         return SimpleNamespace(
             id=None,
             model=request.kwargs.get("model"),

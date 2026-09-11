@@ -23,6 +23,7 @@ class MissingVariableError(KeyError):
     """Raised in strict mode when a placeholder has no matching variable."""
 
     def __init__(self, missing: Iterable[str]):
+        """Sort and dedupe the missing names so the message is stable."""
         self.missing = sorted(set(missing))
         super().__init__(
             "Missing variables for placeholders: " + ", ".join(repr(m) for m in self.missing)

@@ -46,6 +46,8 @@ class conversation:
     """
 
     def __init__(self, external_id: str, title: str | None = None, **metadata: Any):
+        """Validate the id and prepare the ambient record. Nothing is written
+        here — the row is created by the first tracked call inside the block."""
         if not isinstance(external_id, str) or not external_id.strip():
             raise ValueError("conversation() requires a non-empty external_id")
         self._active = _Active(external_id, title, metadata)
@@ -57,17 +59,21 @@ class conversation:
         return self._active.external_id
 
     def __enter__(self) -> conversation:
+        """Make this the ambient conversation for the block."""
         self._token = _current.set(self._active)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        """Restore whatever conversation (if any) was ambient before the block."""
         _current.reset(self._token)
         return False
 
     async def __aenter__(self) -> conversation:
+        """Async twin of __enter__: the contextvar works the same in a task."""
         return self.__enter__()
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        """Async twin of __exit__."""
         return self.__exit__(exc_type, exc, tb)
 
 

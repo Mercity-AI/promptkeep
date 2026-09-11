@@ -34,6 +34,14 @@ public APIs; each such change is called out below.
 
 ### Changed
 
+- Internal restructuring, no public API change: `storage` is split into
+  `models`, `migrations`, `controls` and the write path; `history` builds its
+  dataclasses straight from its own queries; the wrapper's orchestration is
+  one `_Call` object; `call()`/`acall()` live in `promptkeep.integrations`
+  and work through the adapter; the module graph has no import cycles (a
+  test enforces it). `template_hash` moved to `rendering`, `new_run_key` to
+  `models`; `tracking.record_conversation_turn` is gone (use
+  `storage.record_run`).
 - **Python 3.11 is now the minimum** (was 3.9; 3.9 and 3.10 are end-of-life).
 - `wrap()` on an unrecognized object now raises
   `TypeError: wrap() found no supported provider surface ...` naming the

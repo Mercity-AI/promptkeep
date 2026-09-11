@@ -146,10 +146,12 @@ class suppress:
     """Context manager that marks nested calls as check-internal (untracked)."""
 
     def __enter__(self):
+        """Mark the current context as inside a check."""
         self._token = _suppressed.set(True)
         return self
 
     def __exit__(self, *exc):
+        """Lift the mark, restoring whatever it was before."""
         _suppressed.reset(self._token)
         return False
 
@@ -405,6 +407,7 @@ class PromptBlocked(Exception):
     """Raised when a pre-check blocks a call and on_block='raise' (the default)."""
 
     def __init__(self, check_name: str, message: str | None):
+        """Carry the blocking check's name and its message."""
         self.check_name = check_name
         self.message = message
         super().__init__(f"blocked by check {check_name!r}: {message}")
@@ -424,6 +427,8 @@ class RunHandle:
     """
 
     def __init__(self, run_key, prompt_version, results, futures=None):
+        """Bind the run's key, the prompt version that ran, the verdicts known
+        so far, and the futures of any async post-checks still running."""
         self.run_key = run_key
         self.prompt_version = prompt_version
         self.checks = list(results)

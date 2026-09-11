@@ -25,6 +25,25 @@ Published on PyPI as `promptkeep`; GitHub remote is `Mercity-AI/promptkeep`. The
 still named `prompt-manager` — everything inside uses `promptkeep`. `plan.md` is the original
 design doc, kept as history; don't update it to match code changes.
 
+## Code style
+
+Beyond ruff (line length 100, isort, pyupgrade to 3.11), the codebase follows two conventions
+that ruff does not enforce — keep them when adding or editing code:
+
+- **Logical blocks.** A function body is written as a sequence of steps. Each step — a loop, a
+  query, a branch that does one thing — is its own block, separated from the next by a blank
+  line and introduced by a one-line comment saying what that block does (or why). A reader
+  should be able to skim the comments alone and get the algorithm. Don't comment single
+  obvious lines; do comment the block.
+- **Docstrings on everything.** Every module, class, function and method has one, including
+  private helpers and dunder methods. Say what it does and, where it isn't obvious, why it is
+  that way — the docstrings are where the design reasoning lives (see `storage._register`,
+  `writer`, `controls.keep_run`). A one-liner is fine when that is all there is to say.
+
+Module graph is a DAG: no function-level intra-package imports (`tests/test_package.py`
+enforces it; `cli.py`'s lazy dashboard import is the one exception). If an import cycle appears,
+one dependency is pointing the wrong way — fix that rather than deferring the import.
+
 ## Architecture
 
 Three-entity data model, strictly layered: **Prompt** (`name` = permanent identity) →
@@ -35,11 +54,18 @@ never create a version. Normalization (`rendering.normalize_template`) canonical
 placeholder names to `{v0}`, `{v1}`, ... so renaming `{var1}` → `{x}` dedups to the same
 version; static text, repetition patterns, and format specs still distinguish versions.
 
-Flow between modules: `prompts.Prompt.render()` → lazily registers its template via
-`storage.register_version()` (memoized per object *and* per process) → the shared interceptor
-in `integrations/core.py` (installed by `wrap()` on every surface a registered adapter
-locates) → `tracking.record_prompt_run()` → `storage.record_run()`. `history.py` is the read
-side, turning storage's dict rows into frozen dataclasses.
+Modules, bottom up: `rendering`, `conversation`, `config` (no package imports) → `writer`
+(the queue; its sink is injected by storage) → `models` (peewee tables) → `migrations` →
+`controls` (sampling, redaction) → `storage` (the connection and every write) → `prompts` →
+`history` (the read side: queries → frozen dataclasses) → `checks` → `tracking` →
+`integrations/` (`base` = the adapter interface, `core` = the shared interceptor built around
+one `_Call` object per call, `registry` = `wrap()` and the adapter list, `call` = the explicit
+`call()` shape, `openai_wrapper` = the one adapter).
+
+Flow: `prompts.Prompt.render()` → lazily registers its template via
+`storage.register_version()` (memoized per object *and* per process) → the interceptor
+`wrap()` installed on the client → `tracking.record_prompt_run()` → `storage.record_run()`
+(sampling, redaction, then the writer queue or a direct insert).
 
 Load-bearing design decisions (breaking these breaks the library's contract):
 
