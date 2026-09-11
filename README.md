@@ -1,5 +1,9 @@
 # promptkeep
 
+[![CI](https://github.com/Mercity-AI/promptkeep/actions/workflows/ci.yml/badge.svg)](https://github.com/Mercity-AI/promptkeep/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/promptkeep.svg)](https://pypi.org/project/promptkeep/)
+[![Python](https://img.shields.io/pypi/pyversions/promptkeep.svg)](https://pypi.org/project/promptkeep/)
+
 Prompts as first-class objects: named, versioned templates with lineage tracked in SQLite,
 variable rendering, a decorator for computed prompts, and a transparent OpenAI SDK wrapper
 that records every run (prompt version + variables + output + usage). Multi-turn
@@ -259,6 +263,10 @@ promptkeep.configure(
 ## Development
 
 ```bash
-uv sync          # install with dev dependencies
-uv run pytest    # run the test suite
+uv sync                                  # install with dev dependencies
+uv run pytest                            # run the test suite
+uv run ruff format src tests examples && uv run ruff check src tests examples
 ```
+
+CI runs the same on Python 3.9–3.14 across Linux, macOS and Windows. Changes are
+recorded in [CHANGELOG.md](CHANGELOG.md).

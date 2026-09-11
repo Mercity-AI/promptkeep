@@ -1,0 +1,90 @@
+# Changelog
+
+All notable changes to promptkeep are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
+[Semantic Versioning](https://semver.org/). Until 1.0, minor versions may change
+public APIs; each such change is called out below.
+
+## [Unreleased]
+
+## [0.3.0] - 2026-09-11
+
+The release that makes promptkeep safe to deploy: run writes leave the request
+path, multi-turn sessions become first-class, and calls can be gated and audited.
+
+### Added
+
+- **Conversations.** `promptkeep.conversation(external_id, **metadata)` groups
+  every tracked call inside the block (sync or `async with`) into one session;
+  the `promptkeep_conversation=` kwarg attaches a single call without a block.
+  Every turn is recorded, with or without a `Prompt` in the messages, so a
+  session can be read back in full. Read side: `history.conversation()`,
+  `history.list_conversations()`, and `conversation_id` / `turn_index` /
+  `input_text` on `RunInfo`.
+- **Background writes.** `write_mode="background"` is the new default: run rows
+  are built at call time and persisted by a bounded, drop-oldest queue drained
+  on a daemon thread. `promptkeep.flush(timeout)` and an `atexit` hook drain it;
+  `"sync"` and `"off"` remain available (`PROMPTKEEP_WRITE_MODE`). Fork-safe on
+  POSIX. Version registration stays synchronous.
+- **Checks.** `@check.pre` gates (can `block` or `rewrite` the outgoing turn)
+  and `@check.post` audits (async by default) attach per prompt, per call
+  (`promptkeep_pre=` / `promptkeep_post=`) or globally via `configure()`.
+  Verdicts land in a `checks` table and ride back on the response as
+  `response.promptkeep` (a `RunHandle`); `promptkeep.call()` / `acall()` return
+  a `CallResult` directly. Timeouts fail open by default (`on_timeout="closed"`
+  per check), a crashing check records an error instead of raising, and
+  `suppress()` keeps LLM-judge checks from recording themselves.
+- **Local dashboard.** `pip install "promptkeep[serve]"` then `promptkeep serve`
+  opens a read-only, localhost-only, fully offline view: prompts and version
+  lineage with diffs, a filterable runs explorer with check verdicts, and
+  turn-by-turn conversation transcripts.
+- `history.all_runs()`, `history.list_prompts()`, `history.checks(run_key)` and
+  `history.verdict()`.
+- `examples/seed_demo.py` (rich demo data for the dashboard),
+  `examples/pii_conversation_demo.py`, and `examples/playground.py` (moved from
+  the repository root).
+- CI on GitHub Actions: ruff, the test suite on Python 3.9–3.14 across Linux,
+  macOS and Windows, and an 85% coverage gate. Tagged releases publish to PyPI
+  through Trusted Publishing.
+
+### Changed
+
+- Runs are identified by a client-minted `run_key` (UUID) rather than their row
+  id; `RunInfo.run_key` is the value to pass to `history.checks()`.
+- `__version__` is read from the installed package's metadata; `pyproject.toml`
+  is the only place the version is declared.
+- The sdist no longer bundles repository-only files.
+
+### Schema
+
+- Database schema is now version 5 (`PRAGMA user_version`); existing files are
+  migrated forward automatically on first open. New: `conversations` and
+  `checks` tables; `runs` gains `run_key`, `conversation_id`, `turn_index`,
+  `input_text`, `original_input_text`, and nullable `version_id` /
+  `rendered_text`.
+
+## [0.2.0] - 2026-07-04
+
+### Changed
+
+- Versions dedupe on the **normalized** template: placeholder names are
+  canonicalized before hashing, so renaming `{var1}` to `{x}` resolves to the
+  same version. Static text, repetition patterns, attribute paths and format
+  specs still distinguish versions. Existing rows are re-hashed on migration.
+
+### Added
+
+- `exact_match=True` (on `Prompt` and `@prompt`) opts a prompt back into
+  raw-text identity.
+
+## [0.1.0] - 2026-07-04
+
+Initial release: `Prompt` (named, immutable, lazily versioned templates), the
+`@prompt` decorator for computed prompts, lenient/strict rendering, SQLite
+lineage via peewee, `wrap()` for the OpenAI SDK (sync, async, streaming), and
+`history.versions()` / `diff()` / `runs()`.
+
+[Unreleased]: https://github.com/Mercity-AI/promptkeep/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Mercity-AI/promptkeep/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Mercity-AI/promptkeep/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Mercity-AI/promptkeep/releases/tag/v0.1.0

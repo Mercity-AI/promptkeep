@@ -1,0 +1,57 @@
+name: Release
+
+# Pushing a tag like v0.3.0 builds the sdist and wheel, runs the suite once
+# more against the tagged commit, publishes to PyPI via Trusted Publishing
+# (OIDC — no long-lived token in secrets), and opens a GitHub Release with
+# generated notes. One-time setup on PyPI: add this repository and workflow
+# file as a trusted publisher for the `promptkeep` project.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run ruff check src tests examples
+      - run: uv run pytest -q
+      - name: Check the tag matches the declared version
+        run: |
+          declared="v$(uv version --short)"
+          if [ "$declared" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match pyproject version ${declared}" >&2
+            exit 1
+          fi
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # Trusted Publishing
+      contents: write   # the GitHub Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v6
+      - run: uv publish
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --generate-notes
