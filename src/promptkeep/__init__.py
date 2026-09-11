@@ -9,11 +9,11 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from . import history
-from .checks import CheckContext, PromptBlocked, Verdict, acall, call, check, suppress
+from .checks import CheckContext, PromptBlocked, Verdict, check, suppress
 from .config import configure, get_settings
 from .conversation import conversation
 from .decorator import prompt
-from .integrations import wrap
+from .integrations import acall, call, wrap
 from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
 from .tracking import flush

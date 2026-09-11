@@ -26,6 +26,7 @@ from promptkeep.integrations import (
     Target,
     is_wrapped,
     register_adapter,
+    registry,
 )
 from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response
 
@@ -259,7 +260,7 @@ class TestRegistry:
     def restore_registry(self):
         before = integrations.adapters()
         yield
-        integrations._ADAPTERS[:] = before
+        registry._ADAPTERS[:] = before
 
     def test_register_adapter_makes_wrap_recognize_a_new_client_shape(self, prompt):
         """A minimal third-party adapter: a client whose method is
