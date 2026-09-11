@@ -109,6 +109,81 @@ already covered by version lineage, so nothing is duplicated as history grows. W
 prompt version drove each turn is recorded inline — so "which version was live at turn 6
 of this session?" is a lookup, not an investigation.
 
+## Checks
+
+Run your own function before a call (a gate that can stop it) and after it (an
+audit that grades the answer). A check is just a function returning a `Verdict`
+— plain code or another LLM call, promptkeep doesn't care which.
+
+```python
+from promptkeep import Prompt, check, Verdict
+
+@check.pre(name="no_pii")                     # runs before the request is sent
+def block_pii(ctx):
+    return Verdict.block("email in prompt") if "@" in ctx.rendered else Verdict.ok()
+
+@check.post(name="grounded")                  # runs after; async by default
+def is_grounded(ctx):
+    score = judge(ctx.output_text)            # e.g. an LLM-as-judge call
+    return Verdict.from_score(score, threshold=0.7)
+
+review = Prompt("You are a reviewer.", name="REVIEW_SYSTEM",
+                pre=[block_pii], post=[is_grounded])
+```
+
+A `Verdict` is `ok()`, `warn(msg)`, `block(msg)` (pre only — stops the call), or
+`rewrite(text)` (pre only — substitutes the outgoing message). The result rides
+back on the response, and existing code is untouched:
+
+```python
+response = client.chat.completions.create(...)
+response.choices[0].message.content     # unchanged
+response.promptkeep.verification        # "ok" | "warn" | "failed" | "pending"
+response.promptkeep.checks              # each check's verdict
+response.promptkeep.run_key             # the run's identity — history.checks(run_key)
+response.promptkeep.wait(timeout=5)     # block for async post-checks if you want them
+```
+
+Prefer an explicit shape for new code? `call()` returns the result directly:
+
+```python
+from promptkeep import call
+
+result = call(client, model="gpt-5.5", messages=[...])
+result.text            # the reply
+result.verification    # "ok" | "warn" | "failed" | "pending"
+result.run_key
+# async: await promptkeep.acall(client, ...), and response.promptkeep.awaited()
+```
+
+A blocked call raises `PromptBlocked` by default; `configure(on_block="return")`
+makes it return a response-shaped stub instead so a service can degrade. Checks
+attach globally (`configure(pre=[...])`), per prompt, or per call
+(`promptkeep_pre=[...]`), merged most-specific-wins.
+
+Because a guardrail is only useful if it can't take the request down with it,
+checks are isolated from your call path: a crashing or slow check never breaks
+the call (it fails open, recorded), each check's timeout measures its own
+execution — so a burst of concurrent calls can't make a fast check look slow —
+and on async calls nothing runs on the event loop, not even a streamed
+response's post-checks. A check reads the current turn as `ctx.last_text` even
+when the message carries image content, and a `pre` rewrite is applied
+consistently to the outgoing request, the post-check that audits it, and the
+row that's stored. The record keeps both sides of a rewrite — the turn as the
+caller passed it (`original_input_text`) next to what was sent (`input_text`) —
+and the rewriting check's verdict carries the replacement text, so an audit can
+see exactly what changed and which check changed it. An LLM-judge check doesn't
+record itself.
+
+Checks run on every call path — sync or async, streaming or not (post-checks
+fire once a stream finishes). Every verdict is saved to the `checks` table, tied
+to the run it graded (and, when a `Prompt` drove the call, that prompt's
+version). Runs are identified by a `run_key` minted at call time, so a checked
+call goes through the background writer like any other — nothing on the request
+path waits for the database. Async verdicts queue behind their run row, and
+`promptkeep.flush()` waits for any post-check still running before draining the
+queue: once it returns, every verdict is on disk.
+
 ## History
 
 ```python
@@ -156,6 +231,9 @@ promptkeep.flush(timeout=5)                   # block until everything queued is
 promptkeep.configure(write_mode="sync")       # or: write before the call returns
 ```
 
+`flush()` covers check verdicts too: it waits for async post-checks still running,
+then drains the queue, and returns `False` if the timeout ran out first.
+
 An `atexit` hook flushes automatically on interpreter shutdown, so short-lived scripts
 don't lose rows. `write_mode="off"` drops run telemetry entirely (versioning still works).
 
@@ -172,6 +250,9 @@ promptkeep.configure(
     queue_size=10_000,              # background queue bound (drop-oldest when full)
     flush_interval=0.5,             # seconds the writer waits before a partial batch
     batch_size=100,                 # max rows per write transaction
+    pre=[...],                      # global pre-checks (gates), run on every tracked call
+    post=[...],                     # global post-checks (audits), run on every tracked call
+    on_block="raise",               # blocked pre-check: "raise" PromptBlocked | "return" a stub
 )
 ```
 

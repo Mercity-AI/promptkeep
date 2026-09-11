@@ -66,6 +66,8 @@ class Prompt:
         "_exact_match",
         "_source",
         "_fn_source_hash",
+        "_pre",
+        "_post",
         "_registration",
         "_frozen",
     )
@@ -79,6 +81,8 @@ class Prompt:
         exact_match: bool = False,
         source: str = "literal",
         fn_source_hash: Optional[str] = None,
+        pre: Optional[list] = None,
+        post: Optional[list] = None,
     ):
         """Validate inputs and freeze the instance (source/fn_source_hash are
         internal, set by the @prompt decorator).
@@ -108,6 +112,10 @@ class Prompt:
         object.__setattr__(self, "_exact_match", bool(exact_match))
         object.__setattr__(self, "_source", source)
         object.__setattr__(self, "_fn_source_hash", fn_source_hash)
+        # Checks attached at prompt scope. Tuples so the frozen prompt can't
+        # have its check list mutated out from under a registered version.
+        object.__setattr__(self, "_pre", tuple(pre or ()))
+        object.__setattr__(self, "_post", tuple(post or ()))
         object.__setattr__(self, "_registration", _UNSET)
         object.__setattr__(self, "_frozen", True)
 
@@ -160,6 +168,16 @@ class Prompt:
         """True when version identity includes placeholder names (opt-in)."""
         return self._exact_match
 
+    @property
+    def pre(self) -> tuple:
+        """Pre-checks (gates) attached at this prompt's scope."""
+        return self._pre
+
+    @property
+    def post(self) -> tuple:
+        """Post-checks (audits) attached at this prompt's scope."""
+        return self._post
+
     # --- rendering ----------------------------------------------------------
 
     def render(self, **overrides: Any) -> RenderedText:
@@ -185,6 +203,8 @@ class Prompt:
             exact_match=self._exact_match,
             source=self._source,
             fn_source_hash=self._fn_source_hash,
+            pre=self._pre,
+            post=self._post,
         )
 
     def _effective_strict(self) -> bool:

@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -25,7 +26,7 @@ import peewee as pw
 
 logger = logging.getLogger("promptkeep")
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
 
 # The models bind to this proxy; _get_db() points it at the configured file.
 _proxy = pw.DatabaseProxy()
@@ -112,12 +113,25 @@ class ConversationRecord(BaseModel):
 class RunRecord(BaseModel):
     """One execution: a tracked prompt version and/or a conversation turn.
 
+    run_key is the run's public identity — a UUID minted by the caller at call
+    time (see new_run_key), before the row exists. Everything that references
+    a run (a RunHandle, a late check verdict, history.checks) does so by key,
+    which is what lets the row itself travel through the background writer:
+    nothing has to wait for SQLite to assign the integer id. The id stays the
+    primary key for joins and foreign keys; it is not part of the public API.
+
     version is nullable because a conversation turn need not involve a
     wrapped Prompt (a plain follow-up message still gets a row so the whole
-    session can be replayed); a run with neither a version nor a
-    conversation is never created.
+    session can be replayed). Usually a run has a version, a conversation, or
+    both; the one exception is a checked call outside any conversation with no
+    wrapped Prompt, whose row exists solely to anchor its check verdicts.
+
+    original_input_text is set only when a pre-check rewrote the outgoing turn:
+    input_text is then what was actually sent, and this column preserves what
+    the caller originally passed, so the audit trail shows both sides.
     """
 
+    run_key = pw.TextField(unique=True)
     version = pw.ForeignKeyField(
         PromptVersionRecord, column_name="version_id", backref="runs", null=True
     )
@@ -140,6 +154,7 @@ class RunRecord(BaseModel):
     )
     turn_index = pw.IntegerField(null=True)
     input_text = pw.TextField(null=True)
+    original_input_text = pw.TextField(null=True)
 
     class Meta:
         table_name = "runs"
@@ -149,7 +164,33 @@ class RunRecord(BaseModel):
         )
 
 
-_MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord]
+class CheckRecord(BaseModel):
+    """One check verdict against a run — the label store for optimization.
+
+    phase is 'pre' | 'post'; status is 'ok' | 'warn' | 'block' | 'error'.
+    An async post-check's row is written when its verdict lands, so a run can
+    accumulate check rows after it was itself recorded. rewritten holds the
+    replacement text a rewriting pre-check produced (None for every other
+    verdict), so the audit trail names which check changed the turn and to
+    what — the run's original_input_text holds what it changed *from*.
+    """
+
+    run = pw.ForeignKeyField(RunRecord, column_name="run_id", backref="checks")
+    name = pw.TextField()
+    phase = pw.TextField()
+    status = pw.TextField()
+    score = pw.FloatField(null=True)
+    message = pw.TextField(null=True)
+    latency_ms = pw.IntegerField(null=True)
+    rewritten = pw.TextField(null=True)
+    created_at = pw.TextField()
+
+    class Meta:
+        table_name = "checks"
+        indexes = ((("run", "name"), False),)
+
+
+_MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord, CheckRecord]
 
 
 # --- helpers -------------------------------------------------------------------
@@ -158,6 +199,19 @@ _MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord]
 def _utcnow() -> str:
     """Current UTC time as an ISO-8601 string (how all timestamps are stored)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def new_run_key() -> str:
+    """Mint a run's identity: a random UUID, assigned *before* anything is written.
+
+    Runs are referenced by this key rather than by their integer row id
+    precisely so the identity exists at call time. The background writer may
+    not have inserted the row yet when the caller needs to point at it (a
+    RunHandle on the response, an async post-check's verdict landing later),
+    and a key minted client-side never has to wait for the database — the
+    same reason tracing systems mint trace ids in the client.
+    """
+    return str(uuid.uuid4())
 
 
 def template_hash(text: str, exact: bool = False) -> str:
@@ -219,33 +273,38 @@ def _get_db() -> Optional[pw.DatabaseProxy]:
 def _migrate(database: pw.SqliteDatabase) -> None:
     """Apply forward-only schema steps until the DB reaches _SCHEMA_VERSION.
 
-    Each step advances a local `user_version` so steps compose regardless of
-    which version a real DB starts at (e.g. 1 -> 3 must run both the v2 and
-    v3 steps). A brand-new DB is created straight from `_MODELS` at the
-    latest shape, so it's marked done immediately rather than re-running
+    Steps compose regardless of which version a real DB starts at (e.g. 1 -> 3
+    runs both the v2 and v3 steps) — each guard tests the version the DB began
+    at. Every step runs in its own transaction that also stamps the new
+    `user_version`, so a step and its version bump commit together: an
+    interrupted step rolls back whole and re-runs from the same version rather
+    than replaying half of it into a "duplicate column" error. A brand-new DB
+    is created straight from `_MODELS` at the latest shape, so it skips the
     legacy fix-up steps meant for pre-existing rows.
     """
     (user_version,) = database.execute_sql("PRAGMA user_version").fetchone()
-    started_at = user_version
     if user_version < 1:
-        database.create_tables(_MODELS, safe=True)
-        user_version = _SCHEMA_VERSION
+        with database.atomic():
+            database.create_tables(_MODELS, safe=True)
+            database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        return
     if user_version < 2:
         # v2: template_hash became a hash of the *normalized* template
         # (variable names canonicalized). Recompute stored hashes so old
         # rows keep deduping correctly against new registrations.
-        for row in PromptVersionRecord.select():
-            new_hash = template_hash(row.template)
-            if new_hash != row.template_hash:
-                try:
-                    PromptVersionRecord.update(template_hash=new_hash).where(
-                        PromptVersionRecord.id == row.id
-                    ).execute()
-                except pw.IntegrityError:
-                    # Two old versions differing only in variable names now
-                    # collide; keep the older row normalized, leave this one.
-                    pass
-        user_version = 2
+        with database.atomic():
+            for row in PromptVersionRecord.select():
+                new_hash = template_hash(row.template)
+                if new_hash != row.template_hash:
+                    try:
+                        PromptVersionRecord.update(template_hash=new_hash).where(
+                            PromptVersionRecord.id == row.id
+                        ).execute()
+                    except pw.IntegrityError:
+                        # Two old versions differing only in variable names now
+                        # collide; keep the older row normalized, leave this one.
+                        pass
+            database.execute_sql("PRAGMA user_version = 2")
     if user_version < 3:
         # v3: conversations. runs.version_id/rendered_text drop NOT NULL
         # because a conversation turn with no wrapped Prompt still gets a
@@ -253,18 +312,59 @@ def _migrate(database: pw.SqliteDatabase) -> None:
         # run to its conversation and turn position.
         from playhouse.migrate import SqliteMigrator, migrate
 
-        database.create_tables([ConversationRecord], safe=True)
-        migrator = SqliteMigrator(database)
-        migrate(
-            migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
-            migrator.add_column("runs", "turn_index", pw.IntegerField(null=True)),
-            migrator.add_column("runs", "input_text", pw.TextField(null=True)),
-            migrator.drop_not_null("runs", "version_id"),
-            migrator.drop_not_null("runs", "rendered_text"),
-        )
-        user_version = 3
-    if started_at < _SCHEMA_VERSION:
-        database.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        with database.atomic():
+            database.create_tables([ConversationRecord], safe=True)
+            migrator = SqliteMigrator(database)
+            migrate(
+                migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
+                migrator.add_column("runs", "turn_index", pw.IntegerField(null=True)),
+                migrator.add_column("runs", "input_text", pw.TextField(null=True)),
+                migrator.drop_not_null("runs", "version_id"),
+                migrator.drop_not_null("runs", "rendered_text"),
+            )
+            database.execute_sql("PRAGMA user_version = 3")
+    if user_version < 4:
+        # v4: the checks table — one verdict per (run, check).
+        with database.atomic():
+            database.create_tables([CheckRecord], safe=True)
+            database.execute_sql("PRAGMA user_version = 4")
+    if user_version < 5:
+        # v5: runs gain a caller-minted identity (run_key) so a run can be
+        # referenced before its row lands — checked calls go through the
+        # background writer like everything else, and late verdicts find
+        # their run by key. Plus the rewrite audit trail: the turn as the
+        # caller passed it (runs.original_input_text) and what the rewriting
+        # check produced (checks.rewritten).
+        from playhouse.migrate import SqliteMigrator, migrate
+
+        with database.atomic():
+            migrator = SqliteMigrator(database)
+            operations = [
+                migrator.add_column("runs", "run_key", pw.TextField(null=True)),
+                migrator.add_column("runs", "original_input_text", pw.TextField(null=True)),
+            ]
+            # A DB that started below v4 just had its checks table created
+            # from the current model (rewritten included) in the step above;
+            # one that started at v4 has the older shape and needs the column.
+            if not _has_column(database, "checks", "rewritten"):
+                operations.append(
+                    migrator.add_column("checks", "rewritten", pw.TextField(null=True))
+                )
+            migrate(*operations)
+            # Backfill so every pre-existing run has a key: the column is the
+            # run's identity from here on, and readers rely on it being set.
+            for (row_id,) in database.execute_sql("SELECT id FROM runs").fetchall():
+                database.execute_sql(
+                    "UPDATE runs SET run_key = ? WHERE id = ?", (new_run_key(), row_id)
+                )
+            migrate(migrator.add_index("runs", ("run_key",), True))
+            database.execute_sql("PRAGMA user_version = 5")
+
+
+def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:
+    """Whether ``table`` already has ``column`` — for migration steps whose
+    starting shape depends on which earlier steps ran in the same pass."""
+    return any(col.name == column for col in database.get_columns(table))
 
 
 def reset_caches() -> None:
@@ -451,6 +551,7 @@ def reserve_turn_index(conversation_id: int) -> int:
 
 def record_run(
     *,
+    run_key: Optional[str] = None,
     version_id: Optional[int] = None,
     variables: Optional[dict] = None,
     rendered_text: Optional[str] = None,
@@ -468,20 +569,31 @@ def record_run(
     conversation_id: Optional[int] = None,
     turn_index: Optional[int] = None,
     input_text: Optional[str] = None,
-) -> None:
+    original_input_text: Optional[str] = None,
+    checks: Optional[list] = None,
+) -> Optional[str]:
     """Record one run row, honoring the configured write_mode. Never raises.
+
+    Returns the run's key — the identity everything else references it by
+    (a RunHandle, history.checks(), a verdict landing later) — or None when
+    nothing was recorded (tracking disabled, write_mode "off", or the write
+    failed). The key is minted here when the caller didn't bring one, and it
+    is valid the moment this returns: in background mode the row may still
+    be in the queue, but the key already names it.
 
     "sync" inserts before returning; "background" builds the complete row
     (timestamps and turn number included — they must reflect *call* time,
     not whenever the writer thread gets to it) and hands it to the writer
     queue; "off" drops it. Version registration is unaffected by the mode.
+    Bundled ``checks`` — verdicts already known at record time — travel with
+    the row and land in the same transaction, whichever mode.
 
     version_id is optional: a conversation turn with no wrapped Prompt still
-    gets a row (there's simply nothing to attach to a lineage). At least one
-    of version_id / conversation_id should be set by the caller — a run tied
-    to neither is pointless — but that's a caller contract, not enforced
-    here, since failing loudly would violate the shielding this function
-    exists to provide.
+    gets a row (there's simply nothing to attach to a lineage). A row usually
+    has a version_id, a conversation_id, or both; the deliberate exception is a
+    checked call that has neither, whose row exists only to anchor its check
+    verdicts. Nothing is enforced here regardless — failing loudly would
+    violate the shielding this function exists to provide.
 
     turn_index is normally left unset and reserved here. Callers that write
     more than one row for the same physical API call (a message with more
@@ -495,10 +607,13 @@ def record_run(
 
         settings = get_settings()
         if not settings.enabled or settings.write_mode == "off":
-            return
+            return None
+        if run_key is None:
+            run_key = new_run_key()
         if turn_index is None and conversation_id is not None:
             turn_index = reserve_turn_index(conversation_id)
         row = {
+            "run_key": run_key,
             "version": version_id,
             "variables": _json_or_none(variables),
             "rendered_text": rendered_text,
@@ -517,39 +632,121 @@ def record_run(
             "conversation": conversation_id,
             "turn_index": turn_index,
             "input_text": input_text,
+            "original_input_text": original_input_text,
         }
+        if checks:
+            row["_checks"] = list(checks)
         if settings.write_mode == "background":
             from . import writer
 
             writer.submit(row)
+            return run_key
+        if _get_db() is None:
+            return None
+        _insert_run(row)
+        return run_key
+    except Exception:
+        logger.warning("promptkeep: failed to record run", exc_info=True)
+        return None
+
+
+def record_check(run_key: Optional[str], check_row: dict) -> None:
+    """Record one late verdict — an async post-check that finished after its
+    run was recorded — honoring the configured write_mode. Never raises.
+
+    It takes the same road as the run row it belongs to: queued behind it in
+    background mode (so flush() covers it), inserted directly in sync mode,
+    dropped in "off". run_key=None means the run itself was never recorded
+    (tracking disabled), so there is nothing to attach the verdict to.
+    """
+    try:
+        if run_key is None:
+            return
+        from .config import get_settings
+
+        settings = get_settings()
+        if not settings.enabled or settings.write_mode == "off":
+            return
+        item = {"_kind": "check", "run_key": run_key, "created_at": _utcnow(), **check_row}
+        if settings.write_mode == "background":
+            from . import writer
+
+            writer.submit(item)
             return
         if _get_db() is None:
             return
-        _insert_row(row)
+        _insert_check(item)
     except Exception:
-        logger.warning("promptkeep: failed to record run", exc_info=True)
+        logger.warning("promptkeep: failed to record check", exc_info=True)
 
 
-def _insert_row(row: dict) -> None:
-    """Insert one prepared run row and touch its conversation's updated_at."""
-    RunRecord.create(**row)
-    if row.get("conversation") is not None:
-        ConversationRecord.update(updated_at=_utcnow()).where(
-            ConversationRecord.id == row["conversation"]
-        ).execute()
-
-
-def write_batch(rows: list) -> None:
-    """Persist queued rows in one transaction (called from the writer thread).
+def write_batch(items: list) -> None:
+    """Persist queued items in one transaction (called from the writer thread).
 
     Raises on failure — the writer shields and logs, keeping the whole batch
     as the unit of loss rather than half-writing it.
     """
-    if not rows or _get_db() is None:
+    if not items or _get_db() is None:
         return
     with _proxy.atomic():
-        for row in rows:
-            _insert_row(row)
+        for item in items:
+            _persist(item)
+
+
+def _persist(item: dict) -> None:
+    """Apply one queued item: a run row (the default) or a late check verdict.
+
+    These are the dicts record_run/record_check hand to the writer; in sync
+    mode the same two functions insert directly. A ``_kind`` marker tells the
+    shapes apart — everything else in the dict is column data.
+    """
+    if item.get("_kind") == "check":
+        _insert_check(item)
+    else:
+        _insert_run(item)
+
+
+def _insert_run(row: dict) -> int:
+    """Insert one prepared run row plus any bundled check rows; return its row id.
+
+    A row may carry ``_checks`` — verdicts known at record time (all
+    pre-checks, plus blocking post-checks). They're written in the same
+    transaction as the run so they can never orphan. The input dict is left
+    untouched; the writer keeps its batch as the unit of loss and must be
+    free to log or drop it intact.
+    """
+    row = dict(row)
+    checks = row.pop("_checks", None)
+    run = RunRecord.create(**row)
+    if checks:
+        now = _utcnow()
+        CheckRecord.insert_many([{**c, "run": run.id, "created_at": now} for c in checks]).execute()
+    if row.get("conversation") is not None:
+        ConversationRecord.update(updated_at=_utcnow()).where(
+            ConversationRecord.id == row["conversation"]
+        ).execute()
+    return run.id
+
+
+def _insert_check(item: dict) -> None:
+    """Insert one late verdict against its run, located by run_key.
+
+    The run row always precedes its verdicts in the queue, so by the time this
+    runs it is on disk — or earlier in this same transaction. When it isn't
+    (the run was evicted on queue overflow, or its batch failed) the verdict
+    has nothing to attach to and is skipped with a warning; one orphaned
+    verdict must not fail the whole batch it rode in on.
+    """
+    run_id = RunRecord.select(RunRecord.id).where(RunRecord.run_key == item["run_key"]).scalar()
+    if run_id is None:
+        logger.warning(
+            "promptkeep: dropping verdict %r — its run %s was never persisted",
+            item.get("name"),
+            item["run_key"],
+        )
+        return
+    fields = {k: v for k, v in item.items() if k not in ("_kind", "run_key")}
+    CheckRecord.create(run=run_id, **fields)
 
 
 # --- reads (raise on real errors) ---------------------------------------------
@@ -562,6 +759,7 @@ def write_batch(rows: list) -> None:
 # so column order here is irrelevant to callers.
 _RUN_COLUMNS = (
     RunRecord.id,
+    RunRecord.run_key,
     PromptRecord.name.alias("prompt_name"),
     PromptVersionRecord.version.alias("version"),
     RunRecord.variables,
@@ -580,6 +778,7 @@ _RUN_COLUMNS = (
     RunRecord.created_at,
     RunRecord.turn_index,
     RunRecord.input_text,
+    RunRecord.original_input_text,
 )
 # Appended only where the caller filters across conversations and needs to
 # know which one each run belongs to (fetch_conversation_turns already knows).
@@ -723,6 +922,29 @@ def fetch_conversation_turns(external_id: str) -> list:
         .join(ConversationRecord)
         .where(ConversationRecord.external_id == external_id)
         .order_by(RunRecord.turn_index)
+        .dicts()
+    )
+    return list(query)
+
+
+def fetch_checks(run_key: str) -> list:
+    """All check verdicts recorded against one run (by key), as dicts, oldest first."""
+    if _get_db() is None:
+        return []
+    query = (
+        CheckRecord.select(
+            CheckRecord.name,
+            CheckRecord.phase,
+            CheckRecord.status,
+            CheckRecord.score,
+            CheckRecord.message,
+            CheckRecord.latency_ms,
+            CheckRecord.rewritten,
+            CheckRecord.created_at,
+        )
+        .join(RunRecord)
+        .where(RunRecord.run_key == run_key)
+        .order_by(CheckRecord.id)
         .dicts()
     )
     return list(query)

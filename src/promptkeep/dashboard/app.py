@@ -85,6 +85,10 @@ def create_app() -> FastAPI:
             runs = history.runs(prompt, version=version_number, limit=limit)
         else:
             runs = history.all_runs(limit=limit)
+        # A run's headline verdict for the badge column: run_key -> "ok" |
+        # "warn" | "blocked" | "failed" | None (no checks). Cheap per-run
+        # lookups — fine for a local single-user dashboard.
+        verdicts = {r.run_key: history.verdict(r.status, history.checks(r.run_key)) for r in runs}
         return templates.TemplateResponse(
             request,
             "runs.html",
@@ -94,6 +98,7 @@ def create_app() -> FastAPI:
                 "selected_prompt": prompt,
                 "selected_version": version,
                 "runs": runs,
+                "verdicts": verdicts,
             },
         )
 
@@ -108,13 +113,18 @@ def create_app() -> FastAPI:
 
     @app.get("/conversations/{external_id}")
     def conversation_detail(request: Request, external_id: str):
-        """One conversation's full transcript, turn by turn."""
+        """One conversation's full transcript, turn by turn, with each turn's
+        check verdicts shown inline."""
         try:
             convo = history.conversation(external_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+        # run_key -> that turn's check verdicts, for the transcript.
+        turn_checks = {t.run_key: history.checks(t.run_key) for t in convo.turns}
         return templates.TemplateResponse(
-            request, "conversation_detail.html", {"active": "conversations", "convo": convo}
+            request,
+            "conversation_detail.html",
+            {"active": "conversations", "convo": convo, "turn_checks": turn_checks},
         )
 
     return app

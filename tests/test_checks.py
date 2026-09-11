@@ -1,0 +1,816 @@
+"""Tests for checks: pre-gates, post-audits, verdicts, RunHandle, suppression.
+
+Runs against the fake OpenAI clients (no network). Checks execute through
+the real wrapper path.
+"""
+
+import asyncio
+import time
+from types import SimpleNamespace
+
+import pytest
+
+import promptkeep
+from promptkeep import Prompt, PromptBlocked, Verdict, acall, call, check, history, storage, wrap
+from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response
+
+
+def _client(content="Paris is the capital of France."):
+    return wrap(FakeClient(response=make_response(content=content)))
+
+
+def _aclient(content="Paris is the capital of France."):
+    return wrap(FakeAsyncClient(response=make_response(content=content)))
+
+
+def _usage_chunk():
+    return make_chunk(usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7))
+
+
+class TestVerdict:
+    def test_from_score_thresholds(self):
+        assert Verdict.from_score(0.9, 0.5).status == "ok"
+        assert Verdict.from_score(0.2, 0.5).status == "warn"
+        assert Verdict.from_score(0.5, 0.5).status == "ok"  # boundary is inclusive
+
+    def test_constructors(self):
+        assert Verdict.ok().status == "ok"
+        assert Verdict.warn("x").status == "warn"
+        assert Verdict.block("x").status == "block"
+        assert Verdict.rewrite("y").rewritten == "y"
+
+
+class TestPreChecks:
+    def test_block_raises_and_records_blocked_run(self):
+        @check.pre(name="no_pii")
+        def gate(ctx):
+            return Verdict.block("email") if "@" in ctx.rendered else Verdict.ok()
+
+        p = Prompt("sys", name="P", pre=[gate])
+        client = _client()
+        with pytest.raises(PromptBlocked, match="no_pii"):
+            client.chat.completions.create(
+                model="m",
+                messages=[
+                    {"role": "developer", "content": p},
+                    {"role": "user", "content": "reach me at a@b.com"},
+                ],
+            )
+        # The provider was never called.
+        assert client.calls == []
+        # A blocked run is still recorded, with the block verdict.
+        (run,) = history.all_runs()
+        assert run.status == "blocked"
+        (chk,) = storage.fetch_checks(run.run_key)
+        assert chk["name"] == "no_pii" and chk["status"] == "block"
+
+    def test_block_return_mode_yields_stub(self):
+        promptkeep.configure(on_block="return")
+
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.block("nope")
+
+        p = Prompt("sys", name="P", pre=[gate])
+        client = _client()
+        resp = client.chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert client.calls == []
+        assert resp.promptkeep_blocked.check == "gate"
+        assert resp.promptkeep.verification == "failed"
+
+    def test_ok_passes_through(self):
+        @check.pre(name="always_ok")
+        def gate(ctx):
+            return Verdict.ok()
+
+        p = Prompt("sys", name="P", pre=[gate])
+        client = _client()
+        resp = client.chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert len(client.calls) == 1
+        assert resp.promptkeep.verification == "ok"
+
+    def test_warn_is_recorded_but_continues(self):
+        @check.pre(name="length")
+        def gate(ctx):
+            return Verdict.warn("long") if len(ctx.rendered) > 2 else Verdict.ok()
+
+        p = Prompt("long system prompt", name="P", pre=[gate])
+        client = _client()
+        resp = client.chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert len(client.calls) == 1
+        assert resp.promptkeep.verification == "warn"
+
+    def test_rewrite_targets_only_the_last_message(self):
+        @check.pre(name="redact")
+        def gate(ctx):
+            if "SECRET" in (ctx.last_text or ""):
+                return Verdict.rewrite(ctx.last_text.replace("SECRET", "[redacted]"))
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[gate])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {"role": "user", "content": "my SECRET token"},
+            ],
+        )
+        sent = client.calls[0]["messages"]
+        assert sent[0]["content"] == "system"  # system prompt untouched
+        assert sent[1]["content"] == "my [redacted] token"
+
+    def test_last_text_reads_the_user_turn_not_the_system_prompt(self):
+        # A user message with image content is a list of blocks, not a string.
+        # A gate must still scan the user's text, not fall back to the system
+        # prompt (which would let a secret through on any vision call).
+        seen = {}
+
+        @check.pre(name="peek")
+        def gate(ctx):
+            seen["last_text"] = ctx.last_text
+            return Verdict.ok()
+
+        p = Prompt("you are a support agent", name="P", pre=[gate])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "here is my key sk-live-abc123"},
+                        {"type": "image_url", "image_url": {"url": "data:..."}},
+                    ],
+                },
+            ],
+        )
+        assert seen["last_text"] == "here is my key sk-live-abc123"
+
+    def test_rewrite_reaches_post_check_and_storage(self):
+        # A redaction rewrite must not stop at the wire: the post-check that
+        # audits the turn, and the input_text persisted to the DB, must both
+        # see the rewritten text — otherwise the raw secret is written back.
+        seen = {}
+
+        @check.pre(name="redact")
+        def redact(ctx):
+            if "SECRET" in (ctx.last_text or ""):
+                return Verdict.rewrite(ctx.last_text.replace("SECRET", "[redacted]"))
+            return Verdict.ok()
+
+        @check.post(name="audit", mode="blocking")
+        def audit(ctx):
+            seen["last_text"] = ctx.last_text
+            seen["rendered"] = ctx.rendered
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[redact], post=[audit])
+        client = _client()
+        with promptkeep.conversation("c-redact"):
+            client.chat.completions.create(
+                model="m",
+                messages=[
+                    {"role": "developer", "content": p},
+                    {"role": "user", "content": "my SECRET token"},
+                ],
+            )
+        # The post-check saw the redacted turn, not the raw one.
+        assert seen["last_text"] == "my [redacted] token"
+        assert "SECRET" not in seen["rendered"]
+        # And the stored turn is redacted too.
+        (turn,) = history.conversation("c-redact").turns
+        assert turn.input_text == "my [redacted] token"
+
+    def test_rewrite_keeps_the_original_and_names_the_check(self):
+        # The audit trail must show both sides of a rewrite: what the caller
+        # passed, what went out, and which check made the change. The
+        # post-check sees the same pair.
+        seen = {}
+
+        @check.pre(name="redact")
+        def redact(ctx):
+            return Verdict.rewrite((ctx.last_text or "").replace("SECRET", "[redacted]"))
+
+        @check.post(name="audit", mode="blocking")
+        def audit(ctx):
+            seen["original"] = ctx.original_text
+            seen["sent"] = ctx.last_text
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[redact], post=[audit])
+        resp = _client().chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {"role": "user", "content": "my SECRET token"},
+            ],
+        )
+        assert seen == {"original": "my SECRET token", "sent": "my [redacted] token"}
+
+        (run,) = history.all_runs()
+        assert run.run_key == resp.promptkeep.run_key
+        assert run.input_text == "my [redacted] token"
+        assert run.original_input_text == "my SECRET token"
+        (redact_verdict,) = [c for c in history.checks(run.run_key) if c.name == "redact"]
+        assert redact_verdict.rewritten == "my [redacted] token"
+        (audit_verdict,) = [c for c in history.checks(run.run_key) if c.name == "audit"]
+        assert audit_verdict.rewritten is None
+
+    def test_no_rewrite_means_no_original(self):
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.ok()
+
+        p = Prompt("system", name="P", pre=[gate])
+        _client().chat.completions.create(
+            model="m",
+            messages=[{"role": "developer", "content": p}, {"role": "user", "content": "hi"}],
+        )
+        (run,) = history.all_runs()
+        assert run.original_input_text is None
+
+    def test_rewrite_targets_multimodal_user_turn(self):
+        # A rewrite on a vision message must edit the user's text block and
+        # keep the image, not overwrite the system prompt.
+        @check.pre(name="redact")
+        def gate(ctx):
+            return Verdict.rewrite((ctx.last_text or "").replace("SECRET", "[redacted]"))
+
+        p = Prompt("system", name="P", pre=[gate])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[
+                {"role": "developer", "content": p},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "my SECRET token"},
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                    ],
+                },
+            ],
+        )
+        sent = client.calls[0]["messages"]
+        assert sent[0]["content"] == "system"  # system prompt untouched
+        text_blocks = [b for b in sent[1]["content"] if b.get("type") == "text"]
+        image_blocks = [b for b in sent[1]["content"] if b.get("type") == "image_url"]
+        assert text_blocks[0]["text"] == "my [redacted] token"
+        assert len(image_blocks) == 1  # image preserved
+
+
+class TestPostChecks:
+    def test_blocking_post_grades_output(self):
+        @check.post(name="grounded", mode="blocking")
+        def grade(ctx):
+            score = 0.9 if "Paris" in (ctx.output_text or "") else 0.1
+            return Verdict.from_score(score, 0.5)
+
+        p = Prompt("sys", name="P", post=[grade])
+        resp = _client("Paris is the capital.").chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        (chk,) = [c for c in resp.promptkeep.checks if c.name == "grounded"]
+        assert chk.status == "ok" and chk.score == 0.9
+
+    def test_async_post_lands_after_wait(self):
+        @check.post(name="slow", mode="async")
+        def grade(ctx):
+            time.sleep(0.03)
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="P", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert resp.promptkeep.verification == "pending"
+        resp.promptkeep.wait(timeout=5)
+        assert resp.promptkeep.verification == "ok"
+        names = [c["name"] for c in storage.fetch_checks(resp.promptkeep.run_key)]
+        assert "slow" in names
+
+    def test_async_post_still_runs_when_nothing_is_persisted(self):
+        # With tracking off there is no run to attach a verdict to, but the
+        # check itself must still run: wait() is how the caller reads it.
+        promptkeep.configure(enabled=False)
+
+        @check.post(name="judge", mode="async")
+        def grade(ctx):
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="P", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert resp.promptkeep.run_key is None
+        resp.promptkeep.wait(timeout=5)
+        assert [c.name for c in resp.promptkeep.checks] == ["judge"]
+        assert resp.promptkeep.verification == "ok"
+
+
+class TestSafety:
+    def test_crashing_check_never_breaks_the_call(self):
+        @check.post(name="boom", mode="blocking")
+        def grade(ctx):
+            raise RuntimeError("check exploded")
+
+        p = Prompt("sys", name="P", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        # Call still returns; the check is recorded as an error.
+        assert resp.choices[0].message.content == "Paris is the capital of France."
+        (chk,) = [c for c in resp.promptkeep.checks if c.name == "boom"]
+        assert chk.status == "error"
+
+    def test_llm_judge_check_does_not_record_itself(self):
+        """A check that calls an LLM must not create its own run row."""
+        judge = _client("0.9")
+
+        @check.post(name="judge", mode="blocking")
+        def grade(ctx):
+            r = judge.chat.completions.create(
+                model="m", messages=[{"role": "user", "content": "grade"}]
+            )
+            return Verdict.from_score(float(r.choices[0].message.content), 0.5)
+
+        p = Prompt("sys", name="P", post=[grade])
+        client = _client()
+        client.chat.completions.create(model="m", messages=[{"role": "developer", "content": p}])
+        # Exactly one run: the outer call. The judge's call was suppressed.
+        assert len(history.all_runs()) == 1
+
+    def test_pre_timeout_fails_open_by_default(self):
+        @check.pre(name="slow_gate", timeout=0.05)
+        def gate(ctx):
+            time.sleep(0.5)
+            return Verdict.block("too late")
+
+        p = Prompt("sys", name="P", pre=[gate])
+        client = _client()
+        # Fails open: the call proceeds despite the slow gate.
+        resp = client.chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert len(client.calls) == 1
+        (chk,) = [c for c in resp.promptkeep.checks if c.name == "slow_gate"]
+        assert chk.status == "warn"
+
+    def test_pre_timeout_can_fail_closed(self):
+        @check.pre(name="strict_gate", timeout=0.05, on_timeout="closed")
+        def gate(ctx):
+            time.sleep(0.5)
+            return Verdict.ok()
+
+        p = Prompt("sys", name="P", pre=[gate])
+        client = _client()
+        with pytest.raises(PromptBlocked, match="strict_gate"):
+            client.chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+        assert client.calls == []
+
+    def test_checks_under_load_do_not_spuriously_time_out(self):
+        # Each blocking check runs in its own thread, so its timeout measures
+        # its own execution, not time spent queued behind other checks. With
+        # far more concurrent calls than the old shared pool had workers (8),
+        # a comfortably-fast check must not report a timeout just because the
+        # pool was saturated.
+        import threading
+
+        @check.pre(name="gate", timeout=0.7)
+        def gate(ctx):
+            time.sleep(0.3)  # well under the 0.7s budget on its own
+            return Verdict.ok()
+
+        p = Prompt("sys", name="P", pre=[gate])
+        results = {}
+
+        def call(i):
+            resp = _client().chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+            results[i] = resp.promptkeep.verification
+
+        threads = [threading.Thread(target=call, args=(i,)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # All 24 ran concurrently and passed; none fell back to a timeout warn.
+        assert len(results) == 24
+        assert set(results.values()) == {"ok"}
+
+
+class TestScopes:
+    def test_global_and_per_call_checks_apply(self):
+        seen = []
+
+        @check.pre(name="global_gate")
+        def g(ctx):
+            seen.append("global")
+            return Verdict.ok()
+
+        @check.pre(name="call_gate")
+        def c(ctx):
+            seen.append("call")
+            return Verdict.ok()
+
+        promptkeep.configure(pre=[g])
+        client = _client()
+        client.chat.completions.create(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            promptkeep_pre=[c],
+        )
+        assert "global" in seen and "call" in seen
+
+    def test_check_kwargs_never_reach_the_provider(self):
+        @check.pre(name="g")
+        def g(ctx):
+            return Verdict.ok()
+
+        client = _client()
+        client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "hi"}], promptkeep_pre=[g]
+        )
+        assert "promptkeep_pre" not in client.calls[0]
+
+
+class TestPIIConversationFlow:
+    """The realistic story: a global PII gate guards a multi-turn chat, blocks
+    a pasted secret mid-conversation, and the retype goes through."""
+
+    def test_secret_blocked_midconversation_then_retype_passes(self):
+        import re
+
+        secret_re = re.compile(r"sk-[A-Za-z0-9\-]{6,}")
+
+        @check.pre(name="no_secrets")
+        def gate(ctx):
+            if ctx.last_text and secret_re.search(ctx.last_text):
+                return Verdict.block("secret in message")
+            return Verdict.ok()
+
+        promptkeep.configure(pre=[gate])  # global: guards every turn
+        client = _client()
+        sys_p = Prompt("You are support.", name="SUPPORT")
+        msgs = [{"role": "system", "content": sys_p}]
+
+        with promptkeep.conversation("sess-pii", title="401 help"):
+            # turn 0: normal, passes
+            msgs.append({"role": "user", "content": "my deploy returns 401"})
+            client.chat.completions.create(model="m", messages=msgs)
+            msgs.append({"role": "assistant", "content": "likely an expired key"})
+
+            # turn 1: user pastes a raw key -> blocked, never sent
+            msgs.append({"role": "user", "content": "here: sk-live-9fA2Bq7Xk"})
+            with pytest.raises(PromptBlocked, match="no_secrets"):
+                client.chat.completions.create(model="m", messages=msgs)
+            msgs.pop()  # app drops the leaked message
+
+            # turn 2: retype without the secret -> passes
+            msgs.append({"role": "user", "content": "it ends 7Xk, stopped today"})
+            client.chat.completions.create(model="m", messages=msgs)
+
+        convo = history.conversation("sess-pii")
+        statuses = [t.status for t in convo.turns]
+        # three recorded turns: ok, blocked, ok — in order.
+        assert statuses == ["ok", "blocked", "ok"]
+        # the blocked turn has the block verdict and no output.
+        blocked = convo.turns[1]
+        assert blocked.output_text is None
+        (chk,) = storage.fetch_checks(blocked.run_key)
+        assert chk["name"] == "no_secrets" and chk["status"] == "block"
+        # the secret never reached the provider on any call.
+        assert not any("sk-live" in str(c.get("messages")) for c in client.calls)
+
+
+class TestAsyncChecks:
+    """Checks on the AsyncOpenAI path."""
+
+    def test_async_pre_and_post_run(self):
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.ok()
+
+        @check.post(name="grounded", mode="blocking")
+        def grade(ctx):
+            return Verdict.from_score(0.9 if "Paris" in (ctx.output_text or "") else 0.1, 0.5)
+
+        p = Prompt("sys", name="AP", pre=[gate], post=[grade])
+        client = _aclient()
+
+        async def go():
+            return await client.chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+
+        resp = asyncio.run(go())
+        assert {c.name for c in resp.promptkeep.checks} == {"gate", "grounded"}
+        assert resp.promptkeep.verification == "ok"
+
+    def test_async_pre_block_raises(self):
+        @check.pre(name="no_pii")
+        def gate(ctx):
+            return Verdict.block("email") if "@" in ctx.rendered else Verdict.ok()
+
+        p = Prompt("sys", name="AP", pre=[gate])
+        client = _aclient()
+
+        async def go():
+            await client.chat.completions.create(
+                model="m",
+                messages=[
+                    {"role": "developer", "content": p},
+                    {"role": "user", "content": "a@b.com"},
+                ],
+            )
+
+        with pytest.raises(PromptBlocked, match="no_pii"):
+            asyncio.run(go())
+        assert client.calls == []
+
+    def test_awaited_resolves_async_post(self):
+        @check.post(name="slow", mode="async")
+        def grade(ctx):
+            time.sleep(0.03)
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="AP", post=[grade])
+        client = _aclient()
+
+        async def go():
+            resp = await client.chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+            assert resp.promptkeep.verification == "pending"
+            await resp.promptkeep.awaited(timeout=5)
+            return resp.promptkeep.verification
+
+        assert asyncio.run(go()) == "ok"
+
+
+class TestStreamingChecks:
+    """Checks on streamed responses: pre before the stream, post after it drains."""
+
+    def _chunks(self):
+        return [make_chunk(content="Par"), make_chunk(content="is!"), _usage_chunk()]
+
+    def test_sync_stream_pre_upfront_post_after_drain(self):
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.ok()
+
+        @check.post(name="grounded", mode="blocking")
+        def grade(ctx):
+            return Verdict.from_score(0.9 if "Paris" in (ctx.output_text or "") else 0.1, 0.5)
+
+        p = Prompt("sys", name="SP", pre=[gate], post=[grade])
+        client = wrap(FakeClient(stream_chunks=self._chunks()))
+        stream = client.chat.completions.create(
+            model="m", stream=True, messages=[{"role": "developer", "content": p}]
+        )
+        # pre-check is known upfront; post-check not yet.
+        assert [c.name for c in stream.promptkeep.checks] == ["gate"]
+        list(stream)  # drain
+        names = {c.name for c in stream.promptkeep.checks}
+        assert names == {"gate", "grounded"}
+        assert storage.fetch_all_runs()[0]["output_text"] == "Paris!"
+
+    def test_sync_stream_pre_block_never_starts_stream(self):
+        @check.pre(name="no_pii")
+        def gate(ctx):
+            return Verdict.block("email") if "@" in ctx.rendered else Verdict.ok()
+
+        p = Prompt("sys", name="SP", pre=[gate])
+        client = wrap(FakeClient(stream_chunks=self._chunks()))
+        with pytest.raises(PromptBlocked, match="no_pii"):
+            client.chat.completions.create(
+                model="m",
+                stream=True,
+                messages=[
+                    {"role": "developer", "content": p},
+                    {"role": "user", "content": "a@b.com"},
+                ],
+            )
+        assert client.calls == []
+
+    def test_async_stream_checks(self):
+        @check.post(name="grounded", mode="blocking")
+        def grade(ctx):
+            return Verdict.from_score(0.9 if "Paris" in (ctx.output_text or "") else 0.1, 0.5)
+
+        p = Prompt("sys", name="SP", post=[grade])
+        client = wrap(FakeAsyncClient(stream_chunks=self._chunks()))
+
+        async def go():
+            stream = await client.chat.completions.create(
+                model="m", stream=True, messages=[{"role": "developer", "content": p}]
+            )
+            _ = [c async for c in stream]
+            return stream
+
+        stream = asyncio.run(go())
+        assert {c.name for c in stream.promptkeep.checks} == {"grounded"}
+
+    def test_async_stream_finalize_does_not_stall_the_loop(self):
+        # A blocking post-check on an async stream must run off the event loop:
+        # finalizing inline would freeze every other task for the check's
+        # duration. Measure with a heartbeat running alongside the drain.
+        @check.post(name="slow", mode="blocking", timeout=5.0)
+        def slow(ctx):
+            time.sleep(0.3)
+            return Verdict.ok()
+
+        p = Prompt("sys", name="SP", post=[slow])
+        client = wrap(FakeAsyncClient(stream_chunks=self._chunks()))
+
+        async def go():
+            gaps = []
+
+            async def heartbeat(stop):
+                last = time.perf_counter()
+                while not stop.is_set():
+                    await asyncio.sleep(0.01)
+                    now = time.perf_counter()
+                    gaps.append(now - last)
+                    last = now
+
+            stop = asyncio.Event()
+            hb = asyncio.create_task(heartbeat(stop))
+            stream = await client.chat.completions.create(
+                model="m", stream=True, messages=[{"role": "developer", "content": p}]
+            )
+            _ = [c async for c in stream]  # drain -> triggers finalize + slow check
+            stop.set()
+            await hb
+            return gaps, stream
+
+        gaps, stream = asyncio.run(go())
+        # The check still ran and recorded.
+        assert {c.name for c in stream.promptkeep.checks} == {"slow"}
+        # The loop stayed responsive: no heartbeat gap anywhere near the 0.3s
+        # check. Inline finalize would have produced a ~0.3s gap.
+        assert max(gaps) < 0.15
+
+
+class TestCallHelper:
+    """promptkeep.call() / acall(): the explicit result shape."""
+
+    def test_call_returns_text_and_verification(self):
+        @check.post(name="grounded", mode="blocking")
+        def grade(ctx):
+            return Verdict.from_score(0.9 if "Paris" in (ctx.output_text or "") else 0.1, 0.5)
+
+        p = Prompt("sys", name="CP", post=[grade])
+        result = call(_client(), model="m", messages=[{"role": "developer", "content": p}])
+        assert result.text == "Paris is the capital of France."
+        assert result.verification == "ok"
+        assert result.run_key is not None
+        assert [c.name for c in result.checks] == ["grounded"]
+
+    def test_call_on_block_return_gives_failed_result(self):
+        promptkeep.configure(on_block="return")
+
+        @check.pre(name="gate")
+        def gate(ctx):
+            return Verdict.block("nope")
+
+        p = Prompt("sys", name="CP", pre=[gate])
+        result = call(_client(), model="m", messages=[{"role": "developer", "content": p}])
+        assert result.text is None
+        assert result.verification == "failed"
+
+    def test_acall_async(self):
+        p = Prompt("sys", name="CP")
+        client = _aclient()
+
+        async def go():
+            return await acall(client, model="m", messages=[{"role": "developer", "content": p}])
+
+        result = asyncio.run(go())
+        assert result.text == "Paris is the capital of France."
+
+    def test_call_rejects_streaming(self):
+        # A CallResult is settled; streaming has no reply/verdicts yet, so
+        # call() must refuse rather than build a result from an undrained proxy.
+        with pytest.raises(ValueError, match="non-streaming"):
+            call(_client(), model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
+
+    def test_call_warns_on_unwrapped_client(self, caplog):
+        # An unwrapped client runs no checks, so verification is a meaningless
+        # "ok" — call() should warn rather than pretend it verified anything.
+        raw = FakeClient(response=make_response())  # not wrapped
+        with caplog.at_level("WARNING", logger="promptkeep"):
+            result = call(raw, model="m", messages=[{"role": "user", "content": "hi"}])
+        assert result.verification == "ok"
+        assert any("not wrapped" in r.message for r in caplog.records)
+
+
+class TestDurability:
+    """Checked calls in background write mode: nothing on the hot path, and
+    flush() means every verdict is on disk."""
+
+    def test_checked_call_goes_through_the_background_writer(self, monkeypatch):
+        # Hold the writer thread on a gate: if the checked call still wrote
+        # inline, the run would be on disk before the gate opens.
+        import threading
+
+        promptkeep.configure(write_mode="background")
+        gate = threading.Event()
+        real_write_batch = storage.write_batch
+
+        def held(items):
+            gate.wait(timeout=10)
+            real_write_batch(items)
+
+        monkeypatch.setattr(storage, "write_batch", held)
+
+        @check.pre(name="gate")
+        def pre(ctx):
+            return Verdict.ok()
+
+        @check.post(name="grade", mode="blocking")
+        def post(ctx):
+            return Verdict.from_score(0.9, 0.5)
+
+        p = Prompt("sys", name="BG", pre=[pre], post=[post])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        handle = resp.promptkeep
+        assert handle.run_key  # identity exists before the row does
+        assert handle.verification == "ok"
+        assert history.all_runs() == []  # not written inline
+
+        gate.set()
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert run.run_key == handle.run_key
+        assert {c.name for c in history.checks(run.run_key)} == {"gate", "grade"}
+
+    def test_flush_waits_for_async_post_checks(self):
+        # No wait() on the handle: flush alone must be enough for the verdict
+        # to be on disk, because it waits for the check and then the queue.
+        promptkeep.configure(write_mode="background")
+
+        @check.post(name="slow_judge", mode="async")
+        def grade(ctx):
+            time.sleep(0.2)
+            return Verdict.from_score(0.8, 0.5)
+
+        p = Prompt("sys", name="BG", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert resp.promptkeep.verification == "pending"
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        (chk,) = history.checks(run.run_key)
+        assert chk.name == "slow_judge" and chk.score == 0.8
+
+    def test_flush_reports_a_timeout_while_a_check_is_still_running(self):
+        promptkeep.configure(write_mode="background")
+
+        @check.post(name="stuck", mode="async")
+        def grade(ctx):
+            time.sleep(0.6)
+            return Verdict.ok()
+
+        p = Prompt("sys", name="BG", post=[grade])
+        resp = _client().chat.completions.create(
+            model="m", messages=[{"role": "developer", "content": p}]
+        )
+        assert promptkeep.flush(timeout=0.05) is False
+        # Let it finish so the next test starts clean.
+        resp.promptkeep.wait(timeout=5)
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert [c.name for c in history.checks(run.run_key)] == ["stuck"]
+
+    def test_blocked_call_is_recorded_in_background_mode_too(self):
+        promptkeep.configure(write_mode="background")
+
+        @check.pre(name="no_pii")
+        def gate(ctx):
+            return Verdict.block("email")
+
+        p = Prompt("sys", name="BG", pre=[gate])
+        with pytest.raises(PromptBlocked):
+            _client().chat.completions.create(
+                model="m", messages=[{"role": "developer", "content": p}]
+            )
+        assert promptkeep.flush(timeout=5) is True
+        (run,) = history.all_runs()
+        assert run.status == "blocked"
+        (chk,) = history.checks(run.run_key)
+        assert chk.status == "block"

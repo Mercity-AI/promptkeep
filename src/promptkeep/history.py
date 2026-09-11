@@ -30,13 +30,19 @@ class VersionInfo:
 class RunInfo:
     """One recorded execution: which version ran, with what, and what came back.
 
+    run_key is the run's identity — what response.promptkeep.run_key carries
+    and what history.checks() takes. id is the row number, kept for display.
+
     version/prompt_name are None for a conversation turn that involved no
     wrapped Prompt (a plain follow-up message) — there's simply no lineage
     to attach it to. conversation_id/turn_index/input_text are None for a
-    run recorded outside any conversation.
+    run recorded outside any conversation. original_input_text is set only
+    when a pre-check rewrote the turn: input_text is then what was sent, and
+    this is what the caller originally passed.
     """
 
     id: int
+    run_key: str
     prompt_name: Optional[str]
     version: Optional[int]
     variables: Optional[Dict[str, Any]]
@@ -56,6 +62,7 @@ class RunInfo:
     conversation_id: Optional[str] = None
     turn_index: Optional[int] = None
     input_text: Optional[str] = None
+    original_input_text: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +96,53 @@ class ConversationSummary:
     turn_count: int
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class CheckInfo:
+    """One check verdict recorded against a run. rewritten is the replacement
+    text a rewriting pre-check produced; None for every other verdict."""
+
+    name: str
+    phase: str  # 'pre' | 'post'
+    status: str  # 'ok' | 'warn' | 'block' | 'error'
+    score: Optional[float]
+    message: Optional[str]
+    rewritten: Optional[str] = None
+
+
+def checks(run_key: str) -> List[CheckInfo]:
+    """Every check verdict for a run (by its key), oldest first."""
+    return [
+        CheckInfo(
+            name=row["name"],
+            phase=row["phase"],
+            status=row["status"],
+            score=row["score"],
+            message=row["message"],
+            rewritten=row["rewritten"],
+        )
+        for row in storage.fetch_checks(run_key)
+    ]
+
+
+def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
+    """The one-word headline for a run's checks, for a badge in the UI.
+
+    'blocked' if the call was gated, else 'failed' if any check errored,
+    'warn' if any warned, 'ok' if checks ran and all passed, None if the run
+    had no checks at all.
+    """
+    if run_status == "blocked":
+        return "blocked"
+    if not check_infos:
+        return None
+    statuses = {c.status for c in check_infos}
+    if "block" in statuses or "error" in statuses:
+        return "failed"
+    if "warn" in statuses:
+        return "warn"
+    return "ok"
 
 
 def _load_json(value: Optional[str]):
@@ -139,6 +193,7 @@ def _run_info_from_row(row: Dict[str, Any]) -> RunInfo:
     (older query shapes) default to None via dict.get."""
     return RunInfo(
         id=row["id"],
+        run_key=row["run_key"],
         prompt_name=row.get("prompt_name"),
         version=row.get("version"),
         variables=_load_json(row.get("variables")),
@@ -158,6 +213,7 @@ def _run_info_from_row(row: Dict[str, Any]) -> RunInfo:
         conversation_id=row.get("conversation_id"),
         turn_index=row.get("turn_index"),
         input_text=row.get("input_text"),
+        original_input_text=row.get("original_input_text"),
     )
 
 

@@ -54,6 +54,13 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   in-process counters (`storage.reserve_turn_index`, reserve semantics — calling it claims the
   turn), because the DB's `MAX(turn_index)` is stale while rows sit in the queue. Tests run
   `write_mode="sync"` via the conftest fixture.
+- **Runs are identified by a client-minted `run_key`** (`storage.new_run_key`, a UUID), never
+  by the integer row id. That is what lets checked calls use the background writer too: the
+  `RunHandle` and any late verdict name the run before its row exists. Check verdicts travel
+  the same queue (`_kind: "check"` items, resolved to the run by key at write time; a verdict
+  whose run was evicted is skipped, not raised). `promptkeep.flush()` lives in `tracking.py`:
+  it waits for in-flight async post-checks (`checks.wait_for_pending`), then `writer.drain()`.
+  A pre-check rewrite stores both sides: `runs.original_input_text` and `checks.rewritten`.
 - **The wrapper never monkey-patches the `openai` module** — only the object passed to
   `wrap()` gets its `create` replaced (idempotent via `_pm_instrumented`). Message dicts are
   copied, never mutated. Streaming defers run recording until the stream ends
@@ -61,6 +68,26 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 - **Rendering is lenient by default** (`rendering.py`): unknown `{placeholders}` and JSON
   braces pass through literally; unparseable templates return unrendered. Strict mode is
   opt-in per Prompt or via `configure(strict=True)`.
+- **Checks** (`checks.py`) are user functions returning a `Verdict`. `pre` checks gate the
+  request (block/rewrite/warn/ok) before the provider call; `post` checks audit the response
+  (async by default via a shared `ThreadPoolExecutor`, blocking opt-in). Attach at three
+  scopes merged most-specific-wins: global (`configure(pre=/post=)`) < prompt (`Prompt(pre=/
+  post=)`) < per-call (`promptkeep_pre=/promptkeep_post=` kwargs, stripped before the request).
+  A checked call records its run through the normal write path (background queue included):
+  the `RunHandle` (`response.promptkeep`) carries the client-minted `run_key`, pre +
+  blocking-post verdicts bundle into the run row, and async-post verdicts go through
+  `storage.record_check` when they land — queued behind their run in background mode. Two invariants: a crashing/timing-out check never
+  breaks the call (recorded `status="error"`/fail-open `warn`; `on_timeout="closed"` opts a
+  pre-check into fail-closed), and check execution runs under `checks.suppress()` — a
+  contextvar the wrapper honors to make an LLM-judge check's own calls untracked, so it can't
+  recurse. Checks run on all four paths — sync/async × non-streaming/streaming; the async and
+  streaming orchestrators share the same pure-sync phase helpers (`_checked_pre/_block/_post`),
+  the async ones running each phase via `asyncio.to_thread` so a slow check never blocks the
+  loop, and streaming running post-checks in `_CheckedStreamRecorder.finish()` (output only
+  exists once the stream drains) into a `RunHandle` already attached to the proxy.
+  `promptkeep.call()`/`acall()` return the explicit `CallResult` shape; `RunHandle.awaited()`
+  is the async twin of `wait()`. Schema v4 added the `checks` table (the label store for later
+  optimization); v5 added `run_key`, `original_input_text`, and `checks.rewritten`.
 
 ## SQLite/peewee specifics
 

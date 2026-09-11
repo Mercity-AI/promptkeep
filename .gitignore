@@ -6,6 +6,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-.promptkeep.db*
+*.promptkeep.db*
 testing.db*
-demo.promptkeep.db*

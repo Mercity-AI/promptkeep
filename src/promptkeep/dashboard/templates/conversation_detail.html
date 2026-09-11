@@ -14,12 +14,30 @@
     {% if t.prompt_name %}<span class="sep">·</span><a href="/prompts/{{ t.prompt_name }}">{{ t.prompt_name }}</a> <span class="badge">v{{ t.version }}</span>{% endif %}
     {% if t.model %}<span class="sep">·</span><span class="mono">{{ t.model }}</span>{% endif %}
     {% if t.total_tokens is not none %}<span class="sep">·</span><span class="num">{{ t.total_tokens }} tokens</span>{% endif %}
-    <span class="sep">·</span><span class="pill {{ 'status-error' if t.status == 'error' else '' }}">{{ t.status }}</span>
+    <span class="sep">·</span><span class="pill status-{{ t.status }}">{{ t.status }}</span>
   </div>
-  {% if t.input_text %}
+  {% if t.original_input_text %}
+  <div class="field input"><div class="label">Input · as received</div>{{ t.original_input_text }}</div>
+  <div class="field input"><div class="label">Input · as sent (rewritten by a check)</div>{{ t.input_text }}</div>
+  {% elif t.input_text %}
   <div class="field input"><div class="label">Input</div>{{ t.input_text }}</div>
   {% endif %}
+  {% if t.status != 'blocked' %}
   <div class="field"><div class="label">Output</div>{{ t.output_text or '—' }}</div>
+  {% endif %}
+  {% set tc = turn_checks.get(t.run_key) %}
+  {% if tc %}
+  <div class="field">
+    <div class="label">Checks</div>
+    <div class="chips">
+      {% for c in tc %}
+      <span class="chip s-{{ c.status }}" title="{{ c.message or '' }}">
+        <span class="phase">{{ c.phase }}</span>{{ c.name }}: {{ c.status }}{% if c.score is not none %} ({{ c.score }}){% endif %}
+      </span>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
 </div>
 {% endfor %}
 {% endblock %}
