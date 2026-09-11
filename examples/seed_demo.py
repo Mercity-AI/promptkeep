@@ -380,6 +380,11 @@ checked_call(
 
 # --- cosmetic pass: spread timestamps over the past week, add latencies ----------
 
+# Runs are persisted by the background writer; make sure every row is on disk
+# before rewriting them with plain sqlite3, or the writer lands them afterwards
+# with their real (seconds-apart) timestamps.
+promptkeep.flush(timeout=10)
+
 conn = sqlite3.connect(DB_PATH)
 run_ids = [r[0] for r in conn.execute("SELECT id FROM runs ORDER BY id")]
 now = datetime.now(timezone.utc)

@@ -16,7 +16,9 @@ from promptkeep import Prompt, history, prompt, wrap
 DB = Path(__file__).with_name("playground.promptkeep.db")
 for suffix in ("", "-wal", "-shm"):
     Path(str(DB) + suffix).unlink(missing_ok=True)
-promptkeep.configure(db_path=DB, enabled=True)
+# write_mode="sync": this script reads back the run it just recorded, and the
+# default background writer may not have landed it yet.
+promptkeep.configure(db_path=DB, enabled=True, write_mode="sync")
 
 print("=" * 70)
 print("1) BASIC PROMPT + VERSION 1")
