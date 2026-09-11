@@ -39,6 +39,7 @@ promptkeep = "promptkeep.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-cov>=5",
     "ruff>=0.4",
     "fastapi>=0.110",
     "uvicorn>=0.29",
@@ -49,8 +50,20 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/promptkeep"]
 
+[tool.hatch.build.targets.sdist]
+# Ship what a downstream builder needs and nothing that only makes sense in
+# the repository (planning docs, CI config, demo scripts, the lockfile).
+only-include = ["src", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["promptkeep"]
+
+[tool.coverage.report]
+# cli.py is the `serve` launcher: it starts uvicorn, which no unit test should.
+omit = ["*/promptkeep/cli.py"]
 
 [tool.ruff]
 line-length = 100

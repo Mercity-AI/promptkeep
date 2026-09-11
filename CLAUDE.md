@@ -9,10 +9,17 @@ uv sync                                          # install (editable) + dev deps
 uv run pytest -q                                 # full test suite
 uv run pytest tests/test_storage.py -q           # one file
 uv run pytest tests/test_prompt.py::TestVersioning::test_changed_text_bumps_version  # one test
-uv run ruff format src tests && uv run ruff check src tests   # format + lint (line-length 100)
+uv run pytest -q --cov --cov-fail-under=85       # what the CI coverage gate runs
+uv run ruff format src tests examples && uv run ruff check src tests examples   # line-length 100
+uv run python examples/playground.py             # narrated sandbox (throwaway DB, no network)
 uv build                                         # build sdist+wheel into dist/
-uv publish --token pypi-...                      # release (bump version in pyproject.toml first)
 ```
+
+CI (`.github/workflows/ci.yml`) runs ruff, the test suite on Python 3.9–3.14 across Linux, macOS
+and Windows, and an 85% coverage gate, on every push to `main` and every PR. Releases: bump
+`version` in `pyproject.toml` (the only place it lives — `__version__` reads it back from
+package metadata), add the `CHANGELOG.md` entry, tag `vX.Y.Z` and push the tag;
+`.github/workflows/release.yml` builds and publishes to PyPI via Trusted Publishing.
 
 Published on PyPI as `promptkeep`; GitHub remote is `Mercity-AI/promptkeep`. The directory is
 still named `prompt-manager` — everything inside uses `promptkeep`. `plan.md` is the original

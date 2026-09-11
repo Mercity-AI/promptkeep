@@ -1,8 +1,9 @@
-"""Playground for promptkeep — run with `uv run python testing.py`.
+"""Playground for promptkeep — run with `uv run python examples/playground.py`.
 
 Not part of the test suite; a narrated sandbox to watch versioning, lineage,
 run tracking, and the revert-to-old-text behavior actually happen. Uses its
-own throwaway DB (testing.db) and starts fresh every run.
+own throwaway DB (playground.promptkeep.db, next to this file) and starts
+fresh every run.
 """
 
 from pathlib import Path
@@ -12,9 +13,9 @@ import promptkeep
 from promptkeep import Prompt, history, prompt, wrap
 
 # Fresh throwaway DB every run so the output below is deterministic.
-DB = Path("testing.db")
-for leftover in (DB, Path("testing.db-wal"), Path("testing.db-shm")):
-    leftover.unlink(missing_ok=True)
+DB = Path(__file__).with_name("playground.promptkeep.db")
+for suffix in ("", "-wal", "-shm"):
+    Path(str(DB) + suffix).unlink(missing_ok=True)
 promptkeep.configure(db_path=DB, enabled=True)
 
 print("=" * 70)
@@ -34,8 +35,11 @@ print("=" * 70)
 print("2) CHANGE THE TEXT -> NEW VERSION")
 print("=" * 70)
 
-p2 = Prompt("You are a strict code reviewer. Focus on {focus}. Be terse.",
-            {"focus": "correctness"}, name="REVIEW")
+p2 = Prompt(
+    "You are a strict code reviewer. Focus on {focus}. Be terse.",
+    {"focus": "correctness"},
+    name="REVIEW",
+)
 print(f"edited text version: {p2.version}")
 assert p2.version == 2
 
@@ -84,9 +88,9 @@ def summarize_prompt(style="bullet points", max_words=50):
     return f"Summarize the following text as {{style}}. {constraint}\n\nText: {{text}}"
 
 
-d1 = summarize_prompt()                # default max_words=50 -> one template
-d2 = summarize_prompt(max_words=50)    # same computed template -> same version
-d3 = summarize_prompt(max_words=100)   # different computed template -> new version
+d1 = summarize_prompt()  # default max_words=50 -> one template
+d2 = summarize_prompt(max_words=50)  # same computed template -> same version
+d3 = summarize_prompt(max_words=100)  # different computed template -> new version
 print(f"default call:        v{d1.version}")
 print(f"same args again:     v{d2.version}  (deduped)")
 print(f"max_words=100:       v{d3.version}  (template genuinely changed)")
@@ -106,7 +110,8 @@ class FakeCompletions:
         content = kwargs["messages"][0]["content"]
         print(f"  [the API received]: {type(content).__name__} -> {content!r}")
         return SimpleNamespace(
-            id="resp_demo", model=kwargs["model"],
+            id="resp_demo",
+            model=kwargs["model"],
             usage=SimpleNamespace(prompt_tokens=21, completion_tokens=8, total_tokens=29),
             choices=[SimpleNamespace(message=SimpleNamespace(content="LGTM with nits."))],
         )
@@ -122,7 +127,7 @@ class FakeOpenAI:
 client = wrap(FakeOpenAI())
 client.chat.completions.create(
     model="gpt-5.5",
-    messages=[{"role": "developer", "content": p3}],   # p3 is the reverted v1 prompt
+    messages=[{"role": "developer", "content": p3}],  # p3 is the reverted v1 prompt
 )
 
 (run,) = history.runs("REVIEW")
@@ -152,7 +157,9 @@ assert r3.version == 1
 # But structure is respected: same words, different repetition pattern.
 s1 = Prompt("Compare {a} with {a}.", name="COMPARE")
 s2 = Prompt("Compare {a} with {b}.", name="COMPARE")
-print(f"'{{a}} with {{a}}' vs '{{a}} with {{b}}':  v{s1.version} vs v{s2.version}  (different — one value twice != two values)")
+print(
+    f"'{{a}} with {{a}}' vs '{{a}} with {{b}}':  v{s1.version} vs v{s2.version}  (different — one value twice != two values)"
+)
 assert (s1.version, s2.version) == (1, 2)
 
 # And actual wording changes still bump the version, of course.

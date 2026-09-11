@@ -5,6 +5,8 @@ Public API:
     from promptkeep import Prompt, prompt, wrap, configure, history
 """
 
+from importlib.metadata import PackageNotFoundError, version as _distribution_version
+
 from . import history
 from .checks import CheckContext, PromptBlocked, Verdict, acall, call, check, suppress
 from .config import configure, get_settings
@@ -15,7 +17,12 @@ from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
 from .tracking import flush
 
-__version__ = "0.2.0"
+try:
+    # pyproject.toml is the single source of truth for the version; this reads
+    # it back from the installed distribution so the two can never disagree.
+    __version__ = _distribution_version("promptkeep")
+except PackageNotFoundError:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "Prompt",
