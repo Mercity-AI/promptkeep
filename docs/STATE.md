@@ -601,7 +601,7 @@ fifteen seconds" shape (no GIF).
 2. `uv run python examples/seed_demo.py` then `promptkeep serve --db demo.promptkeep.db` — see
    versioning, conversations, checks and run tracking in the dashboard; `CHANGELOG.md` for
    what shipped when
-3. `CLAUDE.md` — the design decisions and the SQLite traps, already written down
+3. `AGENTS.md` — the design decisions and the SQLite traps, already written down
 4. `src/promptkeep/prompts.py`, `storage.py`, `writer.py` — the three files that carry the model
 5. `docs/ROADMAP-v1.md` — where this goes next; section 7 above is the scorecard against it
 6. `plan.md` — the original design doc, kept as history. **Do not update it to match code**
