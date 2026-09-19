@@ -12,7 +12,7 @@ from typing import Any
 
 from . import storage
 from .config import get_settings
-from .rendering import extract_placeholders, render
+from .rendering import extract_placeholders, render, template_hash
 
 # Sentinel distinguishing "registration not attempted yet" from "attempted,
 # got None" (tracking disabled or DB write failed).
@@ -197,7 +197,7 @@ class Prompt:
 
     def format(self, **overrides: Any) -> Prompt:
         """Return a new Prompt with updated variables (same name/template/version)."""
-        return Prompt(
+        derived = Prompt(
             self._template,
             {**self._variables, **overrides},
             name=self._name,
@@ -208,6 +208,11 @@ class Prompt:
             pre=self._pre,
             post=self._post,
         )
+        # Same name and template means the same version: a registration already
+        # made carries over. (A failed one doesn't — the derived prompt retries.)
+        if isinstance(self._registration, tuple):
+            object.__setattr__(derived, "_registration", self._registration)
+        return derived
 
     def _effective_strict(self) -> bool:
         """Per-prompt strict flag if set, otherwise the global configured default."""
@@ -240,6 +245,43 @@ class Prompt:
         """This template's version number under its name (None if tracking is off)."""
         registration = self._ensure_registered()
         return registration[1] if registration else None
+
+    @classmethod
+    def variants(cls, name: str) -> list[Prompt]:
+        """Every stored version of ``name`` as a usable Prompt, oldest first.
+
+            v4, v5 = Prompt.variants("REVIEW_SYSTEM")[-2:]
+            chosen = random.choice([v4, v5]).format(focus="security")   # your own A/B
+            client.chat.completions.create(..., messages=[{"role": "system", "content": chosen}])
+
+        The code only ever holds the *current* template; this is how an older
+        one comes back — to re-run a session against it, to compare it with
+        its successor, or to split traffic between two. Each variant already
+        knows its version (``.version`` costs no database round-trip) and
+        records its runs under it. A version stores a template, never
+        variables — those are run data — so variants come back with none:
+        ``.format(**variables)`` them. Checks aren't stored either.
+
+        An explicit read: it opens the database (so not at import time) and
+        raises if the database is broken. Empty for an unknown name, or when
+        tracking is disabled.
+        """
+        found = []
+        for row in storage.version_rows(name):
+            # A version registered with exact_match=True hashed its raw text;
+            # rebuild it the same way, or it would re-register as a new version.
+            exact = template_hash(row["template"]) != row["template_hash"]
+            variant = cls(
+                row["template"],
+                name=name,
+                exact_match=exact,
+                source=row["source"],
+                fn_source_hash=row["fn_source_hash"],
+            )
+            # It came from the lineage, so it is registered: no lookup needed.
+            object.__setattr__(variant, "_registration", (row["id"], row["version"]))
+            found.append(variant)
+        return found
 
     # --- dunders ------------------------------------------------------------
 

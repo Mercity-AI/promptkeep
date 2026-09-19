@@ -78,6 +78,12 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   subclass.
 - **Prompt is frozen** (`__slots__` + blocked `__setattr__`); `.format()` derives a new one.
   Immutability is what keeps an object consistent with the version hash it registered under.
+- **`Prompt.variants(name)` rebuilds stored versions as Prompts** with `_registration`
+  pre-seeded from the row, so a variant is bound to the version it was loaded from. It must
+  reproduce the identity the version was hashed under — `exact_match` is inferred by
+  comparing the stored hash with the normalized one — or loading would mint a new version.
+  The lineage query lives in `storage.version_rows` (shared with `history.versions`) because
+  `prompts` sits below `history` in the module graph.
 - **Version registration is lazy** — first `.text`/`.render()`/`.version` access, never at
   construction. Prompts are defined at module import time; import must not do I/O.
 - **All implicit write paths are exception-shielded** (`storage.register_version`,

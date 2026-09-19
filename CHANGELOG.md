@@ -32,6 +32,12 @@ public APIs; each such change is called out below.
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
 
+- `Prompt.variants(name)` returns every stored version of a prompt as a
+  usable `Prompt`, oldest first — to re-run against an old template, or split
+  traffic between two. A variant knows its version with no database lookup,
+  records its runs under it, and never creates a version (an `exact_match`
+  version is rebuilt as one). `.format()` now carries a prompt's registration
+  over to the prompt it derives, saving that lookup everywhere.
 - The rest of the CLI: `promptkeep list`, `versions`, `diff` (coloured on a
   terminal), `runs`, `convo`, `stats` and `export --format jsonl` (each run
   with its check verdicts and feedback). Plain text, no new dependencies,

@@ -224,6 +224,23 @@ path waits for the database. Async verdicts queue behind their run row, and
 `promptkeep.flush()` waits for any post-check still running before draining the
 queue: once it returns, every verdict is on disk.
 
+## Older versions, back as Prompts
+
+Your code only ever holds the *current* template. `Prompt.variants()` brings the stored ones
+back as real Prompt objects, oldest first:
+
+```python
+v4, v5 = Prompt.variants("REVIEW_SYSTEM")[-2:]
+v4.version, v4.raw                                         # 4, the template as it was
+
+chosen = random.choice([v4, v5]).format(focus="security")  # a home-made A/B split
+client.chat.completions.create(model=..., messages=[{"role": "system", "content": chosen}, ...])
+```
+
+Each variant records its runs under its own version — so `promptkeep stats REVIEW_SYSTEM`
+compares the two on real traffic — and loading one never creates a version. A version stores
+a template, not variables (those are run data), so `.format(...)` them in.
+
 ## Feedback
 
 Checks label a run automatically; `feedback()` is the label a person (or a downstream

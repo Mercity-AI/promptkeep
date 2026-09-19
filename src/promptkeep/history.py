@@ -391,23 +391,8 @@ def _run_info(row: dict[str, Any]) -> RunInfo:
 
 def versions(name: str) -> list[VersionInfo]:
     """All versions of a prompt, oldest first."""
-    if not _ready():
-        return []
-    query = (
-        PromptVersionRecord.select(
-            PromptVersionRecord.version,
-            PromptVersionRecord.template,
-            PromptVersionRecord.template_hash,
-            PromptVersionRecord.source,
-            PromptVersionRecord.fn_source_hash,
-            PromptVersionRecord.created_at,
-        )
-        .join(PromptRecord)
-        .where(PromptRecord.name == name)
-        .order_by(PromptVersionRecord.version)
-        .dicts()
-    )
-    return [VersionInfo(**row) for row in query]
+    rows = storage.version_rows(name)
+    return [VersionInfo(**{k: v for k, v in row.items() if k != "id"}) for row in rows]
 
 
 def diff(name: str, old: int, new: int) -> str:

@@ -216,6 +216,35 @@ def _register(
     raise RuntimeError(f"could not register a version for prompt {name!r} after retries")
 
 
+def version_rows(name: str) -> list[dict[str, Any]]:
+    """A prompt's stored versions, oldest first, as plain rows (id included).
+
+    The one lineage query, shared by its two readers: ``history.versions``
+    (rows -> VersionInfo) and ``Prompt.variants`` (rows -> Prompt objects).
+    It lives here rather than in ``history`` because ``prompts`` sits below
+    ``history`` in the module graph and needs it too. An explicit read, so it
+    raises normally; empty when tracking is disabled or the name is unknown.
+    """
+    if get_db() is None:
+        return []
+    query = (
+        PromptVersionRecord.select(
+            PromptVersionRecord.id,
+            PromptVersionRecord.version,
+            PromptVersionRecord.template,
+            PromptVersionRecord.template_hash,
+            PromptVersionRecord.source,
+            PromptVersionRecord.fn_source_hash,
+            PromptVersionRecord.created_at,
+        )
+        .join(PromptRecord)
+        .where(PromptRecord.name == name)
+        .order_by(PromptVersionRecord.version)
+        .dicts()
+    )
+    return list(query)
+
+
 # --- conversations ----------------------------------------------------------------
 
 # Conversations memoized per (db, external_id), and turn numbers handed out
