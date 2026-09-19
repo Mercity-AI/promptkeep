@@ -1,8 +1,9 @@
 # promptkeep — Current State
 
-*Snapshot: 11 September 2026 · `main` after the v0.3 batch (hygiene, 0.3.0 release prep,
-conversation read model, sampling/redaction) · v0.2.0 on PyPI, **v0.3.0 tagged and built but
-not yet published** · no open branches*
+*Snapshot: 19 September 2026 · `main` after the refactor (PR #4) and the reach batch — cost
+tracking, `feedback()`, the Responses API adapter with automatic conversation chaining, the
+full CLI, `Prompt.variants()` · v0.2.0 on PyPI, **nothing since is published** · one open
+branch: `typing` (`mypy --strict` clean, awaiting a PR)*
 
 This is the handoff document: what the library is, what is actually built, how to use it, and
 where the edges are. Anyone picking this project up should be able to read this and be
@@ -49,13 +50,13 @@ runs off it.
 |---|---|
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
-| **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. |
-| **Tests** | 253 passing (~2.9s, no network), verified locally on Python 3.11 and 3.14 on macOS. Coverage 91%. |
-| **Size** | ~4,900 LOC Python + ~450 LOC HTML templates · ~3,500 LOC tests |
+| **Branches** | `main`, plus `typing` (strict typing, to be merged by PR). PR #1 merged `feat/conversations-dashboard`, PR #3 `feat/checks`, PR #4 `refactor`; feature batches are committed straight to main, one commit each. |
+| **Tests** | 398 (395 + 3 that build the real OpenAI SDK's objects and skip without it), ~4s, no network, verified locally on Python 3.11 on macOS. Coverage 94%. |
+| **Size** | ~5,700 LOC Python + ~450 LOC HTML templates · ~5,000 LOC tests |
 | **Python** | ≥ 3.11. **No CI yet**: the workflows (ruff, the suite on 3.11–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
-| **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Still OpenAI `chat.completions`-only. |
+| **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Two provider surfaces, both OpenAI-shaped (`chat.completions`, Responses) — which covers OpenRouter and every compatible endpoint; no Anthropic or LiteLLM adapter yet. |
 
 ```bash
 pip install promptkeep            # core
@@ -291,7 +292,22 @@ promptkeep serve                                   # http://127.0.0.1:8420, read
 promptkeep serve --db path/to/prompts.db --port 8420
 ```
 
-`serve` is the **only** CLI subcommand. It launches a FastAPI + Jinja2 app that is read-only,
+The read commands — plain aligned text, no dependencies, `--db PATH` on each, and none of
+them will create a database that isn't there:
+
+```bash
+promptkeep list                              # prompts, version and run counts
+promptkeep versions NAME [--full]            # the lineage
+promptkeep diff NAME 4 5                     # coloured on a terminal
+promptkeep runs [NAME] [--version N] [--limit N]
+promptkeep convo EXTERNAL_ID                 # transcript, with verdicts and feedback per turn
+promptkeep stats NAME                        # per version: runs, errors, pass rate, scores, latency, tokens, cost
+promptkeep export [--prompt NAME] [-o FILE]  # JSONL, each run with its labels
+```
+
+Each is a presentation of a `history` read; `stats` is backed by `history.stats(name)`.
+
+`serve` launches a FastAPI + Jinja2 app that is read-only,
 localhost-bound, and fully offline (no CDN assets, no account, automatic light/dark). Pages:
 prompts overview → version lineage → diff between two versions; runs (filterable by prompt and
 version); conversations (filterable the same way) → turn-by-turn transcript with the driving
@@ -386,6 +402,32 @@ Not built: `promptkeep.feedback()`.
 
 ---
 
+### 4.14 The reach batch *(19 September 2026)*
+
+**Cost.** `runs.cost_usd` (schema v6) is what the provider *reported* — adapters read
+`usage.cost`, which OpenRouter sends on every response and on a stream's last chunk. It is
+never estimated; OpenAI's own API reports nothing, so those runs are `None`. Surfaces as
+`RunInfo.cost_usd`, `ConversationInfo.total_cost`, the dashboard, the CLI.
+
+**Feedback.** `promptkeep.feedback(run_key, score=, label=, comment=)` stores a judgement as
+a `checks` row with `phase="feedback"` — same write path as a late verdict, no new table.
+Every recorded call (not only checked ones) now carries `response.promptkeep.run_key`.
+
+**Responses API.** `wrap()` also instruments `client.responses.create` (provider
+`"openai-responses"`): Prompts as `instructions`, the `input` string, or inside `input`
+items; typed stream events. A call with `previous_response_id` joins the conversation of the
+run that produced that response; a chain's first call is adopted into a new conversation
+(`response:<id>`) as turn 0 — through an in-process index and a queued adoption, so it holds
+in background mode (schema v7 indexes `runs.response_id`). Explicit conversations win;
+untracked chains are not followed.
+
+**Variants.** `Prompt.variants(name)` returns every stored version as a usable Prompt, bound
+to its version. No weighted routing — `compare()` and A/B routing remain open.
+
+`examples/live_smoke.py` makes three tiny real calls (key from the environment) and prints
+what was recorded: the check that a live endpoint is shaped the way the adapters read it.
+**It has not been run yet** — no key was available in the session that wrote it.
+
 ## 5. Architecture
 
 ```
@@ -461,22 +503,28 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-253 tests, no network, no `openai` dependency, ~2.9s. Coverage 91% (`cli.py`, the uvicorn
-launcher, is excluded).
+398 tests, no network, ~4s. Coverage 94% (only `cli._serve`, the uvicorn launcher, is
+excluded). No `openai` dependency: three tests in `test_responses.py` build the real SDK's
+objects and skip without it — `uv run --with openai python -m pytest tests/test_responses.py`.
 
 | File | Tests | Covers |
 |---|---:|---|
 | `test_checks.py` | 39 | pre/post checks, verdicts, timeouts, rewrite, RunHandle, call()/acall(), streaming |
 | `test_rendering.py` | 30 | lenient/strict matrix, JSON braces, normalization |
-| `test_adapters.py` | 25 | the adapter contract, run per registered adapter; the registry |
+| `test_adapters.py` | 46 | the adapter contract, run per registered adapter; the registry |
 | `test_conversation.py` | 27 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing |
 | `test_prompt.py` | 25 | immutability, versioning, provenance, equality |
-| `test_storage.py` | 21 | dedup, version counters, concurrency, migrations, run_key, conversations |
+| `test_responses.py` | 38 | Responses request shapes, recording, streaming, checks, `previous_response_id` chaining (sync, background, cross-process), the real SDK's objects |
+| `test_cli.py` | 29 | every CLI command's output, error exits, `history.stats()` |
+| `test_storage.py` | 27 | dedup, version counters, concurrency, migrations, run_key, conversations, `chain_conversation` |
+| `test_cost.py` | 21 | reported cost (response, stream, junk, zero vs none), conversation totals, formatting |
+| `test_feedback.py` | 20 | a handle on every recorded call; feedback storage, validation, shielding, redaction |
 | `test_openai_wrapper.py` | 19 | substitution, run rows, streaming, async, error paths |
-| `test_dashboard.py` | 17 | every route via `TestClient`, 404s, filters, stats line |
+| `test_dashboard.py` | 18 | every route via `TestClient`, 404s, filters, stats line |
 | `test_decorator.py` | 16 | defaults, kwargs capture, fn source hash, async builders |
 | `test_controls.py` | 15 | sampling (always-keep rules, per-conversation decision, env), redaction (every field, failure modes) |
 | `test_writer.py` | 9 | batching, overflow/drop counting, flush, reset, atexit |
+| `test_variants.py` | 9 | `Prompt.variants()`: ordering, no new versions, exact_match round-trip, runs filed under the variant |
 | `test_history.py` | 7 | versions/diff/runs shaping |
 | `test_package.py` | 3 | `__version__` matches `pyproject.toml`; `__all__` resolves; no import cycles |
 
@@ -528,7 +576,7 @@ started.
 | Schema v4 `checks` table, `history.checks()` | **Done** | schema is at v5 |
 | Three scopes, `on_block`, per-check timeout + `on_timeout`, `suppress()` | **Done** | answers open question 3 |
 | Dashboard checks view | **Done** | |
-| `promptkeep.feedback()` | Open | |
+| `promptkeep.feedback()` | **Done** | rows in `checks`, `phase="feedback"`; every recorded call carries a `run_key` |
 | Docs page with real examples | Partial | README section + PII demo; no docs site |
 
 ### v0.5 — Reach and visibility (public beta)
@@ -536,13 +584,13 @@ started.
 | Item | Status | Notes |
 |---|---|---|
 | `promptkeep serve` — read-only, localhost | **Done** | shipped early, ahead of the milestone |
-| Rest of the CLI: `list`, `versions`, `diff`, `runs`, `convo`, `stats`, `export` | Open | `serve` is the only subcommand |
+| Rest of the CLI: `list`, `versions`, `diff`, `runs`, `convo`, `stats`, `export` | **Done** | plain text, no deps; `export` is JSONL only |
 | Provider adapter interface (`integrations/base.py`) | **Done** | OpenAI chat is the first adapter; contract suite in `test_adapters.py` |
-| OpenAI Responses API + automatic conversation chaining | Open | |
+| OpenAI Responses API + automatic conversation chaining | **Done** | `responses.create` only — `.stream()` / `.parse()` pass through untracked |
 | Anthropic adapter | Open | |
 | LiteLLM adapter | Open | |
-| Cost tracking (`cost_usd`, price table) | Open | |
-| `compare()` and `Prompt.variants()` A/B routing | Open | |
+| Cost tracking (`cost_usd`, price table) | **Done** | provider-reported only, by decision: no bundled price table |
+| `compare()` and `Prompt.variants()` A/B routing | Partial | `Prompt.variants(name)` returns the stored versions and `history.stats()` / `promptkeep stats` is the comparison table; `compare()` and weighted routing deliberately left out |
 | Docs site | Open | |
 
 ### v1.0 — Stability
@@ -578,20 +626,17 @@ fifteen seconds" shape (no GIF).
 
 ### Suggested next moves, in order
 
-1. **Enable CI** (`TODO.md`): re-issue the token with the `workflow` scope, move
+1. **Merge `typing`** (PR): `mypy --strict` clean, mypy added to the gate.
+2. **Run `examples/live_smoke.py`** against OpenRouter (and OpenAI, for the Responses chain)
+   — the adapters are tested against fakes and the SDK's own types, not yet a live endpoint.
+3. **Enable CI** (`TODO.md`): re-issue the token with the `workflow` scope, move
    `docs/workflows/` to `.github/workflows/`, and watch the first run — Windows has never
-   executed this suite; fix whatever it turns up before publishing.
-2. **Publish 0.3.0** from the tag: `uv build && uv publish --token ...` (or, once
-   `release.yml` is enabled and PyPI Trusted Publishing is configured, `git push origin
-   v0.3.0`). If the read model and production controls should ship in the same release, move
-   the tag first: `git tag -f -a v0.3.0` on the current main and fold the "Unreleased"
-   changelog entries into 0.3.0.
-3. v0.3 is then fully closed and the adapter interface is in. Next in **v0.5 reach**: the
-   OpenAI Responses API adapter (+ `previous_response_id` chaining — needs a
-   `conversation_hint` adapter method and a response-id → conversation lookup in storage),
-   then Anthropic and LiteLLM adapters, the rest of the CLI (`list`, `versions`, `diff`, `runs`, `convo`, `stats`,
-   `export`), cost tracking, and `compare()`. `promptkeep.feedback()` (v0.4 leftover) is a
-   small one to fold in early.
+   executed this suite.
+4. **Cut a release.** PyPI is still at 0.2.0 and the local `v0.3.0` tag is far behind main;
+   decide the number (0.4.0 is the honest one), fold "Unreleased" into it, retag, publish.
+5. Then what is left of **v0.5**: Anthropic and LiteLLM adapters, `compare()` / weighted
+   routing if still wanted, a docs site. `parent_run_id` (tree-shaped conversations) is the
+   one v0.3 item still open.
 
 ---
 
