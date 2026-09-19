@@ -32,6 +32,14 @@ public APIs; each such change is called out below.
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
 
+- `promptkeep.feedback(run_key, score=, label=, comment=)` attaches a human or
+  downstream judgement to a run after the fact. It is stored in the `checks`
+  table with `phase="feedback"` (no schema change), rides the same write path
+  as a late verdict, shows up in `history.checks()` and the dashboard, and
+  never moves a run's pass/fail headline.
+- Every recorded call now carries `response.promptkeep` (a `RunHandle` with
+  the run's `run_key`), not only checked ones — that key is what `feedback()`
+  takes. A call that records nothing is still returned untouched.
 - Cost tracking: a run records what the provider said the call cost, as
   `RunInfo.cost_usd` (schema v6 adds `runs.cost_usd`). It is read off the
   response's usage block — OpenRouter reports `usage.cost` on every response,

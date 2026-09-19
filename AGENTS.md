@@ -108,6 +108,13 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   (`read_response`, the absorber), so an adapter bug loses telemetry, never a call.
   `tests/test_adapters.py` is the contract every adapter must pass — a new provider adds one
   `Scenario` there. Today the only adapter is OpenAI `chat.completions`.
+- **Feedback is a row in `checks`, not a table of its own.** `tracking.feedback(run_key, ...)`
+  writes `phase="feedback"` (`name` = the label, `message` = the comment, `status="ok"`)
+  through `storage.record_check`, so it inherits the late-verdict machinery: queue ordering
+  behind its run, redaction, skip-with-a-warning when the run never landed. Anything that
+  reads verdicts as pass/fail (`history.verdict`, stats) must filter that phase out. Its
+  prerequisite: every call that records — checked or not — mints its `run_key` up front and
+  gets a `RunHandle` on the response.
 - **Cost is reported, never estimated.** `runs.cost_usd` (schema v6) holds what the provider
   itself said the call cost — adapters read it off the usage block (`ResponseFields.cost_usd`;
   OpenRouter sends `usage.cost` on every response and on a stream's last chunk). A provider

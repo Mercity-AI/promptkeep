@@ -1,5 +1,6 @@
-"""Recording a run for a Prompt, and ``flush()`` — the "everything recorded
-so far is durable" call.
+"""Recording a run for a Prompt, labelling a run after the fact
+(``feedback()``), and ``flush()`` — the "everything recorded so far is
+durable" call.
 
 ``record_prompt_run`` is the one thing an integration (or a script that
 tracks calls by hand) needs beyond ``storage.record_run``: it resolves the
@@ -53,6 +54,55 @@ def record_prompt_run(
     except Exception:
         logger.warning("promptkeep: failed to record run", exc_info=True)
         return None
+
+
+def feedback(
+    run_key: str | None,
+    *,
+    score: float | None = None,
+    label: str | None = None,
+    comment: str | None = None,
+) -> None:
+    """Attach a human (or downstream) judgement to a run, by its key.
+
+        response = client.chat.completions.create(...)
+        key = response.promptkeep.run_key          # keep it with your own records
+        ...
+        promptkeep.feedback(key, score=1.0, label="thumbs_up")
+        promptkeep.feedback(key, score=0.0, label="hallucination", comment="invented a citation")
+
+    It is stored where check verdicts are — the ``checks`` table is the label
+    store — as a row with ``phase="feedback"``: ``label`` is its name,
+    ``comment`` its message. So it rides the same write path as a late
+    verdict (queued behind its run in background mode, redacted, skipped with
+    a warning if the run was never persisted), ``history.checks(run_key)``
+    returns it next to the automatic verdicts, and a run can collect any
+    number of them. Feedback never changes a run's pass/fail headline.
+
+    ``run_key=None`` — what a handle carries when its run wasn't recorded —
+    is a no-op, so ``feedback(response.promptkeep.run_key, ...)`` is always
+    safe. Passing no judgement at all is a usage error and raises; nothing
+    else here does.
+    """
+    # A label with nothing in it is a bug at the call site, not telemetry.
+    if score is None and label is None and comment is None:
+        raise ValueError("feedback() needs at least one of score=, label= or comment=")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
+        raise TypeError(f"feedback(score=...) must be a number, got {type(score).__name__}")
+
+    # The same row shape a check produces, under its own phase.
+    storage.record_check(
+        run_key,
+        {
+            "name": label or "feedback",
+            "phase": "feedback",
+            "status": "ok",
+            "score": None if score is None else float(score),
+            "message": comment,
+            "latency_ms": None,
+            "rewritten": None,
+        },
+    )
 
 
 def flush(timeout: float | None = None) -> bool:

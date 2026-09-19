@@ -198,6 +198,27 @@ path waits for the database. Async verdicts queue behind their run row, and
 `promptkeep.flush()` waits for any post-check still running before draining the
 queue: once it returns, every verdict is on disk.
 
+## Feedback
+
+Checks label a run automatically; `feedback()` is the label a person (or a downstream
+system) gives it later — the thumbs-down, the support ticket, the eval score:
+
+```python
+response = client.chat.completions.create(...)
+key = response.promptkeep.run_key      # every recorded call carries one — store it with your own records
+
+promptkeep.feedback(key, score=1.0, label="thumbs_up")
+promptkeep.feedback(key, score=0.0, label="hallucination", comment="invented a citation")
+
+history.checks(key)                    # verdicts and feedback together; phase == "feedback"
+```
+
+It lands in the same `checks` table as the verdicts (so later analysis reads one label
+store), travels the same write path — queued behind its run in background mode, passed
+through `redact` — and a run can collect any number of them. `feedback(None, ...)` is a
+no-op, which is what `run_key` is when a run wasn't stored (sampled out, tracking off), so
+the call is always safe to make.
+
 ## History
 
 ```python

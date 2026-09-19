@@ -10,8 +10,8 @@ object holding everything known about the call in flight — and drives it:
 3. pre-checks run and may block or rewrite,
 4. the real method is called,
 5. post-checks run, one run row per tracked prompt (or one bare turn) is
-   recorded through ``tracking`` -> ``storage``, and a RunHandle is attached
-   to the response when checks ran.
+   recorded through ``tracking`` -> ``storage``, and a RunHandle naming the
+   run is attached to the response (``response.promptkeep``).
 
 Sync/async and streaming/non-streaming are all handled here, once: the
 async interceptor runs each blocking phase via ``asyncio.to_thread``, and
@@ -175,9 +175,8 @@ def _wrap_stream(call: _Call, stream: Any, start: float, proxy_cls: type) -> Any
     if not call.records:
         return stream
     proxy = proxy_cls(stream, _StreamRecorder(call, start))
-    # A checked stream carries its handle from the start; finish() fills it.
-    if call.checked:
-        _attach_handle(proxy, call.handle)
+    # The stream carries its handle from the start; finish() fills it in.
+    _attach_handle(proxy, call.handle)
     return proxy
 
 
@@ -191,9 +190,9 @@ class _Call:
     Built from the raw kwargs: promptkeep's own kwargs come off, the adapter
     parses the rest, the conversation slot is reserved, and checks are
     collected across the three scopes. A call is *checked* when any check
-    applies; checked calls mint their ``run_key`` up front (see
-    ``models.new_run_key``) so the RunHandle and late verdicts can name the
-    run before its row exists.
+    applies. Every call that records mints its ``run_key`` up front (see
+    ``models.new_run_key``) and gets a RunHandle, so the run can be named —
+    by a late verdict, by ``promptkeep.feedback()`` — before its row exists.
     """
 
     def __init__(self, adapter: ProviderAdapter, kwargs: dict[str, Any]) -> None:
@@ -209,18 +208,23 @@ class _Call:
         # The conversation slot: one turn number per physical API call.
         self.conversation_id, self.turn_index = _prepare_conversation(external_id, title, metadata)
 
-        # Checks across scopes; a checked call gets its identity now.
+        # Checks across scopes.
         self.pre_checks, self.post_checks = _collect_checks(
             self.request.tracked, per_call_pre, per_call_post
         )
         self.checked = bool(self.pre_checks or self.post_checks)
-        self.run_key: str | None = new_run_key() if self.checked else None
+
+        # A call that records gets its identity now, and the handle that will
+        # carry it back on the response. When several prompts ride one call
+        # both refer to the first — the row the verdicts are filed under.
+        tracked = self.request.tracked
+        self.version: int | None = tracked[0][0].version if tracked else None
+        self.run_key: str | None = new_run_key() if self.records else None
+        self.handle: RunHandle | None = RunHandle(None, self.version, []) if self.records else None
 
         # Filled in by run_pre() for a checked call.
         self.outcome = PreOutcome()
         self.ctx: CheckContext | None = None
-        self.version: int | None = None
-        self.handle: RunHandle | None = None
         # Set only when a pre-check rewrote the turn: what the caller passed.
         self.original_input_text: str | None = None
 
@@ -243,12 +247,11 @@ class _Call:
         The context the checks saw is kept: the post-check context is derived
         from it later, so a rewrite reaches the outgoing request, the audit
         and the recorded row alike. When several prompts ride one call, the
-        checks and the RunHandle refer to the first — the run the verdicts
-        are filed under (see _write) — so ctx.prompt and the row agree.
+        checks refer to the first — the run the verdicts are filed under (see
+        _write) — so ctx.prompt and the row agree.
         """
         tracked = self.request.tracked
         prompt_obj = tracked[0][0] if tracked else None
-        self.version = prompt_obj.version if prompt_obj is not None else None
         self.ctx = CheckContext(
             rendered=self.request.joined_text,
             messages=self.request.payload,
@@ -259,7 +262,8 @@ class _Call:
             last_text=self.request.input_text,
         )
         self.outcome = run_pre_checks(list(self.pre_checks), self.ctx)
-        self.handle = RunHandle(None, self.version, list(self.outcome.results))
+        assert self.handle is not None  # a checked call always records
+        self.handle.checks = list(self.outcome.results)
 
         # A rewrite has to reach three places: the wire, the audit, the row.
         if self.outcome.rewritten is not None:
@@ -304,17 +308,21 @@ class _Call:
     ) -> Any:
         """Record the completed call and return the response.
 
-        Unchecked: one row (per tracked prompt, or a bare turn) and nothing
-        else. Checked: the blocking post-checks run first, the row goes down
-        with every verdict known so far, the async post-checks are scheduled
-        (their verdicts land later, by run_key), and the RunHandle is filled
-        in — and attached to the response unless it already rides on a
-        stream proxy. For a stream, ``response`` is the ResponseFields summary
-        (there is no single provider object), and that is what a post-check
-        sees as ``ctx.response``.
+        Unchecked: one row (per tracked prompt, or a bare turn). Checked: the
+        blocking post-checks run first, the row goes down with every verdict
+        known so far, and the async post-checks are scheduled (their verdicts
+        land later, by run_key). Either way the RunHandle is filled in with
+        the run's key and attached to the response, unless it already rides
+        on a stream proxy; a call that records nothing has no handle and its
+        response is returned untouched. For a stream, ``response`` is the
+        ResponseFields summary (there is no single provider object), and that
+        is what a post-check sees as ``ctx.response``.
         """
         if not self.checked:
-            self._write(fields, latency_ms, "ok", None)
+            if self.handle is not None:
+                self.handle.run_key = self._write(fields, latency_ms, "ok", None)
+                if attach:
+                    _attach_handle(response, self.handle)
             return response
 
         # The audit context: the pre context plus the response.

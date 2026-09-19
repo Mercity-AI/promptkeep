@@ -16,7 +16,7 @@ from .decorator import prompt
 from .integrations import acall, call, wrap
 from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
-from .tracking import flush
+from .tracking import feedback, flush
 
 try:
     # pyproject.toml is the single source of truth for the version; this reads
@@ -35,6 +35,7 @@ __all__ = [
     "history",
     "conversation",
     "flush",
+    "feedback",
     "check",
     "call",
     "acall",

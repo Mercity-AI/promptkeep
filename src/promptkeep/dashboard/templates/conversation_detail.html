@@ -39,11 +39,12 @@
   {% set tc = turn_checks.get(t.run_key) %}
   {% if tc %}
   <div class="field">
-    <div class="label">Checks</div>
+    <div class="label">Checks &amp; feedback</div>
     <div class="chips">
       {% for c in tc %}
-      <span class="chip s-{{ c.status }}" title="{{ c.message or '' }}">
-        <span class="phase">{{ c.phase }}</span>{{ c.name }}: {{ c.status }}{% if c.score is not none %} ({{ c.score }}){% endif %}
+      {# A feedback row is a label, not a pass/fail: neutral colour, no status. #}
+      <span class="chip s-{{ c.status }} p-{{ c.phase }}" title="{{ c.message or '' }}">
+        <span class="phase">{{ c.phase }}</span>{{ c.name }}{% if c.phase != 'feedback' %}: {{ c.status }}{% endif %}{% if c.score is not none %} ({{ c.score }}){% endif %}
       </span>
       {% endfor %}
     </div>

@@ -217,11 +217,13 @@ class ConversationSummary:
 
 @dataclass(frozen=True)
 class CheckInfo:
-    """One check verdict recorded against a run. rewritten is the replacement
-    text a rewriting pre-check produced; None for every other verdict."""
+    """One label recorded against a run: a check verdict, or a piece of
+    ``promptkeep.feedback()`` (phase 'feedback', where name is the feedback's
+    label and message its comment). rewritten is the replacement text a
+    rewriting pre-check produced; None for everything else."""
 
     name: str
-    phase: str  # 'pre' | 'post'
+    phase: str  # 'pre' | 'post' | 'feedback'
     status: str  # 'ok' | 'warn' | 'block' | 'error'
     score: float | None
     message: str | None
@@ -229,7 +231,8 @@ class CheckInfo:
 
 
 def checks(run_key: str) -> list[CheckInfo]:
-    """Every check verdict for a run (by its key), oldest first."""
+    """Every label on a run (by its key), oldest first: its check verdicts
+    and any ``promptkeep.feedback()`` given on it — told apart by ``phase``."""
     if not _ready():
         return []
     query = (
@@ -254,13 +257,14 @@ def verdict(run_status: str, check_infos: list[CheckInfo]) -> str | None:
 
     'blocked' if the call was gated, else 'failed' if any check errored,
     'warn' if any warned, 'ok' if checks ran and all passed, None if the run
-    had no checks at all.
+    had no checks at all. Feedback rows are labels, not checks: they never
+    move the headline.
     """
     if run_status == "blocked":
         return "blocked"
-    if not check_infos:
+    statuses = {c.status for c in check_infos if c.phase != "feedback"}
+    if not statuses:
         return None
-    statuses = {c.status for c in check_infos}
     if "block" in statuses or "error" in statuses:
         return "failed"
     if "warn" in statuses:
