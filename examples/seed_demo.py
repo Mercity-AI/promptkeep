@@ -34,8 +34,16 @@ random.seed(42)
 # --- a minimal OpenAI-shaped fake (same surface tests/fakes.py mirrors) --------
 
 
+# Dollars per million tokens (input, output) — only so the fake can report a
+# believable cost. promptkeep itself never prices anything: it stores the
+# ``usage.cost`` an endpoint like OpenRouter sends back, which this imitates.
+_PRICES = {"gpt-4o-mini": (0.15, 0.60), "o4-mini": (1.10, 4.40), "gpt-4.1": (2.00, 8.00)}
+
+
 def _response(text, model, prompt_tokens, completion_tokens):
-    """One chat-completion response shaped like the real SDK object."""
+    """One chat-completion response shaped like the real SDK object, with the
+    OpenRouter-style ``usage.cost`` on it."""
+    price_in, price_out = _PRICES.get(model, (1.0, 3.0))
     return SimpleNamespace(
         id=f"resp_{random.randrange(10**8):08x}",
         model=model,
@@ -43,6 +51,7 @@ def _response(text, model, prompt_tokens, completion_tokens):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            cost=(prompt_tokens * price_in + completion_tokens * price_out) / 1_000_000,
         ),
         choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
     )
@@ -78,7 +87,22 @@ def call(messages, reply, model="gpt-4o-mini", conversation=None):
     kwargs = {"model": model, "messages": messages}
     if conversation:
         kwargs["promptkeep_conversation"] = conversation
-    return client.chat.completions.create(**kwargs)
+    response = client.chat.completions.create(**kwargs)
+    _maybe_feedback(response)
+    return response
+
+
+def _maybe_feedback(response):
+    """Some users rate what they got: mostly thumbs up, the odd complaint. The
+    key comes off the response — every recorded call carries one."""
+    roll = random.random()
+    key = response.promptkeep.run_key
+    if roll < 0.30:
+        promptkeep.feedback(key, score=1.0, label="thumbs_up")
+    elif roll < 0.40:
+        promptkeep.feedback(
+            key, score=0.0, label="thumbs_down", comment="didn't answer the question"
+        )
 
 
 def fail(messages, error, model="gpt-4o-mini", conversation=None):

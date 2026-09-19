@@ -116,6 +116,28 @@ class FakeAsyncCompletions(FakeCompletions):
         return self.response
 
 
+class FakeDecoratedAsyncCompletions(FakeAsyncCompletions):
+    """The real AsyncOpenAI's shape: ``create`` is an ``async def`` behind a
+    plain-``def`` decorator (the SDK's ``@required_args``), so it does not
+    *look* like a coroutine function — it just returns a coroutine.
+
+    ``leave_trail`` is whether the decorator used functools.wraps: the SDK's
+    does (``__wrapped__`` leads back to the async def); a careless one doesn't,
+    and then the only evidence is the awaitable that comes back.
+    """
+
+    def __init__(self, leave_trail=True, **kwargs):
+        super().__init__(**kwargs)
+        inner = super().create
+
+        def create(**call_kwargs):
+            return inner(**call_kwargs)
+
+        if leave_trail:
+            create.__wrapped__ = inner
+        self.create = create
+
+
 class FakeClient:
     """Mimics openai.OpenAI: client.chat.completions.create(**kwargs)."""
 

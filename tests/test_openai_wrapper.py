@@ -315,3 +315,80 @@ class TestAsync:
             asyncio.run(go())
         (run,) = history.runs("WRAP_SYS")
         assert run.status == "error"
+
+
+class TestDecoratedAsyncMethods:
+    """The real AsyncOpenAI hides ``chat.completions.create`` behind a plain-def
+    decorator, so it doesn't look like a coroutine function. Treated as sync,
+    every async chat run was recorded the moment the coroutine was *created*:
+    no output, no usage, zero latency. With the decorator's ``__wrapped__``
+    trail the method is recognized up front; without one, the awaitable it
+    returns gives it away."""
+
+    @pytest.fixture(params=[True, False], ids=["wraps-trail", "no-trail"])
+    def make_client(self, request):
+        from tests.fakes import FakeDecoratedAsyncCompletions
+
+        def build(**kwargs):
+            client = FakeAsyncClient()
+            client.chat.completions = FakeDecoratedAsyncCompletions(
+                leave_trail=request.param, **kwargs
+            )
+            return wrap(client)
+
+        return build
+
+    def ask(self, client, **extra):
+        return client.chat.completions.create(
+            model="gpt-test", messages=[{"role": "developer", "content": make_prompt()}], **extra
+        )
+
+    def test_the_fake_really_hides_its_coroutine_function(self):
+        import inspect
+
+        from tests.fakes import FakeDecoratedAsyncCompletions
+
+        assert not inspect.iscoroutinefunction(FakeDecoratedAsyncCompletions().create)
+
+    def test_the_run_is_recorded_after_the_await_with_the_response(self, make_client):
+        client = make_client(response=make_response(content="awaited answer", cost=0.01))
+        response = asyncio.run(self.ask(client))
+        assert response.choices[0].message.content == "awaited answer"
+        (run,) = history.runs("WRAP_SYS")
+        assert run.output_text == "awaited answer"
+        assert run.total_tokens == 15
+        assert run.cost_usd == 0.01
+        assert response.promptkeep.run_key == run.run_key
+
+    def test_provider_error_is_recorded_once_and_reraised(self, make_client):
+        client = make_client(error=RuntimeError("boom"))
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(self.ask(client))
+        (run,) = history.runs("WRAP_SYS")
+        assert run.status == "error"
+
+    def test_streaming(self, make_client):
+        client = make_client(stream_chunks=[make_chunk(content="Hi "), make_chunk(content="there")])
+
+        async def go():
+            return [chunk async for chunk in await self.ask(client, stream=True)]
+
+        assert len(asyncio.run(go())) == 2
+        (run,) = history.runs("WRAP_SYS")
+        assert run.output_text == "Hi there"
+
+    def test_a_post_check_audits_the_response_not_the_coroutine(self, make_client):
+        from promptkeep import check
+        from promptkeep.checks import Verdict
+
+        seen = {}
+
+        @check.post(mode="blocking")
+        def look(ctx):
+            seen["output"] = ctx.output_text
+            return Verdict.ok()
+
+        client = make_client(response=make_response(content="audited"))
+        response = asyncio.run(self.ask(client, promptkeep_post=[look]))
+        assert seen["output"] == "audited"
+        assert response.promptkeep.verification == "ok"

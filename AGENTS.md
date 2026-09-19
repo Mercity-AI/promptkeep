@@ -14,7 +14,6 @@ uv run pytest -q --cov --cov-fail-under=85       # what the CI coverage gate run
 uv run ruff format src tests examples && uv run ruff check src tests examples   # line-length 100
 uv run promptkeep stats NAME --db demo.promptkeep.db   # the CLI (seed one: examples/seed_demo.py)
 uv run python examples/playground.py             # narrated sandbox (throwaway DB, no network)
-uv run --with openai python -m pytest tests/test_responses.py   # + the real-SDK shape tests
 uv build                                         # build sdist+wheel into dist/
 ```
 
@@ -84,6 +83,14 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   comparing the stored hash with the normalized one — or loading would mint a new version.
   The lineage query lives in `storage.version_rows` (shared with `history.versions`) because
   `prompts` sits below `history` in the module graph.
+- **Sync or async is decided on the unwrapped method** (`core._instrument_target` uses
+  `inspect.unwrap`), because SDKs decorate: `iscoroutinefunction` is False for the real
+  `AsyncOpenAI.chat.completions.create`. The sync interceptor also hands any awaitable result
+  to `_settle`, the shared async tail, so an undetectable async method still records after the
+  await instead of storing an empty run.
+- **A Prompt's registration memo is `(db_path, result)`.** Prompts are module-level objects and
+  outlive `configure(db_path=...)`; a bare version id would be meaningless (or, worse, valid)
+  in another file. `.format()` and `variants()` carry/seed the memo in the same shape.
 - **Version registration is lazy** — first `.text`/`.render()`/`.version` access, never at
   construction. Prompts are defined at module import time; import must not do I/O.
 - **All implicit write paths are exception-shielded** (`storage.register_version`,
@@ -197,10 +204,13 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 `tests/conftest.py` has an autouse fixture giving every test a fresh tmp DB and reset config —
 tests never touch a real `.promptkeep.db`. OpenAI wrapper tests run against hand-rolled fakes
 in `tests/fakes.py` (no network, no `openai` dependency; core must never import `openai`).
-`test_responses.py::TestAgainstTheRealSDK` builds the SDK's own objects and skips without it —
-run it with `uv run --with openai python -m pytest tests/test_responses.py` (`python -m`, or
-the overlay isn't on the path). `examples/live_smoke.py` is the by-hand check against a real
-endpoint.
+**The fakes are our belief about the SDK; `tests/test_real_sdk.py` is the SDK.** It drives the
+real `openai` clients (in the dev group — the package still doesn't depend on it) over an httpx
+`MockTransport`, and it exists because a fake can't catch a wrong assumption about what it
+imitates: the real `AsyncOpenAI.chat.completions.create` is an `async def` behind a sync
+decorator, a fake `async def create` never modelled that, and async chat runs were recorded
+empty until that file ran. When an adapter learns a new shape, add the case there too, not only
+to the fakes. `examples/live_smoke.py` is the by-hand check against a live endpoint.
 `test_storage.py::test_concurrent_registration_from_threads` is the canary for the SQLite
 locking subtleties above — if a storage change makes it flaky, the change is wrong, not the
 test. The module for the Prompt class is `prompts.py` (plural) because the public `prompt`

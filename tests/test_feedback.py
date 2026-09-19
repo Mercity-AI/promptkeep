@@ -52,6 +52,24 @@ class TestEveryRecordedCallHasAHandle:
         )
         assert not hasattr(response, "promptkeep")
 
+    def test_a_response_that_cannot_carry_a_handle_is_not_worth_a_warning(self, caplog):
+        """A third-party adapter may return a str or a dict. The run is
+        recorded all the same; nobody asked for the handle."""
+        client = FakeClient(response="just a string")
+        with caplog.at_level("WARNING", logger="promptkeep"):
+            assert ask(wrap(client)) == "just a string"
+        assert "run handle" not in caplog.text
+        assert len(history.runs("FB_SYS")) == 1
+
+    def test_but_it_is_on_a_checked_call_where_the_handle_is_the_point(self, caplog):
+        @check.post(mode="blocking")
+        def fine(ctx):
+            return Verdict.ok()
+
+        with caplog.at_level("WARNING", logger="promptkeep"):
+            ask(wrap(FakeClient(response="just a string")), promptkeep_post=[fine])
+        assert "could not attach run handle" in caplog.text
+
     def test_async_call(self):
         client = wrap(FakeAsyncClient())
         response = asyncio.run(ask(client))

@@ -59,6 +59,10 @@ public APIs; each such change is called out below.
   followed. Schema v7 indexes `runs.response_id` for the lookup. Adapters opt
   in through a new optional `ProviderAdapter.conversation_hint()`; a second
   optional method, `accepts()`, tells surfaces on one client apart.
+- `tests/test_real_sdk.py` drives the real `openai` SDK — sync and async
+  clients, both surfaces, SSE streams — through promptkeep over an httpx
+  `MockTransport`. `openai` joins the dev dependency group for it (the package
+  itself still depends only on peewee); it is what caught the async bug below.
 - `examples/live_smoke.py`: three tiny real calls (key from the environment)
   that print what was recorded — the check that a live endpoint's responses
   are shaped the way the adapters read them.
@@ -97,6 +101,20 @@ public APIs; each such change is called out below.
 
 ### Fixed
 
+- **Async chat completions on the real `AsyncOpenAI` were recorded empty.**
+  The SDK hides `chat.completions.create` behind a plain-`def` decorator, so
+  it did not look like a coroutine function; promptkeep took it for a sync
+  method and recorded the run the moment the coroutine was created — no
+  output, no usage, zero latency — and a post-check audited the coroutine
+  instead of the response. The method is now unwrapped before it is asked, and
+  a call that returns an awaitable anyway is finished the async way. (Async
+  *Responses* calls, and everything on the sync client, were unaffected.)
+- A Prompt's remembered version id is now tied to the database it came from.
+  A module-level Prompt that had already rendered kept its old id across a
+  `configure(db_path=...)`, so its runs failed the foreign key and were lost —
+  or were filed under whichever version owned that id in the new file.
+- The dashboard's check chips inherited `white-space: pre-wrap` from the
+  transcript fields and rendered the template's own indentation inside them.
 - `ConversationInfo.total_tokens` counted a call once per tracked Prompt: a
   call carrying two Prompts writes two rows repeating the same usage. Totals
   now count each API call once.

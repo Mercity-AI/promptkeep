@@ -84,11 +84,19 @@ def is_instrumented(target: Target) -> bool:
 
 def _instrument_target(target: Target, adapter: ProviderAdapter) -> None:
     """Replace ``target``'s method with the tracking interceptor, once. Picks
-    the sync or async interceptor based on the original method."""
+    the sync or async interceptor based on the original method.
+
+    The method is unwrapped before it is asked: SDKs decorate their methods,
+    and a plain-``def`` decorator around an ``async def`` hides it from
+    ``iscoroutinefunction`` — the real ``AsyncOpenAI.chat.completions.create``
+    is exactly that (``@required_args``). One that hides without leaving a
+    ``__wrapped__`` trail is still caught when its first call returns an
+    awaitable (see ``_make_sync_create``).
+    """
     if is_instrumented(target):
         return
     original = getattr(target.owner, target.attribute)
-    if inspect.iscoroutinefunction(original):
+    if inspect.iscoroutinefunction(inspect.unwrap(original)):
         setattr(target.owner, target.attribute, _make_async_create(original, adapter))
     else:
         setattr(target.owner, target.attribute, _make_sync_create(original, adapter))
@@ -126,6 +134,12 @@ def _make_sync_create(original: Any, adapter: ProviderAdapter) -> Any:
             call.record_error(repr(exc), _ms(start))
             raise
 
+        # An async method that couldn't be told apart up front: what came back
+        # is the pending call, not its response. Finish it the async way —
+        # recording now would store an empty run for a call still in flight.
+        if inspect.isawaitable(response):
+            return _settle(call, response, start)
+
         # Streams are recorded when they end; everything else right now.
         if call.streaming:
             return _wrap_stream(call, response, start, _SyncStreamProxy)
@@ -154,19 +168,33 @@ def _make_async_create(original: Any, adapter: ProviderAdapter) -> Any:
             if blocked is not None:
                 return blocked
 
+        # A provider error raised before there is anything to await (argument
+        # validation) is recorded like one raised while awaiting.
         start = time.perf_counter()
         try:
-            response = await original(*args, **call.request.kwargs)
+            pending = original(*args, **call.request.kwargs)
         except Exception as exc:
             await asyncio.to_thread(call.record_error, repr(exc), _ms(start))
             raise
-
-        if call.streaming:
-            return _wrap_stream(call, response, start, _AsyncStreamProxy)
-        fields = _read_response(adapter, response)
-        return await asyncio.to_thread(call.finish, response, fields, _ms(start))
+        return await _settle(call, pending, start)
 
     return create
+
+
+async def _settle(call: _Call, pending: Any, start: float) -> Any:
+    """Await a provider call in flight, then record it off the event loop:
+    the failed run if it raised, the stream proxy if it streams, otherwise
+    the completed call (post-checks included)."""
+    try:
+        response = await pending
+    except Exception as exc:
+        await asyncio.to_thread(call.record_error, repr(exc), _ms(start))
+        raise
+
+    if call.streaming:
+        return _wrap_stream(call, response, start, _AsyncStreamProxy)
+    fields = _read_response(call.adapter, response)
+    return await asyncio.to_thread(call.finish, response, fields, _ms(start))
 
 
 def _wrap_stream(call: _Call, stream: Any, start: float, proxy_cls: type) -> Any:
@@ -328,7 +356,7 @@ class _Call:
             if self.handle is not None:
                 self.handle.run_key = self._write(fields, latency_ms, "ok", None)
                 if attach:
-                    _attach_handle(response, self.handle)
+                    _attach_handle(response, self.handle, expected=False)
             return response
 
         # The audit context: the pre context plus the response.
@@ -550,15 +578,27 @@ def _record_bare(**fields: Any) -> str | None:
         return None
 
 
-def _attach_handle(response: Any, handle: RunHandle | None) -> None:
-    """Attach the RunHandle as response.promptkeep, tolerating frozen objects."""
+def _attach_handle(response: Any, handle: RunHandle | None, expected: bool = True) -> None:
+    """Attach the RunHandle as response.promptkeep, tolerating frozen objects.
+
+    Some responses can't carry an attribute at all (a str, a dict, a slotted
+    object from a third-party adapter). On a checked call the caller is about
+    to read ``response.promptkeep``, so that is worth a warning; on an
+    unchecked one (``expected=False``) the handle is a convenience, the run is
+    recorded either way, and warning on every call would be pure noise.
+    """
     try:
         object.__setattr__(response, "promptkeep", handle)
     except Exception:
         try:
             response.promptkeep = handle
         except Exception:
-            logger.warning("promptkeep: could not attach run handle to response", exc_info=True)
+            if expected:
+                logger.warning("promptkeep: could not attach run handle to response", exc_info=True)
+            else:
+                logger.debug(
+                    "promptkeep: response of type %s can't carry a run handle", type(response)
+                )
 
 
 # --- streaming --------------------------------------------------------------------

@@ -199,6 +199,9 @@
   }
   .turn .meta .sep { color: var(--border); }
   .turn .field { margin: 12px 0 2px; white-space: pre-wrap; color: var(--text-secondary); }
+  /* Chips are markup, not recorded text: pre-wrap would render the template's
+     own newlines and indentation inside them. */
+  .turn .field.labels { white-space: normal; }
   .turn .field.input {
     border-left: 3px solid var(--accent);
     padding: 6px 0 6px 12px; color: var(--text);

@@ -363,8 +363,10 @@ def chain_conversation(previous_response_id: str) -> int | None:
     followed only from a call promptkeep tracked, never inferred. Raises like
     any storage call; the caller shields.
     """
+    # Nothing is being recorded, so there is nothing to group: don't leave a
+    # conversation row behind for a run that will never be written.
     settings = get_settings()
-    if not settings.enabled or get_db() is None:
+    if not settings.enabled or settings.write_mode == "off" or get_db() is None:
         return None
 
     # The predecessor: the in-process index first (its row may still be

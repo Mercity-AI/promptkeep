@@ -441,6 +441,13 @@ class TestChainConversation:
         # An aged-out response is still found — on disk.
         assert storage.chain_conversation("resp_0") is not None
 
+    def test_write_mode_off_leaves_no_conversation_behind(self):
+        self._run("resp_1")
+        promptkeep.configure(write_mode="off")
+        assert storage.chain_conversation("resp_1") is None
+        promptkeep.configure(write_mode="sync")
+        assert history.list_conversations() == []
+
     def test_disabled_tracking_chains_nothing(self):
         promptkeep.configure(enabled=False)
         assert storage.chain_conversation("resp_1") is None
