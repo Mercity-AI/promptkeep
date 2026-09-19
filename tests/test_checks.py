@@ -61,8 +61,8 @@ class TestPreChecks:
         # A blocked run is still recorded, with the block verdict.
         (run,) = history.all_runs()
         assert run.status == "blocked"
-        (chk,) = storage.fetch_checks(run.run_key)
-        assert chk["name"] == "no_pii" and chk["status"] == "block"
+        (chk,) = history.checks(run.run_key)
+        assert chk.name == "no_pii" and chk.status == "block"
 
     def test_block_return_mode_yields_stub(self):
         promptkeep.configure(on_block="return")
@@ -294,7 +294,7 @@ class TestPostChecks:
         assert resp.promptkeep.verification == "pending"
         resp.promptkeep.wait(timeout=5)
         assert resp.promptkeep.verification == "ok"
-        names = [c["name"] for c in storage.fetch_checks(resp.promptkeep.run_key)]
+        names = [c.name for c in history.checks(resp.promptkeep.run_key)]
         assert "slow" in names
 
     def test_async_post_still_runs_when_nothing_is_persisted(self):
@@ -488,8 +488,8 @@ class TestPIIConversationFlow:
         # the blocked turn has the block verdict and no output.
         blocked = convo.turns[1]
         assert blocked.output_text is None
-        (chk,) = storage.fetch_checks(blocked.run_key)
-        assert chk["name"] == "no_secrets" and chk["status"] == "block"
+        (chk,) = history.checks(blocked.run_key)
+        assert chk.name == "no_secrets" and chk.status == "block"
         # the secret never reached the provider on any call.
         assert not any("sk-live" in str(c.get("messages")) for c in client.calls)
 
@@ -584,7 +584,7 @@ class TestStreamingChecks:
         list(stream)  # drain
         names = {c.name for c in stream.promptkeep.checks}
         assert names == {"gate", "grounded"}
-        assert storage.fetch_all_runs()[0]["output_text"] == "Paris!"
+        assert history.all_runs()[0].output_text == "Paris!"
 
     def test_sync_stream_pre_block_never_starts_stream(self):
         @check.pre(name="no_pii")

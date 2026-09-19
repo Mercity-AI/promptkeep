@@ -2,8 +2,10 @@
 
 In write_mode="background" (the default), `storage.record_run` and
 `storage.record_check` enqueue their items here and return immediately; this
-module's worker thread batches queued items into single transactions off the
-caller's hot path. Design rules, each a known telemetry-library footgun:
+module's worker thread batches queued items and hands each batch to the
+*sink* — a callable storage registers at import (`set_sink`), so this module
+knows nothing about SQLite and the dependency runs one way. Design rules,
+each a known telemetry-library footgun:
 
 - **Bounded queue, drop-oldest.** A full queue drops the oldest item and
   counts it (rate-limited warning) — a slow disk must never become an OOM.
@@ -30,13 +32,18 @@ import os
 import queue
 import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any
+
+from .config import get_settings
 
 logger = logging.getLogger("promptkeep")
 
+Sink = Callable[[list[dict[str, Any]]], None]
+
 _lock = threading.Lock()
-_queue: Optional["queue.Queue[dict]"] = None
-_thread: Optional[threading.Thread] = None
+_queue: queue.Queue[dict] | None = None
+_thread: threading.Thread | None = None
 _dropped_total = 0
 _last_drop_log = 0.0
 _DROP_LOG_INTERVAL = 5.0
@@ -46,9 +53,19 @@ _DROP_LOG_INTERVAL = 5.0
 # reset() — a stale hook is harmless (flush() no-ops on an empty queue), a
 # leaked one per reset is not.
 _atexit_registered = False
+# Where batches go. Set once by storage at import; a batch drained before
+# that (impossible in practice — nothing can enqueue before storage exists)
+# is logged and dropped rather than crashing the worker.
+_sink: Sink | None = None
 
 
-def submit(item: dict) -> None:
+def set_sink(sink: Sink) -> None:
+    """Register the callable the worker hands each batch to."""
+    global _sink
+    _sink = sink
+
+
+def submit(item: dict[str, Any]) -> None:
     """Enqueue one item (a run row or a late verdict) for the background
     thread; never blocks, never raises.
 
@@ -88,7 +105,7 @@ def submit(item: dict) -> None:
         logger.warning("promptkeep: failed to enqueue run", exc_info=True)
 
 
-def drain(timeout: Optional[float] = None) -> bool:
+def drain(timeout: float | None = None) -> bool:
     """Block until every queued item is written (or timeout seconds pass).
 
     Returns True when the queue fully drained, False on timeout. A process
@@ -140,7 +157,7 @@ def reset() -> None:
         _dropped_total = 0
 
 
-def _ensure_started() -> "queue.Queue[dict]":
+def _ensure_started() -> queue.Queue[dict]:
     """Create the queue and start the daemon thread on first use."""
     global _queue, _thread
     q = _queue
@@ -148,8 +165,6 @@ def _ensure_started() -> "queue.Queue[dict]":
         return q
     with _lock:
         if _queue is None:
-            from .config import get_settings
-
             # Queue bound is read once at creation; changing queue_size later
             # needs a process restart (or reset_caches in tests).
             _queue = queue.Queue(maxsize=get_settings().queue_size)
@@ -172,8 +187,6 @@ def _worker() -> None:
 
     Serves the queue it was started for; retires when reset() swaps it out.
     """
-    from .config import get_settings
-
     q = _queue
     assert q is not None
     while True:
@@ -192,9 +205,10 @@ def _worker() -> None:
                 except queue.Empty:
                     break
             try:
-                from . import storage
-
-                storage.write_batch(batch)
+                sink = _sink
+                if sink is None:
+                    raise RuntimeError("no sink registered for the background writer")
+                sink(batch)
             except Exception:
                 logger.warning(
                     "promptkeep: background writer failed to persist %d item(s)",

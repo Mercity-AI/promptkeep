@@ -27,3 +27,25 @@ Until CI exists, run the gate locally before pushing:
 uv run ruff format --check src tests examples && uv run ruff check src tests examples
 uv run pytest -q --cov --cov-fail-under=85
 ```
+
+## Provider adapters
+
+Only OpenAI `chat.completions` has an adapter — which also covers OpenRouter
+and every other OpenAI-compatible endpoint, so it is the shape we stick to
+for now. Each of these is one `ProviderAdapter` subclass plus one `Scenario`
+in `tests/test_adapters.py`:
+
+- **OpenAI Responses API** (`client.responses.create`): Prompts in `input` /
+  `instructions`; typed stream events; and `previous_response_id`, which
+  needs a `conversation_hint` adapter method and a response-id → conversation
+  lookup so turns chain with no user code.
+- **Anthropic** (`client.messages.create`): separate `system` field,
+  `content[0].text`, `input_tokens` / `output_tokens`, event-stream deltas.
+- **LiteLLM**: a module function, not a client — `wrap(litellm.completion)`
+  returns a wrapped function the user rebinds.
+
+## Strict typing
+
+`py.typed` ships, so downstream type checkers trust these annotations, but
+`mypy --strict src/promptkeep` still reports errors — mostly untyped private
+helpers and peewee model attributes. Get it clean and add it to CI.

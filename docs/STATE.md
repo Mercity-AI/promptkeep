@@ -50,7 +50,7 @@ runs off it.
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
 | **Branches** | `main` only. PR #1 merged `feat/conversations-dashboard`, PR #3 merged `feat/checks`; the v0.3 batch was committed straight to main. |
-| **Tests** | 252 passing (~2.9s, no network), verified locally on Python 3.11 and 3.14 on macOS. Coverage 91%. |
+| **Tests** | 253 passing (~2.9s, no network), verified locally on Python 3.11 and 3.14 on macOS. Coverage 91%. |
 | **Size** | ~4,900 LOC Python + ~450 LOC HTML templates · ~3,500 LOC tests |
 | **Python** | ≥ 3.11. **No CI yet**: the workflows (ruff, the suite on 3.11–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
@@ -391,32 +391,39 @@ Not built: `promptkeep.feedback()`.
 ```
 src/promptkeep/
 ├── __init__.py        public API (+ __version__ read from package metadata)
-├── prompts.py         Prompt + RenderedText          (plural — `prompt` is the decorator)
-├── rendering.py       render / normalize / placeholder extraction
-├── decorator.py       @prompt (sync and async builders)
+├── rendering.py       render / normalize / placeholder extraction / template_hash
 ├── config.py          configure() / get_settings() / reset(); sample_rate, redact
 ├── conversation.py    contextvar-based conversation() context manager
-├── checks.py          check.pre/post, Verdict, CheckContext, RunHandle, call()/acall(), suppress()
-├── storage.py         peewee models, migrations, register_version, record_run (+ sampling,
-│                      redaction), record_check, write_batch, fetch_*
-├── writer.py          background queue + daemon thread, flush(), fork hook
-├── tracking.py        provider-agnostic run recording (prompt runs and bare conversation turns)
-├── history.py         read side — dict rows -> frozen dataclasses; ConversationInfo.replay()
+├── writer.py          background queue + daemon thread, drain(), fork hook; sink injected
+├── models.py          the peewee tables + new_run_key()
+├── migrations.py      forward-only schema steps, applied on open (no migration files)
+├── controls.py        sampling decision and redaction, as pure functions
+├── storage.py         the DB binding and every write: register_version, conversations,
+│                      record_run / record_check, write_batch
+├── prompts.py         Prompt + RenderedText          (plural — `prompt` is the decorator)
+├── decorator.py       @prompt (sync and async builders)
+├── history.py         the read side: queries -> frozen dataclasses; ConversationInfo.replay()
+├── checks.py          check.pre/post, Verdict, CheckContext, RunHandle, suppress()
+├── tracking.py        record_prompt_run() (resolve version, then storage), flush()
 ├── cli.py             `promptkeep serve` (lazy-imports the server stack)
 ├── dashboard/
 │   ├── app.py         FastAPI routes, read-only
 │   └── templates/     base, prompts, prompt_detail, diff, runs, conversations, conversation_detail
 └── integrations/
-    ├── __init__.py    wrap(), is_wrapped(), the adapter registry (register_adapter)
+    ├── __init__.py    re-exports
     ├── base.py        ProviderAdapter / Request / ResponseFields / StreamAbsorber / Target
-    ├── core.py        the shared interceptor: conversations, checks, recording, stream proxies
+    ├── core.py        the shared interceptor: one _Call per call; stream proxies
+    ├── registry.py    wrap(), is_wrapped(), the adapter list (register_adapter)
+    ├── call.py        call() / acall() / CallResult, through the adapter
     └── openai_wrapper.py   OpenAIChatAdapter — the only adapter so far
 ```
 
-Flow: `Prompt.render()` → `storage.register_version()` (lazy, memoized, sync) → wrapper
-intercepts `chat.completions.create` → resolves the active conversation → runs pre-checks →
-provider call → post-checks → `tracking` → `storage.record_run()` (sampling decision,
-redaction) → `writer.submit()` → daemon thread → `storage.write_batch()`.
+Flow: `Prompt.render()` → `storage.register_version()` (lazy, memoized, sync) → the
+interceptor `wrap()` installed builds a `_Call` → resolves the active conversation → runs
+pre-checks → provider call → post-checks → `tracking.record_prompt_run()` →
+`storage.record_run()` (sampling decision, redaction) → `writer.submit()` → daemon thread →
+`storage.write_batch()`. The module graph is a DAG — no function-level intra-package
+imports; `tests/test_package.py` enforces it.
 
 ### Load-bearing decisions
 
@@ -454,7 +461,7 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-252 tests, no network, no `openai` dependency, ~2.9s. Coverage 91% (`cli.py`, the uvicorn
+253 tests, no network, no `openai` dependency, ~2.9s. Coverage 91% (`cli.py`, the uvicorn
 launcher, is excluded).
 
 | File | Tests | Covers |
@@ -471,7 +478,7 @@ launcher, is excluded).
 | `test_controls.py` | 15 | sampling (always-keep rules, per-conversation decision, env), redaction (every field, failure modes) |
 | `test_writer.py` | 9 | batching, overflow/drop counting, flush, reset, atexit |
 | `test_history.py` | 7 | versions/diff/runs shaping |
-| `test_package.py` | 2 | `__version__` matches `pyproject.toml`; `__all__` resolves |
+| `test_package.py` | 3 | `__version__` matches `pyproject.toml`; `__all__` resolves; no import cycles |
 
 `tests/conftest.py` gives every test a fresh tmp DB, reset config, `write_mode="sync"`, and a
 reset writer — tests never touch a real `.promptkeep.db`.
@@ -594,7 +601,7 @@ fifteen seconds" shape (no GIF).
 2. `uv run python examples/seed_demo.py` then `promptkeep serve --db demo.promptkeep.db` — see
    versioning, conversations, checks and run tracking in the dashboard; `CHANGELOG.md` for
    what shipped when
-3. `CLAUDE.md` — the design decisions and the SQLite traps, already written down
+3. `AGENTS.md` — the design decisions and the SQLite traps, already written down
 4. `src/promptkeep/prompts.py`, `storage.py`, `writer.py` — the three files that carry the model
 5. `docs/ROADMAP-v1.md` — where this goes next; section 7 above is the scorecard against it
 6. `plan.md` — the original design doc, kept as history. **Do not update it to match code**

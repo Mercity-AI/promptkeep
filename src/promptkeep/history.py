@@ -1,19 +1,25 @@
-"""Query the lineage and run history of a prompt by name.
+"""The read side: lineage, runs, conversations and verdicts as frozen
+dataclasses.
 
-The read-side API: storage returns raw dict rows; this module shapes them
-into typed, immutable dataclasses that are pleasant to work with.
+Every query lives here, next to the type it produces. Reads raise normally —
+a broken query is a bug you want to see — but against a disabled tracker
+they return nothing rather than opening a file.
 """
 
 from __future__ import annotations
 
 import difflib
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import groupby
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
+
+import peewee as pw
 
 from . import storage
+from .models import CheckRecord, ConversationRecord, PromptRecord, PromptVersionRecord, RunRecord
 
 
 @dataclass(frozen=True)
@@ -24,7 +30,7 @@ class VersionInfo:
     template: str
     template_hash: str
     source: str
-    fn_source_hash: Optional[str]
+    fn_source_hash: str | None
     created_at: str
 
 
@@ -45,26 +51,26 @@ class RunInfo:
 
     id: int
     run_key: str
-    prompt_name: Optional[str]
-    version: Optional[int]
-    variables: Optional[Dict[str, Any]]
-    rendered_text: Optional[str]
+    prompt_name: str | None
+    version: int | None
+    variables: dict[str, Any] | None
+    rendered_text: str | None
     provider: str
-    model: Optional[str]
-    request_params: Optional[Dict[str, Any]]
-    response_id: Optional[str]
-    output_text: Optional[str]
-    prompt_tokens: Optional[int]
-    completion_tokens: Optional[int]
-    total_tokens: Optional[int]
-    latency_ms: Optional[int]
+    model: str | None
+    request_params: dict[str, Any] | None
+    response_id: str | None
+    output_text: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int | None
     status: str
-    error: Optional[str]
+    error: str | None
     created_at: str
-    conversation_id: Optional[str] = None
-    turn_index: Optional[int] = None
-    input_text: Optional[str] = None
-    original_input_text: Optional[str] = None
+    conversation_id: str | None = None
+    turn_index: int | None = None
+    input_text: str | None = None
+    original_input_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,18 +83,18 @@ class ConversationInfo:
     """
 
     external_id: str
-    title: Optional[str]
-    metadata: Optional[Dict[str, Any]]
+    title: str | None
+    metadata: dict[str, Any] | None
     created_at: str
     updated_at: str
-    turns: List[RunInfo]
+    turns: list[RunInfo]
 
     @property
-    def versions_used(self) -> Dict[str, List[int]]:
+    def versions_used(self) -> dict[str, list[int]]:
         """Which prompt versions drove this conversation, e.g.
         ``{"REVIEW_SYSTEM": [4, 5], "SUMMARIZE": [2]}`` — each name's versions
         in order of first use. Turns without a tracked Prompt contribute nothing."""
-        used: Dict[str, List[int]] = {}
+        used: dict[str, list[int]] = {}
         for turn in self.turns:
             if turn.prompt_name is None or turn.version is None:
                 continue
@@ -123,7 +129,7 @@ class ConversationInfo:
             return 0.0
         return max(0.0, (max(ends) - min(starts)).total_seconds())
 
-    def replay(self, system: Any = None) -> List[Dict[str, Any]]:
+    def replay(self, system: Any = None) -> list[dict[str, Any]]:
         """Rebuild the conversation as a chat ``messages`` list, ready to send
         back to a provider — the raw material of every eval and re-run.
 
@@ -141,7 +147,7 @@ class ConversationInfo:
         wrapped client tracks the latter like any other) and the stored system
         prompts are dropped.
         """
-        messages: List[Dict[str, Any]] = []
+        messages: list[dict[str, Any]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
         previous_prompts: set = set()
@@ -162,7 +168,7 @@ class ConversationInfo:
                 messages.append({"role": "assistant", "content": head.output_text})
         return messages
 
-    def _completed_turns(self) -> Iterator[Tuple[Optional[int], List[RunInfo]]]:
+    def _completed_turns(self) -> Iterator[tuple[int | None, list[RunInfo]]]:
         """Turns that completed, as (turn_index, rows) — rows sharing a
         turn_index came from the same API call. Relies on ``turns`` being
         ordered by turn_index, which the storage read guarantees."""
@@ -187,7 +193,7 @@ class ConversationSummary:
     """One conversation's row in an overview listing: id plus turn count."""
 
     external_id: str
-    title: Optional[str]
+    title: str | None
     turn_count: int
     created_at: str
     updated_at: str
@@ -201,27 +207,33 @@ class CheckInfo:
     name: str
     phase: str  # 'pre' | 'post'
     status: str  # 'ok' | 'warn' | 'block' | 'error'
-    score: Optional[float]
-    message: Optional[str]
-    rewritten: Optional[str] = None
+    score: float | None
+    message: str | None
+    rewritten: str | None = None
 
 
-def checks(run_key: str) -> List[CheckInfo]:
+def checks(run_key: str) -> list[CheckInfo]:
     """Every check verdict for a run (by its key), oldest first."""
-    return [
-        CheckInfo(
-            name=row["name"],
-            phase=row["phase"],
-            status=row["status"],
-            score=row["score"],
-            message=row["message"],
-            rewritten=row["rewritten"],
+    if not _ready():
+        return []
+    query = (
+        CheckRecord.select(
+            CheckRecord.name,
+            CheckRecord.phase,
+            CheckRecord.status,
+            CheckRecord.score,
+            CheckRecord.message,
+            CheckRecord.rewritten,
         )
-        for row in storage.fetch_checks(run_key)
-    ]
+        .join(RunRecord)
+        .where(RunRecord.run_key == run_key)
+        .order_by(CheckRecord.id)
+        .dicts()
+    )
+    return [CheckInfo(**row) for row in query]
 
 
-def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
+def verdict(run_status: str, check_infos: list[CheckInfo]) -> str | None:
     """The one-word headline for a run's checks, for a badge in the UI.
 
     'blocked' if the call was gated, else 'failed' if any check errored,
@@ -240,7 +252,15 @@ def verdict(run_status: str, check_infos: List[CheckInfo]) -> Optional[str]:
     return "ok"
 
 
-def _parse_timestamp(value: str) -> Optional[datetime]:
+# --- row helpers -------------------------------------------------------------------
+
+
+def _ready() -> bool:
+    """Whether there is a database to read: False when tracking is disabled."""
+    return storage.get_db() is not None
+
+
+def _parse_timestamp(value: str) -> datetime | None:
     """A stored ISO-8601 timestamp as a datetime; None when unparseable."""
     try:
         return datetime.fromisoformat(value)
@@ -248,7 +268,7 @@ def _parse_timestamp(value: str) -> Optional[datetime]:
         return None
 
 
-def _load_json(value: Optional[str]):
+def _load_json(value: str | None) -> Any:
     """Decode a stored JSON column; malformed/missing data becomes None."""
     if value is None:
         return None
@@ -258,19 +278,71 @@ def _load_json(value: Optional[str]):
         return None
 
 
-def versions(name: str) -> List[VersionInfo]:
+# The run projection, defined once: every run-shaped read selects these same
+# columns (aliased to RunInfo's field names) and differs only in joins,
+# filters and order. Reusing aliased column objects across queries is safe —
+# building a query never mutates them.
+_RUN_COLUMNS = (
+    RunRecord.id,
+    RunRecord.run_key,
+    PromptRecord.name.alias("prompt_name"),
+    PromptVersionRecord.version.alias("version"),
+    RunRecord.variables,
+    RunRecord.rendered_text,
+    RunRecord.provider,
+    RunRecord.model,
+    RunRecord.request_params,
+    RunRecord.response_id,
+    RunRecord.output_text,
+    RunRecord.prompt_tokens,
+    RunRecord.completion_tokens,
+    RunRecord.total_tokens,
+    RunRecord.latency_ms,
+    RunRecord.status,
+    RunRecord.error,
+    RunRecord.created_at,
+    RunRecord.turn_index,
+    RunRecord.input_text,
+    RunRecord.original_input_text,
+)
+# Added only where the caller reads across conversations and needs to know
+# which one each run belongs to (a conversation's own turns already know).
+_CONVERSATION_ID_COLUMN = ConversationRecord.external_id.alias("conversation_id")
+
+
+def _run_info(row: dict[str, Any]) -> RunInfo:
+    """One projected run row as a RunInfo; the two JSON columns are decoded."""
+    return RunInfo(
+        **{
+            **row,
+            "variables": _load_json(row.get("variables")),
+            "request_params": _load_json(row.get("request_params")),
+        }
+    )
+
+
+# --- reads -------------------------------------------------------------------------
+
+
+def versions(name: str) -> list[VersionInfo]:
     """All versions of a prompt, oldest first."""
-    return [
-        VersionInfo(
-            version=row["version"],
-            template=row["template"],
-            template_hash=row["template_hash"],
-            source=row["source"],
-            fn_source_hash=row["fn_source_hash"],
-            created_at=row["created_at"],
+    if not _ready():
+        return []
+    query = (
+        PromptVersionRecord.select(
+            PromptVersionRecord.version,
+            PromptVersionRecord.template,
+            PromptVersionRecord.template_hash,
+            PromptVersionRecord.source,
+            PromptVersionRecord.fn_source_hash,
+            PromptVersionRecord.created_at,
         )
-        for row in storage.fetch_versions(name)
-    ]
+        .join(PromptRecord)
+        .where(PromptRecord.name == name)
+        .order_by(PromptVersionRecord.version)
+        .dicts()
+    )
+    return [VersionInfo(**row) for row in query]
 
 
 def diff(name: str, old: int, new: int) -> str:
@@ -280,6 +352,7 @@ def diff(name: str, old: int, new: int) -> str:
     for wanted in (old, new):
         if wanted not in by_number:
             raise ValueError(f"prompt {name!r} has no version {wanted}")
+
     lines = difflib.unified_diff(
         by_number[old].template.splitlines(),
         by_number[new].template.splitlines(),
@@ -290,64 +363,75 @@ def diff(name: str, old: int, new: int) -> str:
     return "\n".join(lines)
 
 
-def _run_info_from_row(row: Dict[str, Any]) -> RunInfo:
-    """Shape one raw run/turn dict row (from either fetch_runs or
-    fetch_conversation_turns) into a RunInfo. Missing optional columns
-    (older query shapes) default to None via dict.get."""
-    return RunInfo(
-        id=row["id"],
-        run_key=row["run_key"],
-        prompt_name=row.get("prompt_name"),
-        version=row.get("version"),
-        variables=_load_json(row.get("variables")),
-        rendered_text=row.get("rendered_text"),
-        provider=row["provider"],
-        model=row["model"],
-        request_params=_load_json(row.get("request_params")),
-        response_id=row["response_id"],
-        output_text=row["output_text"],
-        prompt_tokens=row["prompt_tokens"],
-        completion_tokens=row["completion_tokens"],
-        total_tokens=row["total_tokens"],
-        latency_ms=row["latency_ms"],
-        status=row["status"],
-        error=row["error"],
-        created_at=row["created_at"],
-        conversation_id=row.get("conversation_id"),
-        turn_index=row.get("turn_index"),
-        input_text=row.get("input_text"),
-        original_input_text=row.get("original_input_text"),
-    )
-
-
-def runs(name: str, version: Optional[int] = None, limit: int = 50) -> List[RunInfo]:
+def runs(name: str, version: int | None = None, limit: int = 50) -> list[RunInfo]:
     """Recorded runs for a prompt (optionally one version), newest first."""
-    return [
-        _run_info_from_row(row) for row in storage.fetch_runs(name, version=version, limit=limit)
-    ]
+    if not _ready():
+        return []
+    # Join through versions to prompts so callers filter by name, not ids.
+    query = (
+        RunRecord.select(*_RUN_COLUMNS, _CONVERSATION_ID_COLUMN)
+        .join(PromptVersionRecord)
+        .join(PromptRecord)
+        .switch(RunRecord)
+        .join(ConversationRecord, pw.JOIN.LEFT_OUTER)
+        .where(PromptRecord.name == name)
+    )
+    if version is not None:
+        query = query.where(PromptVersionRecord.version == version)
+    query = query.order_by(RunRecord.id.desc()).limit(limit).dicts()
+    return [_run_info(row) for row in query]
 
 
-def all_runs(limit: int = 100) -> List[RunInfo]:
-    """Every recorded run regardless of prompt (or with none), newest first."""
-    return [_run_info_from_row(row) for row in storage.fetch_all_runs(limit=limit)]
+def all_runs(limit: int = 100) -> list[RunInfo]:
+    """Every recorded run regardless of prompt (or with none), newest first.
+
+    Left-joined throughout: a conversation-only turn has no version/prompt
+    to join to, and a run outside any conversation has no conversation to
+    join to. Both cases surface as NULLs rather than dropping the row.
+    """
+    if not _ready():
+        return []
+    query = (
+        RunRecord.select(*_RUN_COLUMNS, _CONVERSATION_ID_COLUMN)
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(PromptRecord, pw.JOIN.LEFT_OUTER)
+        .switch(RunRecord)
+        .join(ConversationRecord, pw.JOIN.LEFT_OUTER)
+        .order_by(RunRecord.id.desc())
+        .limit(limit)
+        .dicts()
+    )
+    return [_run_info(row) for row in query]
 
 
-def list_prompts() -> List[PromptSummary]:
-    """Every prompt with its version/run counts, for an overview listing."""
-    return [
-        PromptSummary(
-            name=row["name"],
-            version_count=row["version_count"],
-            run_count=row["run_count"],
-            created_at=row["created_at"],
+def list_prompts() -> list[PromptSummary]:
+    """Every prompt with its version/run counts, for an overview listing.
+
+    COUNT(DISTINCT ...) is required here: joining both versions and runs off
+    the same prompt fans out into a cross product, so a plain COUNT would
+    double-count whichever side has more rows.
+    """
+    if not _ready():
+        return []
+    query = (
+        PromptRecord.select(
+            PromptRecord.name,
+            PromptRecord.created_at,
+            pw.fn.COUNT(pw.fn.DISTINCT(PromptVersionRecord.id)).alias("version_count"),
+            pw.fn.COUNT(pw.fn.DISTINCT(RunRecord.id)).alias("run_count"),
         )
-        for row in storage.fetch_prompt_summaries()
-    ]
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(RunRecord, pw.JOIN.LEFT_OUTER, on=(RunRecord.version == PromptVersionRecord.id))
+        .group_by(PromptRecord.id)
+        .order_by(PromptRecord.name)
+        .dicts()
+    )
+    return [PromptSummary(**row) for row in query]
 
 
 def list_conversations(
-    limit: int = 100, prompt: Optional[str] = None, version: Optional[int] = None
-) -> List[ConversationSummary]:
+    limit: int = 100, prompt: str | None = None, version: int | None = None
+) -> list[ConversationSummary]:
     """Every conversation with its turn count, most recently active first.
 
     ``prompt=`` keeps only conversations in which that prompt drove at least
@@ -357,16 +441,35 @@ def list_conversations(
     """
     if version is not None and prompt is None:
         raise ValueError("list_conversations(version=...) requires prompt= as well")
-    return [
-        ConversationSummary(
-            external_id=row["external_id"],
-            title=row["title"],
-            turn_count=row["turn_count"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+    if not _ready():
+        return []
+    query = (
+        ConversationRecord.select(
+            ConversationRecord.external_id,
+            ConversationRecord.title,
+            ConversationRecord.created_at,
+            ConversationRecord.updated_at,
+            pw.fn.COUNT(RunRecord.id).alias("turn_count"),
         )
-        for row in storage.fetch_conversation_summaries(limit=limit, prompt=prompt, version=version)
-    ]
+        .join(RunRecord, pw.JOIN.LEFT_OUTER)
+        .group_by(ConversationRecord.id)
+        .order_by(ConversationRecord.updated_at.desc())
+        .limit(limit)
+    )
+
+    # The prompt filter is a separate subquery rather than a condition on the
+    # counting join, so turn_count stays the conversation's full length.
+    if prompt is not None:
+        driven_by = (
+            RunRecord.select(RunRecord.conversation)
+            .join(PromptVersionRecord)
+            .join(PromptRecord)
+            .where(PromptRecord.name == prompt)
+        )
+        if version is not None:
+            driven_by = driven_by.where(PromptVersionRecord.version == version)
+        query = query.where(ConversationRecord.id.in_(driven_by))
+    return [ConversationSummary(**row) for row in query.dicts()]
 
 
 def conversation(external_id: str) -> ConversationInfo:
@@ -376,15 +479,33 @@ def conversation(external_id: str) -> ConversationInfo:
     output off each turn, in order, to replay the whole session. Raises
     ValueError if no conversation was ever recorded under this id.
     """
-    row = storage.fetch_conversation(external_id)
+    row = None
+    if _ready():
+        row = (
+            ConversationRecord.select()
+            .where(ConversationRecord.external_id == external_id)
+            .dicts()
+            .first()
+        )
     if row is None:
         raise ValueError(f"no conversation found for external_id {external_id!r}")
-    turns = [_run_info_from_row(r) for r in storage.fetch_conversation_turns(external_id)]
+
+    # The turns: version fields are NULL where a turn had no wrapped Prompt.
+    turn_rows = (
+        RunRecord.select(*_RUN_COLUMNS)
+        .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+        .join(PromptRecord, pw.JOIN.LEFT_OUTER)
+        .switch(RunRecord)
+        .join(ConversationRecord)
+        .where(ConversationRecord.external_id == external_id)
+        .order_by(RunRecord.turn_index)
+        .dicts()
+    )
     return ConversationInfo(
         external_id=row["external_id"],
         title=row["title"],
         metadata=_load_json(row["metadata"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
-        turns=turns,
+        turns=[_run_info(r) for r in turn_rows],
     )

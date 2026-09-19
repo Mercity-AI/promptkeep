@@ -10,6 +10,11 @@ from promptkeep import Prompt, history, storage, tracking, wrap
 from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response
 
 
+def _recorded(external_id):
+    """Whether a conversation row exists under this id."""
+    return any(c.external_id == external_id for c in history.list_conversations())
+
+
 class TestConversationStorage:
     """Conversation resolution and turn bookkeeping at the storage layer."""
 
@@ -19,11 +24,11 @@ class TestConversationStorage:
         first = storage.get_or_create_conversation("sess-1", title="First")
         second = storage.get_or_create_conversation("sess-1", title="Ignored")
         assert first == second
-        assert storage.fetch_conversation("sess-1")["title"] == "First"
+        assert history.conversation("sess-1").title == "First"
 
     def test_unknown_conversation_is_none(self):
         """Reading a conversation that was never created returns None, not an error."""
-        assert storage.fetch_conversation("nope") is None
+        assert not _recorded("nope")
 
     def test_turn_indexes_are_sequential(self):
         """reserve_turn_index claims a turn per call, and record_run without
@@ -85,7 +90,7 @@ class TestConversationContextManager:
         deferred to the first tracked call, matching version registration."""
         with promptkeep.conversation("sess-empty"):
             pass
-        assert storage.fetch_conversation("sess-empty") is None
+        assert not _recorded("sess-empty")
 
     def test_calls_inside_block_share_conversation_with_sequential_turns(self):
         """A Prompt-backed turn 0 and a plain follow-up turn 1 both land in
@@ -137,7 +142,7 @@ class TestConversationContextManager:
                 messages=[{"role": "user", "content": "hi"}],
                 promptkeep_conversation="sess-override",
             )
-        assert storage.fetch_conversation("sess-ambient") is None
+        assert not _recorded("sess-ambient")
         assert len(history.conversation("sess-override").turns) == 1
 
     def test_async_context_manager(self):
@@ -165,7 +170,7 @@ class TestConversationContextManager:
                 stream=True,
                 messages=[{"role": "user", "content": "stream this"}],
             )
-            assert storage.fetch_conversation("sess-stream") is not None  # reserved up front
+            assert _recorded("sess-stream")  # reserved up front
             list(stream)
         convo = history.conversation("sess-stream")
         assert convo.turns[0].output_text == "ok"

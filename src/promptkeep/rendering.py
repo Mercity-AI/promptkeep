@@ -8,9 +8,10 @@ Strict mode raises instead.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections.abc import Iterable, Mapping
 from string import Formatter
-from typing import Iterable, Mapping, Optional, Set
 
 logger = logging.getLogger("promptkeep")
 
@@ -22,6 +23,7 @@ class MissingVariableError(KeyError):
     """Raised in strict mode when a placeholder has no matching variable."""
 
     def __init__(self, missing: Iterable[str]):
+        """Sort and dedupe the missing names so the message is stable."""
         self.missing = sorted(set(missing))
         super().__init__(
             "Missing variables for placeholders: " + ", ".join(repr(m) for m in self.missing)
@@ -41,7 +43,7 @@ def _base_name(field_name: str) -> str:
     return field_name.split(".")[0].split("[")[0]
 
 
-def _rebuild_placeholder(field_name: str, conversion: Optional[str], spec: Optional[str]) -> str:
+def _rebuild_placeholder(field_name: str, conversion: str | None, spec: str | None) -> str:
     """Reassemble a parsed placeholder into its original `{field!conv:spec}` text."""
     out = "{" + field_name
     if conversion:
@@ -85,13 +87,13 @@ def normalize_template(template: str) -> str:
     return "".join(out)
 
 
-def extract_placeholders(template: str) -> Set[str]:
+def extract_placeholders(template: str) -> set[str]:
     """Return the set of variable names referenced by the template.
 
     `{user[name]}` and `{user.name}` both report `user`. Positional
     placeholders (`{}` / `{0}`) are not supported and are ignored here.
     """
-    names: Set[str] = set()
+    names: set[str] = set()
     try:
         for _literal, field_name, _spec, _conv in _formatter.parse(template):
             if field_name:
@@ -104,7 +106,7 @@ def extract_placeholders(template: str) -> Set[str]:
     return names
 
 
-def render(template: str, variables: Optional[Mapping] = None, strict: bool = False) -> str:
+def render(template: str, variables: Mapping | None = None, strict: bool = False) -> str:
     """Substitute variables into the template.
 
     Lenient (default): unknown placeholders stay as literal `{name}` text and
@@ -152,3 +154,17 @@ def render(template: str, variables: Optional[Mapping] = None, strict: bool = Fa
     if strict and missing:
         raise MissingVariableError(missing)
     return "".join(out)
+
+
+def template_hash(text: str, exact: bool = False) -> str:
+    """Content hash used as a template's version identity.
+
+    Default: hashes the *normalized* template (variable names canonicalized
+    to positional tokens), so renaming a placeholder — {var1} -> {x} —
+    resolves to the same version; only static text and placeholder structure
+    matter. With exact=True the raw text is hashed, making placeholder names
+    part of the identity.
+    """
+    if not exact:
+        text = normalize_template(text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

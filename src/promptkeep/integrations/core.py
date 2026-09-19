@@ -1,44 +1,53 @@
 """Provider-agnostic instrumentation: the one interceptor every adapter shares.
 
 ``instrument()`` installs a tracking replacement for each call method an
-adapter locates on a client. The replacement:
+adapter locates on a client. The replacement builds a ``_Call`` — one
+object holding everything known about the call in flight — and drives it:
 
-1. resolves the active conversation and strips promptkeep's own kwargs,
-2. asks the adapter to parse the request (Prompts substituted by plain
-   strings, the current turn picked out),
-3. runs pre-checks, calls the real method, runs post-checks,
-4. records one run per tracked prompt (or one bare turn inside a
-   conversation) through ``tracking`` -> ``storage``,
-5. attaches a RunHandle to the response when checks ran.
+1. promptkeep's own kwargs come off and the active conversation is resolved,
+2. the adapter parses the request (Prompts substituted by plain strings, the
+   current turn picked out),
+3. pre-checks run and may block or rewrite,
+4. the real method is called,
+5. post-checks run, one run row per tracked prompt (or one bare turn) is
+   recorded through ``tracking`` -> ``storage``, and a RunHandle is attached
+   to the response when checks ran.
 
 Sync/async and streaming/non-streaming are all handled here, once: the
-async orchestrators run each blocking phase via ``asyncio.to_thread``, and
-the stream proxies defer recording until the stream ends. Tracking can never
-break the user's call: recording is exception-shielded, adapter failures are
-logged and lose telemetry, and provider errors are re-raised unchanged after
-a failed run is recorded.
+async interceptor runs each blocking phase via ``asyncio.to_thread``, and
+the stream proxies defer the last phase until the stream ends. Tracking can
+never break the user's call: recording is exception-shielded, adapter
+failures are logged and lose telemetry, and provider errors are re-raised
+unchanged after a failed run is recorded.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any
 
+from .. import storage
 from ..checks import (
+    Check,
     CheckContext,
+    CheckResult,
+    PreOutcome,
     PromptBlocked,
     RunHandle,
     run_pre_checks,
     schedule_async,
     suppressed,
 )
+from ..config import get_settings
 from ..conversation import current as current_conversation
-from ..storage import new_run_key
-from ..tracking import record_conversation_turn, record_prompt_run
+from ..models import new_run_key
+from ..tracking import record_prompt_run
 from .base import ProviderAdapter, Request, ResponseFields, Target
 
 logger = logging.getLogger("promptkeep")
@@ -85,10 +94,302 @@ def _instrument_target(target: Target, adapter: ProviderAdapter) -> None:
     target.owner._pm_instrumented = True
 
 
-# --- conversation resolution --------------------------------------------------------
+# --- the interceptors ------------------------------------------------------------------
 
 
-def _resolve_conversation(kwargs) -> Tuple[Optional[str], Optional[str], dict]:
+def _make_sync_create(original: Any, adapter: ProviderAdapter) -> Any:
+    """Build the sync replacement for a provider's call method."""
+
+    @functools.wraps(original)
+    def create(*args: Any, **kwargs: Any) -> Any:
+        """Substitute prompts, gate, call the real API, audit, record."""
+        # A call made from inside a check (e.g. an LLM judge) is a passthrough:
+        # no tracking, no nested checks — just strip our kwargs and delegate.
+        if suppressed():
+            _strip_promptkeep_kwargs(kwargs)
+            return original(*args, **kwargs)
+
+        # Everything known before the provider is called, in one place.
+        call = _Call(adapter, kwargs)
+        if call.checked:
+            call.run_pre()
+            blocked = call.blocked_response()
+            if blocked is not None:
+                return blocked
+
+        # The real call. A provider error is recorded, then re-raised untouched.
+        start = time.perf_counter()
+        try:
+            response = original(*args, **call.request.kwargs)
+        except Exception as exc:
+            call.record_error(repr(exc), _ms(start))
+            raise
+
+        # Streams are recorded when they end; everything else right now.
+        if call.streaming:
+            return _wrap_stream(call, response, start, _SyncStreamProxy)
+        return call.finish(response, _read_response(adapter, response), _ms(start))
+
+    return create
+
+
+def _make_async_create(original: Any, adapter: ProviderAdapter) -> Any:
+    """Build the async replacement for a provider's call method: the same
+    phases, each blocking one run via asyncio.to_thread so a slow check or a
+    DB write never stalls the event loop."""
+
+    @functools.wraps(original)
+    async def create(*args: Any, **kwargs: Any) -> Any:
+        """Async twin of the sync interceptor."""
+        if suppressed():
+            _strip_promptkeep_kwargs(kwargs)
+            return await original(*args, **kwargs)
+
+        call = _Call(adapter, kwargs)
+        if call.checked:
+            await asyncio.to_thread(call.run_pre)
+            # PromptBlocked raises straight through to_thread when on_block="raise".
+            blocked = await asyncio.to_thread(call.blocked_response)
+            if blocked is not None:
+                return blocked
+
+        start = time.perf_counter()
+        try:
+            response = await original(*args, **call.request.kwargs)
+        except Exception as exc:
+            await asyncio.to_thread(call.record_error, repr(exc), _ms(start))
+            raise
+
+        if call.streaming:
+            return _wrap_stream(call, response, start, _AsyncStreamProxy)
+        fields = _read_response(adapter, response)
+        return await asyncio.to_thread(call.finish, response, fields, _ms(start))
+
+    return create
+
+
+def _wrap_stream(call: _Call, stream: Any, start: float, proxy_cls: type) -> Any:
+    """Hand a stream back through a proxy that records the call once the
+    stream ends. An untracked stream (no Prompt, no conversation, no checks)
+    is returned as-is — there is nothing to record."""
+    if not call.records:
+        return stream
+    proxy = proxy_cls(stream, _StreamRecorder(call, start))
+    # A checked stream carries its handle from the start; finish() fills it.
+    if call.checked:
+        _attach_handle(proxy, call.handle)
+    return proxy
+
+
+# --- one call in flight ------------------------------------------------------------------
+
+
+class _Call:
+    """One tracked call in flight: what the interceptor knows before, during
+    and after the provider call, and the four things it does with it.
+
+    Built from the raw kwargs: promptkeep's own kwargs come off, the adapter
+    parses the rest, the conversation slot is reserved, and checks are
+    collected across the three scopes. A call is *checked* when any check
+    applies; checked calls mint their ``run_key`` up front (see
+    ``models.new_run_key``) so the RunHandle and late verdicts can name the
+    run before its row exists.
+    """
+
+    def __init__(self, adapter: ProviderAdapter, kwargs: dict[str, Any]) -> None:
+        """Parse the call and reserve everything it needs. No provider I/O."""
+        # promptkeep's kwargs never reach the provider; take them off first.
+        external_id, title, metadata = _resolve_conversation(kwargs)
+        per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
+
+        # The adapter turns what's left into a Request (Prompts substituted).
+        self.adapter = adapter
+        self.request: Request = adapter.parse_request(kwargs)
+
+        # The conversation slot: one turn number per physical API call.
+        self.conversation_id, self.turn_index = _prepare_conversation(external_id, title, metadata)
+
+        # Checks across scopes; a checked call gets its identity now.
+        self.pre_checks, self.post_checks = _collect_checks(
+            self.request.tracked, per_call_pre, per_call_post
+        )
+        self.checked = bool(self.pre_checks or self.post_checks)
+        self.run_key: str | None = new_run_key() if self.checked else None
+
+        # Filled in by run_pre() for a checked call.
+        self.outcome = PreOutcome()
+        self.ctx: CheckContext | None = None
+        self.version: int | None = None
+        self.handle: RunHandle | None = None
+        # Set only when a pre-check rewrote the turn: what the caller passed.
+        self.original_input_text: str | None = None
+
+    @property
+    def records(self) -> bool:
+        """Whether this call produces a run row at all: a tracked Prompt, a
+        conversation turn, or a checked call (whose row anchors its verdicts)."""
+        return bool(self.request.tracked) or self.conversation_id is not None or self.checked
+
+    @property
+    def streaming(self) -> bool:
+        """Whether the provider will return a stream for this call."""
+        return self.adapter.is_streaming(self.request)
+
+    # --- phase 1: the gate --------------------------------------------------
+
+    def run_pre(self) -> None:
+        """Run the pre-checks in order, then fold any rewrite into the request.
+
+        The context the checks saw is kept: the post-check context is derived
+        from it later, so a rewrite reaches the outgoing request, the audit
+        and the recorded row alike. When several prompts ride one call, the
+        checks and the RunHandle refer to the first — the run the verdicts
+        are filed under (see _write) — so ctx.prompt and the row agree.
+        """
+        tracked = self.request.tracked
+        prompt_obj = tracked[0][0] if tracked else None
+        self.version = prompt_obj.version if prompt_obj is not None else None
+        self.ctx = CheckContext(
+            rendered=self.request.joined_text,
+            messages=self.request.payload,
+            prompt=prompt_obj,
+            variables=tracked[0][1] if tracked else None,
+            model=self.request.kwargs.get("model"),
+            provider=self.adapter.provider,
+            last_text=self.request.input_text,
+        )
+        self.outcome = run_pre_checks(list(self.pre_checks), self.ctx)
+        self.handle = RunHandle(None, self.version, list(self.outcome.results))
+
+        # A rewrite has to reach three places: the wire, the audit, the row.
+        if self.outcome.rewritten is not None:
+            original = self.ctx.last_text
+            self.request = self.adapter.apply_rewrite(self.request, self.outcome.rewritten)
+            self.ctx = replace(
+                self.ctx,
+                rendered=self.request.joined_text,
+                last_text=self.request.input_text,
+                messages=self.request.payload,
+                original_text=original,
+            )
+            self.original_input_text = original
+
+    def blocked_response(self) -> Any | None:
+        """If a pre-check blocked: record the blocked run, then raise
+        PromptBlocked or return a response-shaped stub carrying the handle.
+        None when nothing blocked."""
+        blocked = self.outcome.blocked
+        if blocked is None:
+            return None
+        run_key = self._write(ResponseFields(), 0, "blocked", f"blocked by check {blocked.name!r}")
+        if get_settings().on_block == "raise":
+            raise PromptBlocked(blocked.name, blocked.message)
+        stub = self.adapter.blocked_stub(self.request, blocked)
+        assert self.handle is not None
+        self.handle.run_key = run_key
+        _attach_handle(stub, self.handle)
+        return stub
+
+    # --- phase 2: the outcome -----------------------------------------------
+
+    def record_error(
+        self, error_repr: str, latency_ms: int, fields: ResponseFields | None = None
+    ) -> None:
+        """The provider raised (or a stream broke): record the failed run,
+        keeping any pre verdicts and whatever a stream had produced so far."""
+        self._write(fields or ResponseFields(), latency_ms, "error", error_repr)
+
+    def finish(
+        self, response: Any, fields: ResponseFields, latency_ms: int, attach: bool = True
+    ) -> Any:
+        """Record the completed call and return the response.
+
+        Unchecked: one row (per tracked prompt, or a bare turn) and nothing
+        else. Checked: the blocking post-checks run first, the row goes down
+        with every verdict known so far, the async post-checks are scheduled
+        (their verdicts land later, by run_key), and the RunHandle is filled
+        in — and attached to the response unless it already rides on a
+        stream proxy. For a stream, ``response`` is the ResponseFields summary
+        (there is no single provider object), and that is what a post-check
+        sees as ``ctx.response``.
+        """
+        if not self.checked:
+            self._write(fields, latency_ms, "ok", None)
+            return response
+
+        # The audit context: the pre context plus the response.
+        assert self.ctx is not None and self.handle is not None
+        post_ctx = replace(
+            self.ctx,
+            model=fields.model or self.ctx.model,
+            output_text=fields.output_text,
+            response=response,
+        )
+        blocking = [c for c in self.post_checks if c.mode != "async"]
+        asyncs = [c for c in self.post_checks if c.mode == "async"]
+        results = list(self.outcome.results) + [c.run(post_ctx) for c in blocking]
+
+        # The row, then the verdicts still to come, then the handle.
+        run_key = self._write(fields, latency_ms, "ok", None, results)
+        futures = [schedule_async(c, post_ctx, run_key) for c in asyncs]
+        self.handle.run_key = run_key
+        self.handle.checks = list(results)
+        self.handle._futures = futures
+        if attach:
+            _attach_handle(response, self.handle)
+        return response
+
+    # --- the write -------------------------------------------------------------
+
+    def _write(
+        self,
+        fields: ResponseFields,
+        latency_ms: int,
+        status: str,
+        error: str | None,
+        results: list[CheckResult] | None = None,
+    ) -> str | None:
+        """Write this call's run row(s); return the primary run's key.
+
+        One row per tracked prompt, sharing the response metadata; a call
+        with no Prompt still gets one bare row when it belongs to a
+        conversation (so follow-up turns replay) or is checked (so its
+        verdicts have a run to hang off). The verdicts — ``results`` if
+        given, else the pre verdicts — and the minted run_key go with the
+        first prompt's row; the rest record plainly under keys of their own.
+        Shielded: nothing here can raise into the request path.
+        """
+        if not self.records:
+            return None
+        verdicts = self.outcome.results if results is None else results
+        check_rows = [r.to_row() for r in verdicts] or None
+        common: dict[str, Any] = dict(
+            provider=self.adapter.provider,
+            latency_ms=latency_ms,
+            status=status,
+            error=error,
+            conversation_id=self.conversation_id,
+            turn_index=self.turn_index,
+            input_text=self.request.input_text,
+            original_input_text=self.original_input_text,
+            **_row_fields(self.request, fields),
+        )
+        tracked = self.request.tracked
+        if not tracked:
+            return _record_bare(run_key=self.run_key, checks=check_rows, **common)
+        (prompt_obj, variables, rendered), *rest = tracked
+        run_key = record_prompt_run(
+            prompt_obj, variables, rendered, run_key=self.run_key, checks=check_rows, **common
+        )
+        for prompt_obj, variables, rendered in rest:
+            record_prompt_run(prompt_obj, variables, rendered, **common)
+        return run_key
+
+
+# --- request-side helpers ------------------------------------------------------------
+
+
+def _resolve_conversation(kwargs: dict[str, Any]) -> tuple[str | None, str | None, dict[str, Any]]:
     """Which conversation (if any) this call belongs to.
 
     The explicit per-call kwarg always wins over the ambient `with
@@ -105,7 +406,9 @@ def _resolve_conversation(kwargs) -> Tuple[Optional[str], Optional[str], dict]:
     return None, None, {}
 
 
-def _prepare_conversation(external_id, title, metadata) -> Tuple[Optional[int], Optional[int]]:
+def _prepare_conversation(
+    external_id: str | None, title: str | None, metadata: dict[str, Any]
+) -> tuple[int | None, int | None]:
     """Resolve/create the conversation row and reserve this call's turn number.
 
     One reservation per physical API call, reused for every run row it
@@ -115,8 +418,6 @@ def _prepare_conversation(external_id, title, metadata) -> Tuple[Optional[int], 
     if external_id is None:
         return None, None
     try:
-        from .. import storage
-
         conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
         if conversation_id is None:
             return None, None
@@ -126,24 +427,47 @@ def _prepare_conversation(external_id, title, metadata) -> Tuple[Optional[int], 
         return None, None
 
 
-class _RunContext(NamedTuple):
-    """What identifies a checked call's run row before anything is written.
+def _pop_check_kwargs(kwargs: dict[str, Any]) -> tuple[tuple[Check, ...], tuple[Check, ...]]:
+    """Strip and return per-call checks (never reach the provider)."""
+    pre = kwargs.pop("promptkeep_pre", None) or ()
+    post = kwargs.pop("promptkeep_post", None) or ()
+    return tuple(pre), tuple(post)
 
-    run_key is minted up front (see storage.new_run_key) so the RunHandle and
-    any late verdict can name the run while its row is still in the write
-    queue. original_input_text is filled in only when a pre-check rewrote the
-    turn: input_text then holds what was sent, this holds what the caller
-    passed.
+
+def _strip_promptkeep_kwargs(kwargs: dict[str, Any]) -> None:
+    """Drop every promptkeep kwarg — for the untracked passthrough path."""
+    for key in _PROMPTKEEP_KWARGS:
+        kwargs.pop(key, None)
+
+
+def _collect_checks(
+    tracked: list, per_call_pre: tuple[Check, ...], per_call_post: tuple[Check, ...]
+) -> tuple[list[Check], list[Check]]:
+    """Merge checks from all three scopes: global < prompt < per-call.
+
+    Deduplicated by name (most specific wins), preserving order. A tracked
+    prompt contributes its own pre/post; global comes from configure().
     """
+    settings = get_settings()
+    pre: list[Check] = []
+    post: list[Check] = []
+    for prompt_obj, _vars, _rendered in tracked:
+        pre.extend(prompt_obj.pre)
+        post.extend(prompt_obj.post)
+    pre = list(settings.pre) + pre + list(per_call_pre)
+    post = list(settings.post) + post + list(per_call_post)
+    return _dedupe_checks(pre), _dedupe_checks(post)
 
-    run_key: str
-    conversation_id: Optional[int]
-    turn_index: Optional[int]
-    input_text: Optional[str]
-    original_input_text: Optional[str] = None
+
+def _dedupe_checks(checks: list[Check]) -> list[Check]:
+    """Keep the last check registered under each name (most specific scope)."""
+    by_name: dict[str, Check] = {}
+    for chk in checks:
+        by_name[chk.name] = chk
+    return list(by_name.values())
 
 
-# --- adapter calls, shielded ---------------------------------------------------------
+# --- response-side helpers ------------------------------------------------------------
 
 
 def _ms(start: float) -> int:
@@ -163,7 +487,7 @@ def _read_response(adapter: ProviderAdapter, response: Any) -> ResponseFields:
         return ResponseFields()
 
 
-def _row_fields(request: Request, fields: ResponseFields) -> dict:
+def _row_fields(request: Request, fields: ResponseFields) -> dict[str, Any]:
     """The response-side columns of a run row. The request's model is the
     fallback when the response (or an error) didn't name one."""
     return dict(
@@ -177,126 +501,18 @@ def _row_fields(request: Request, fields: ResponseFields) -> dict:
     )
 
 
-# --- run recording ---------------------------------------------------------------
+def _record_bare(**fields: Any) -> str | None:
+    """A run row with no Prompt — a bare conversation turn, or the anchor a
+    checked call's verdicts hang off — shielded like every write made from
+    the request path."""
+    try:
+        return storage.record_run(**fields)
+    except Exception:
+        logger.warning("promptkeep: failed to record run", exc_info=True)
+        return None
 
 
-def _record_runs(
-    adapter: ProviderAdapter,
-    request: Request,
-    fields: ResponseFields,
-    latency_ms: int,
-    status: str = "ok",
-    error: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-    turn_index: Optional[int] = None,
-    input_text: Optional[str] = None,
-) -> None:
-    """Write one run row per tracked prompt, sharing the response metadata.
-
-    When no Prompt was tracked but a conversation is active, still write one
-    untracked turn row — otherwise plain follow-up messages would be
-    invisible to conversation playback even though they're part of the
-    session.
-    """
-    if not request.tracked and conversation_id is None:
-        return
-    common = dict(
-        provider=adapter.provider,
-        latency_ms=latency_ms,
-        status=status,
-        error=error,
-        conversation_id=conversation_id,
-        turn_index=turn_index,
-        input_text=input_text,
-        **_row_fields(request, fields),
-    )
-    if request.tracked:
-        for prompt_obj, variables, rendered in request.tracked:
-            record_prompt_run(prompt_obj, variables, rendered, **common)
-    else:
-        record_conversation_turn(**common)
-
-
-def _record_checked(adapter, request, fields, latency_ms, status, error, conv, check_rows):
-    """Record the run for a checked call (checks bundled), returning its run_key
-    — or None when nothing was recorded (tracking disabled, write_mode "off",
-    sampled out).
-
-    Mirrors _record_runs but returns the primary run's key and attaches the
-    verdicts. For multiple tracked prompts, checks bundle onto the first —
-    the run whose key the RunHandle carries; the rest record normally under
-    keys of their own.
-    """
-    common = dict(
-        provider=adapter.provider,
-        latency_ms=latency_ms,
-        status=status,
-        error=error,
-        conversation_id=conv.conversation_id,
-        turn_index=conv.turn_index,
-        input_text=conv.input_text,
-        original_input_text=conv.original_input_text,
-        **_row_fields(request, fields),
-    )
-    tracked = request.tracked
-    if tracked:
-        run_key = record_prompt_run(
-            tracked[0][0],
-            tracked[0][1],
-            tracked[0][2],
-            run_key=conv.run_key,
-            checks=check_rows,
-            **common,
-        )
-        for prompt_obj, variables, rendered in tracked[1:]:
-            record_prompt_run(prompt_obj, variables, rendered, **common)
-        return run_key
-    return record_conversation_turn(run_key=conv.run_key, checks=check_rows, **common)
-
-
-# --- checks -----------------------------------------------------------------------
-
-
-def _pop_check_kwargs(kwargs):
-    """Strip and return per-call checks (never reach the provider)."""
-    pre = kwargs.pop("promptkeep_pre", None) or ()
-    post = kwargs.pop("promptkeep_post", None) or ()
-    return tuple(pre), tuple(post)
-
-
-def _strip_promptkeep_kwargs(kwargs) -> None:
-    """Drop every promptkeep kwarg — for the untracked passthrough path."""
-    for key in _PROMPTKEEP_KWARGS:
-        kwargs.pop(key, None)
-
-
-def _collect_checks(tracked, per_call_pre, per_call_post):
-    """Merge checks from all three scopes: global < prompt < per-call.
-
-    Deduplicated by name (most specific wins), preserving order. A tracked
-    prompt contributes its own pre/post; global comes from configure().
-    """
-    from ..config import get_settings
-
-    settings = get_settings()
-    pre, post = [], []
-    for prompt_obj, _vars, _rendered in tracked:
-        pre.extend(prompt_obj.pre)
-        post.extend(prompt_obj.post)
-    pre = list(settings.pre) + pre + list(per_call_pre)
-    post = list(settings.post) + post + list(per_call_post)
-    return _dedupe_checks(pre), _dedupe_checks(post)
-
-
-def _dedupe_checks(checks):
-    """Keep the last check registered under each name (most specific scope)."""
-    by_name = {}
-    for chk in checks:
-        by_name[chk.name] = chk
-    return list(by_name.values())
-
-
-def _attach_handle(response, handle):
+def _attach_handle(response: Any, handle: RunHandle | None) -> None:
     """Attach the RunHandle as response.promptkeep, tolerating frozen objects."""
     try:
         object.__setattr__(response, "promptkeep", handle)
@@ -307,356 +523,28 @@ def _attach_handle(response, handle):
             logger.warning("promptkeep: could not attach run handle to response", exc_info=True)
 
 
-# The checked-call flow is split into pure-sync phases (run pre-checks, handle
-# a block, run post-checks + record) so the sync and async orchestrators can
-# share every bit of logic — the async one just runs each phase via
-# asyncio.to_thread so a blocking check or DB write never stalls the loop.
-
-
-def _checked_pre(adapter, request, pre_checks):
-    """Run pre-checks; return (outcome, pre_ctx, version).
-
-    pre_ctx is the exact context the checks saw. The later phases derive the
-    post-check context from it (via dataclasses.replace) instead of rebuilding
-    it — one source of truth for the request-side fields, and the place a
-    rewrite gets folded in so the audit and the recorded row see the
-    rewritten turn, not the original.
-    """
-    # When several prompts ride one call, checks and the RunHandle refer to
-    # the first — the same run the verdicts are filed under (see
-    # _record_checked) — so ctx.prompt/version and the recorded row agree.
-    prompt_obj = request.tracked[0][0] if request.tracked else None
-    variables = request.tracked[0][1] if request.tracked else None
-    version = prompt_obj.version if prompt_obj is not None else None
-    pre_ctx = CheckContext(
-        rendered=request.joined_text,
-        messages=request.payload,
-        prompt=prompt_obj,
-        variables=variables,
-        model=request.kwargs.get("model"),
-        provider=adapter.provider,
-        last_text=request.input_text,
-    )
-    outcome = run_pre_checks(list(pre_checks), pre_ctx)
-    return outcome, pre_ctx, version
-
-
-def _apply_pre_rewrite(adapter, outcome, request, pre_ctx, conv):
-    """Fold a pre-check rewrite into everything downstream, or pass through.
-
-    A rewrite has to reach three places, not just the wire: the outgoing
-    request (so the provider sees it), the post-check context (so the audit
-    grades what was actually sent), and the recorded ``input_text`` (so the
-    stored turn is what actually went out). The turn as the caller passed it
-    is kept alongside — ``original_input_text`` on the row, ``original_text``
-    on the context — so the record shows both sides of the change and which
-    check made it (its verdict row carries the rewritten text). Returns the
-    updated (request, pre_ctx, conv).
-    """
-    if outcome.rewritten is None:
-        return request, pre_ctx, conv
-    original = pre_ctx.last_text
-    request = adapter.apply_rewrite(request, outcome.rewritten)
-    pre_ctx = replace(
-        pre_ctx,
-        rendered=request.joined_text,
-        last_text=request.input_text,
-        messages=request.payload,
-        original_text=original,
-    )
-    conv = conv._replace(input_text=request.input_text, original_input_text=original)
-    return request, pre_ctx, conv
-
-
-def _checked_block(adapter, outcome, request, conv, version):
-    """If a pre-check blocked: record the blocked run, then raise PromptBlocked
-    or return a response-shaped stub. Returns None when nothing blocked."""
-    if outcome.blocked is None:
-        return None
-    from ..config import get_settings
-
-    pre_rows = [r.to_row() for r in outcome.results]
-    run_key = _record_checked(
-        adapter,
-        request,
-        ResponseFields(),
-        0,
-        "blocked",
-        f"blocked by check {outcome.blocked.name!r}",
-        conv,
-        pre_rows,
-    )
-    if get_settings().on_block == "raise":
-        raise PromptBlocked(outcome.blocked.name, outcome.blocked.message)
-    stub = adapter.blocked_stub(request, outcome.blocked)
-    _attach_handle(stub, RunHandle(run_key, version, outcome.results))
-    return stub
-
-
-def _checked_record_error(adapter, request, conv, outcome, error_repr, latency_ms):
-    """Record a failed checked call (provider raised), keeping pre verdicts."""
-    pre_rows = [r.to_row() for r in outcome.results]
-    _record_checked(
-        adapter, request, ResponseFields(), latency_ms, "error", error_repr, conv, pre_rows
-    )
-
-
-def _checked_post(
-    adapter,
-    response,
-    fields,
-    request,
-    conv,
-    outcome,
-    pre_ctx,
-    version,
-    post_checks,
-    latency,
-    handle=None,
-):
-    """Run post-checks, record the run with all known verdicts, and surface the
-    RunHandle. If `handle` is given (streaming: it's already on the proxy),
-    populate it in place; otherwise create one and attach it to `response`.
-    Async post-checks land later via their futures.
-
-    The post context is the pre context with the response fields filled in, so
-    any pre-check rewrite (already folded into pre_ctx) is what the audit sees.
-    Async post-checks run whether or not the run was persisted — the handle's
-    wait() still collects their verdicts; only the DB write is skipped then.
-    """
-    post_ctx = replace(
-        pre_ctx,
-        model=fields.model or pre_ctx.model,
-        output_text=fields.output_text,
-        response=response,
-    )
-    blocking = [c for c in post_checks if c.mode != "async"]
-    asyncs = [c for c in post_checks if c.mode == "async"]
-    blocking_results = [c.run(post_ctx) for c in blocking]
-
-    known_results = list(outcome.results) + blocking_results
-    check_rows = [r.to_row() for r in known_results]
-    run_key = _record_checked(adapter, request, fields, latency, "ok", None, conv, check_rows)
-
-    futures = [schedule_async(c, post_ctx, run_key) for c in asyncs]
-    if handle is None:
-        _attach_handle(response, RunHandle(run_key, version, known_results, futures))
-    else:
-        handle.run_key = run_key
-        handle.checks = list(known_results)
-        handle._futures = futures
-    return response
-
-
-def _run_checked_create(adapter, original, args, request, conv, pre_checks, post_checks):
-    """Checked call on the sync path: pre-gate, call, post-audit, RunHandle."""
-    outcome, pre_ctx, version = _checked_pre(adapter, request, pre_checks)
-    stub = _checked_block(adapter, outcome, request, conv, version)
-    if stub is not None:
-        return stub
-    request, pre_ctx, conv = _apply_pre_rewrite(adapter, outcome, request, pre_ctx, conv)
-    start = time.perf_counter()
-    try:
-        response = original(*args, **request.kwargs)
-    except Exception as exc:
-        _checked_record_error(adapter, request, conv, outcome, repr(exc), _ms(start))
-        raise
-    fields = _read_response(adapter, response)
-    return _checked_post(
-        adapter, response, fields, request, conv, outcome, pre_ctx, version, post_checks, _ms(start)
-    )
-
-
-async def _run_checked_create_async(
-    adapter, original, args, request, conv, pre_checks, post_checks
-):
-    """Checked call on the async path: same phases, each run off the event loop
-    via asyncio.to_thread so a slow check or DB write never blocks it."""
-    import asyncio
-
-    outcome, pre_ctx, version = await asyncio.to_thread(_checked_pre, adapter, request, pre_checks)
-    # _checked_block raises PromptBlocked through to_thread when on_block='raise'.
-    stub = await asyncio.to_thread(_checked_block, adapter, outcome, request, conv, version)
-    if stub is not None:
-        return stub
-    request, pre_ctx, conv = _apply_pre_rewrite(adapter, outcome, request, pre_ctx, conv)
-    start = time.perf_counter()
-    try:
-        response = await original(*args, **request.kwargs)
-    except Exception as exc:
-        await asyncio.to_thread(
-            _checked_record_error, adapter, request, conv, outcome, repr(exc), _ms(start)
-        )
-        raise
-    fields = _read_response(adapter, response)
-    return await asyncio.to_thread(
-        _checked_post,
-        adapter,
-        response,
-        fields,
-        request,
-        conv,
-        outcome,
-        pre_ctx,
-        version,
-        post_checks,
-        _ms(start),
-    )
-
-
-# --- interceptors -------------------------------------------------------------------
-
-
-def _make_sync_create(original, adapter: ProviderAdapter):
-    """Build the sync replacement for a provider's call method."""
-
-    @functools.wraps(original)
-    def create(*args, **kwargs):
-        """Substitute prompts, call the real API, record the outcome."""
-        # A call made from inside a check (e.g. an LLM judge) is a passthrough:
-        # no tracking, no nested checks — just strip our kwargs and delegate.
-        if suppressed():
-            _strip_promptkeep_kwargs(kwargs)
-            return original(*args, **kwargs)
-
-        external_id, title, metadata = _resolve_conversation(kwargs)
-        per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
-        request = adapter.parse_request(kwargs)
-        conversation_id, turn_index = _prepare_conversation(external_id, title, metadata)
-
-        pre_checks, post_checks = _collect_checks(request.tracked, per_call_pre, per_call_post)
-        if pre_checks or post_checks:
-            conv = _RunContext(new_run_key(), conversation_id, turn_index, request.input_text)
-            if adapter.is_streaming(request):
-                return _run_checked_stream(
-                    adapter, original, args, request, conv, pre_checks, post_checks
-                )
-            return _run_checked_create(
-                adapter, original, args, request, conv, pre_checks, post_checks
-            )
-
-        start = time.perf_counter()
-        try:
-            response = original(*args, **request.kwargs)
-        except Exception as exc:
-            # Record the failure, then surface the original error untouched.
-            _record_runs(
-                adapter,
-                request,
-                ResponseFields(),
-                _ms(start),
-                status="error",
-                error=repr(exc),
-                conversation_id=conversation_id,
-                turn_index=turn_index,
-                input_text=request.input_text,
-            )
-            raise
-        # Streaming: defer recording until the stream is exhausted.
-        if adapter.is_streaming(request) and (request.tracked or conversation_id is not None):
-            return _SyncStreamProxy(
-                response,
-                _StreamRecorder(adapter, request, start, conversation_id, turn_index),
-            )
-        _record_runs(
-            adapter,
-            request,
-            _read_response(adapter, response),
-            _ms(start),
-            conversation_id=conversation_id,
-            turn_index=turn_index,
-            input_text=request.input_text,
-        )
-        return response
-
-    return create
-
-
-def _make_async_create(original, adapter: ProviderAdapter):
-    """Build the async replacement for a provider's call method."""
-
-    @functools.wraps(original)
-    async def create(*args, **kwargs):
-        """Async twin of the sync interceptor: substitute, await, record."""
-        if suppressed():
-            _strip_promptkeep_kwargs(kwargs)
-            return await original(*args, **kwargs)
-        external_id, title, metadata = _resolve_conversation(kwargs)
-        per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
-        request = adapter.parse_request(kwargs)
-        conversation_id, turn_index = _prepare_conversation(external_id, title, metadata)
-
-        pre_checks, post_checks = _collect_checks(request.tracked, per_call_pre, per_call_post)
-        if pre_checks or post_checks:
-            conv = _RunContext(new_run_key(), conversation_id, turn_index, request.input_text)
-            if adapter.is_streaming(request):
-                return await _run_checked_stream_async(
-                    adapter, original, args, request, conv, pre_checks, post_checks
-                )
-            return await _run_checked_create_async(
-                adapter, original, args, request, conv, pre_checks, post_checks
-            )
-
-        start = time.perf_counter()
-        try:
-            response = await original(*args, **request.kwargs)
-        except Exception as exc:
-            _record_runs(
-                adapter,
-                request,
-                ResponseFields(),
-                _ms(start),
-                status="error",
-                error=repr(exc),
-                conversation_id=conversation_id,
-                turn_index=turn_index,
-                input_text=request.input_text,
-            )
-            raise
-        if adapter.is_streaming(request) and (request.tracked or conversation_id is not None):
-            return _AsyncStreamProxy(
-                response,
-                _StreamRecorder(adapter, request, start, conversation_id, turn_index),
-            )
-        _record_runs(
-            adapter,
-            request,
-            _read_response(adapter, response),
-            _ms(start),
-            conversation_id=conversation_id,
-            turn_index=turn_index,
-            input_text=request.input_text,
-        )
-        return response
-
-    return create
-
-
 # --- streaming --------------------------------------------------------------------
 
 
 class _StreamRecorder:
-    """Feeds streamed chunks to the adapter's absorber; writes the run once
-    when the stream ends."""
+    """Feeds streamed chunks to the adapter's absorber; finishes the call once
+    when the stream ends. Shared by the sync and async proxies."""
 
-    def __init__(self, adapter, request, start, conversation_id=None, turn_index=None):
-        """Hold the request context; the absorber fills in as chunks arrive."""
-        self.adapter = adapter
-        self.request = request
+    def __init__(self, call: _Call, start: float) -> None:
+        """Hold the call; the absorber fills in as chunks arrive."""
+        self.call = call
         self.start = start
-        self.conversation_id = conversation_id
-        self.turn_index = turn_index
-        self.absorber = adapter.stream_absorber()
+        self.absorber = call.adapter.stream_absorber()
         self.recorded = False
 
-    def absorb(self, chunk) -> None:
+    def absorb(self, chunk: Any) -> None:
         """Fold one chunk in. An absorber bug loses telemetry, never a chunk."""
         try:
             self.absorber.absorb(chunk)
         except Exception:
             logger.warning(
                 "promptkeep: %s adapter failed to absorb a stream chunk",
-                self.adapter.provider,
+                self.call.adapter.provider,
                 exc_info=True,
             )
 
@@ -667,139 +555,39 @@ class _StreamRecorder:
         except Exception:
             logger.warning(
                 "promptkeep: %s adapter failed to summarize a stream",
-                self.adapter.provider,
+                self.call.adapter.provider,
                 exc_info=True,
             )
             return ResponseFields()
 
-    def finish(self, status: str = "ok", error: Optional[str] = None) -> None:
-        """Write the run exactly once."""
+    def finish(self, status: str = "ok", error: str | None = None) -> None:
+        """Record exactly once: a failed run if the stream broke, otherwise the
+        completed call (post-checks included) with the accumulated summary
+        standing in for the response."""
         if self.recorded:
             return
         self.recorded = True
-        _record_runs(
-            self.adapter,
-            self.request,
-            self.summary(),
-            _ms(self.start),
-            status,
-            error,
-            conversation_id=self.conversation_id,
-            turn_index=self.turn_index,
-            input_text=self.request.input_text,
-        )
-
-
-class _CheckedStreamRecorder(_StreamRecorder):
-    """A stream recorder that also runs post-checks once the stream ends —
-    output only exists then — and populates the RunHandle already on the proxy.
-
-    Pre-checks already ran (before the stream started); their verdicts live in
-    `outcome`. finish() adds the post verdicts and records the run with both.
-    Post-checks receive the stream's ResponseFields summary as ``ctx.response``
-    — there is no single provider response object for a stream.
-    """
-
-    def __init__(
-        self, adapter, request, start, conv, outcome, pre_ctx, version, post_checks, handle
-    ):
-        super().__init__(adapter, request, start, conv.conversation_id, conv.turn_index)
-        self.conv = conv
-        self.outcome = outcome
-        self.pre_ctx = pre_ctx
-        self.version = version
-        self.post_checks = post_checks
-        self.handle = handle
-
-    def finish(self, status: str = "ok", error: Optional[str] = None) -> None:
-        """Record once: post-checks on success, or a checked error run."""
-        if self.recorded:
-            return
-        self.recorded = True
-        if error is not None:
-            _checked_record_error(
-                self.adapter, self.request, self.conv, self.outcome, error, _ms(self.start)
-            )
-            return
         fields = self.summary()
-        _checked_post(
-            self.adapter,
-            fields,
-            fields,
-            self.request,
-            self.conv,
-            self.outcome,
-            self.pre_ctx,
-            self.version,
-            self.post_checks,
-            _ms(self.start),
-            handle=self.handle,
-        )
-
-
-def _run_checked_stream(adapter, original, args, request, conv, pre_checks, post_checks):
-    """Checked streaming (sync): pre-gate before the stream, post-audit after it
-    drains. Returns a proxy carrying the (progressively filled) RunHandle."""
-    outcome, pre_ctx, version = _checked_pre(adapter, request, pre_checks)
-    stub = _checked_block(adapter, outcome, request, conv, version)
-    if stub is not None:
-        return stub
-    request, pre_ctx, conv = _apply_pre_rewrite(adapter, outcome, request, pre_ctx, conv)
-    start = time.perf_counter()
-    try:
-        stream = original(*args, **request.kwargs)
-    except Exception as exc:
-        _checked_record_error(adapter, request, conv, outcome, repr(exc), _ms(start))
-        raise
-    handle = RunHandle(None, version, list(outcome.results))
-    recorder = _CheckedStreamRecorder(
-        adapter, request, start, conv, outcome, pre_ctx, version, post_checks, handle
-    )
-    proxy = _SyncStreamProxy(stream, recorder)
-    _attach_handle(proxy, handle)
-    return proxy
-
-
-async def _run_checked_stream_async(
-    adapter, original, args, request, conv, pre_checks, post_checks
-):
-    """Checked streaming (async): same shape, blocking phases off the loop."""
-    import asyncio
-
-    outcome, pre_ctx, version = await asyncio.to_thread(_checked_pre, adapter, request, pre_checks)
-    stub = await asyncio.to_thread(_checked_block, adapter, outcome, request, conv, version)
-    if stub is not None:
-        return stub
-    request, pre_ctx, conv = _apply_pre_rewrite(adapter, outcome, request, pre_ctx, conv)
-    start = time.perf_counter()
-    try:
-        stream = await original(*args, **request.kwargs)
-    except Exception as exc:
-        await asyncio.to_thread(
-            _checked_record_error, adapter, request, conv, outcome, repr(exc), _ms(start)
-        )
-        raise
-    handle = RunHandle(None, version, list(outcome.results))
-    recorder = _CheckedStreamRecorder(
-        adapter, request, start, conv, outcome, pre_ctx, version, post_checks, handle
-    )
-    proxy = _AsyncStreamProxy(stream, recorder)
-    _attach_handle(proxy, handle)
-    return proxy
+        if error is not None:
+            self.call.record_error(error, _ms(self.start), fields)
+            return
+        self.call.finish(fields, fields, _ms(self.start), attach=False)
 
 
 class _SyncStreamProxy:
     """Wraps a sync stream: passes chunks through, records the run at the end."""
 
-    def __init__(self, stream, recorder: _StreamRecorder):
+    def __init__(self, stream: Any, recorder: _StreamRecorder) -> None:
+        """Hold the real stream and the recorder that finishes it."""
         self._stream = stream
         self._recorder = recorder
-        self._iterator = None
+        self._iterator: Any = None
 
-    def __iter__(self):
+    def __iter__(self) -> _SyncStreamProxy:
+        """The proxy is its own iterator."""
         return self
 
-    def __next__(self):
+    def __next__(self) -> Any:
         """Yield the next chunk, absorbing it; finish the run on exhaustion/error."""
         if self._iterator is None:
             self._iterator = iter(self._stream)
@@ -814,14 +602,14 @@ class _SyncStreamProxy:
         self._recorder.absorb(chunk)
         return chunk
 
-    def __enter__(self):
+    def __enter__(self) -> _SyncStreamProxy:
         """Support `with client...create(stream=True) as stream:` usage."""
         enter = getattr(self._stream, "__enter__", None)
         if enter is not None:
             enter()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         """Record on context exit (even if the loop broke early), then delegate."""
         self._recorder.finish(
             status="error" if exc_type else "ok",
@@ -829,10 +617,10 @@ class _SyncStreamProxy:
         )
         exit_ = getattr(self._stream, "__exit__", None)
         if exit_ is not None:
-            return exit_(exc_type, exc, tb)
+            return bool(exit_(exc_type, exc, tb))
         return False
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         """Everything else (close(), response, ...) delegates to the real stream."""
         return getattr(self._stream, name)
 
@@ -840,16 +628,18 @@ class _SyncStreamProxy:
 class _AsyncStreamProxy:
     """Async twin of _SyncStreamProxy for async streams."""
 
-    def __init__(self, stream, recorder: _StreamRecorder):
+    def __init__(self, stream: Any, recorder: _StreamRecorder) -> None:
+        """Hold the real stream and the recorder that finishes it."""
         self._stream = stream
         self._recorder = recorder
-        self._iterator = None
+        self._iterator: Any = None
         self._finalized = False
 
-    def __aiter__(self):
+    def __aiter__(self) -> _AsyncStreamProxy:
+        """The proxy is its own async iterator."""
         return self
 
-    async def _finish(self, status: str = "ok", error: Optional[str] = None) -> None:
+    async def _finish(self, status: str = "ok", error: str | None = None) -> None:
         """Finalize off the event loop.
 
         recorder.finish() runs post-checks and a synchronous DB insert. On the
@@ -864,14 +654,12 @@ class _AsyncStreamProxy:
         keeps it single-shot. asyncio.shield keeps the record from being lost
         if the consuming task is cancelled mid-finalize.
         """
-        import asyncio
-
         if self._finalized:
             return
         self._finalized = True
         await asyncio.shield(asyncio.to_thread(self._recorder.finish, status, error))
 
-    async def __anext__(self):
+    async def __anext__(self) -> Any:
         """Yield the next chunk, absorbing it; finish the run on exhaustion/error."""
         if self._iterator is None:
             self._iterator = self._stream.__aiter__()
@@ -886,14 +674,14 @@ class _AsyncStreamProxy:
         self._recorder.absorb(chunk)
         return chunk
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> _AsyncStreamProxy:
         """Support `async with ... as stream:` usage."""
         enter = getattr(self._stream, "__aenter__", None)
         if enter is not None:
             await enter()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         """Record on context exit (even if the loop broke early), then delegate."""
         await self._finish(
             status="error" if exc_type else "ok",
@@ -901,12 +689,12 @@ class _AsyncStreamProxy:
         )
         exit_ = getattr(self._stream, "__aexit__", None)
         if exit_ is not None:
-            return await exit_(exc_type, exc, tb)
+            return bool(await exit_(exc_type, exc, tb))
         return False
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         """Everything else delegates to the real stream."""
         return getattr(self._stream, name)
 
 
-__all__: List[str] = ["instrument", "is_instrumented"]
+__all__ = ["instrument", "is_instrumented"]

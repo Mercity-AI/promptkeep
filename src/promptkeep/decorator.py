@@ -13,12 +13,13 @@ import functools
 import hashlib
 import inspect
 import textwrap
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .prompts import Prompt
 
 
-def _function_source_hash(fn: Callable) -> Optional[str]:
+def _function_source_hash(fn: Callable) -> str | None:
     """Hash the function's source so history can tell code changes apart from
     same-code output changes. None when source isn't available (e.g. REPL)."""
     try:
@@ -28,7 +29,7 @@ def _function_source_hash(fn: Callable) -> Optional[str]:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def prompt(name: str, strict: Optional[bool] = None, exact_match: bool = False):
+def prompt(name: str, strict: bool | None = None, exact_match: bool = False):
     """Turn a template-building function into a Prompt factory.
 
         @prompt(name="REVIEW_SYSTEM")
