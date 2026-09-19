@@ -181,3 +181,41 @@ class TestVersioning:
         p = Prompt("hi {x}", name="VTEST")
         assert p.version is None
         assert p.text == "hi {x}"  # rendering still works
+
+
+class TestRegistrationFollowsTheDatabase:
+    """A Prompt remembers its version id — but only for the database it got it
+    from. Prompts are module-level objects; they outlive a configure()."""
+
+    def test_a_prompt_re_registers_after_the_database_changes(self, tmp_path):
+        from promptkeep import history, tracking
+
+        prompt = Prompt("Review {what}.", {"what": "code"}, name="MOVES")
+        assert prompt.version == 1
+
+        # A second file that already has other versions under the same ids.
+        promptkeep.configure(db_path=tmp_path / "other.db")
+        Prompt("Something else entirely.", name="SQUATTER").version
+        Prompt("An older wording of {what}.", name="MOVES").version
+
+        assert prompt.version == 2  # its own place in *this* file's lineage
+        tracking.record_prompt_run(prompt, {"what": "code"}, "Review code.", provider="openai")
+        (run,) = history.runs("MOVES")
+        assert run.version == 2 and run.rendered_text == "Review code."
+        assert history.runs("SQUATTER") == []  # not filed under whoever owns the old id
+
+    def test_a_formatted_prompt_keeps_the_memo_only_for_the_same_database(self, tmp_path):
+        prompt = Prompt("Review {what}.", name="MOVES")
+        prompt.version
+        promptkeep.configure(db_path=tmp_path / "other.db")
+        Prompt("Older {what}.", name="MOVES").version
+        assert prompt.format(what="code").version == 2
+
+    def test_no_second_lookup_while_the_database_stays_put(self, monkeypatch):
+        from promptkeep import storage
+
+        prompt = Prompt("Review {what}.", name="STAYS")
+        prompt.version
+        monkeypatch.setattr(storage, "register_version", lambda *a, **k: 1 / 0)
+        assert prompt.version == 1
+        assert prompt.format(what="x").version == 1

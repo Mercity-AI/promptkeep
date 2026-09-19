@@ -14,8 +14,13 @@ from . import storage
 from .config import get_settings
 from .rendering import extract_placeholders, render, template_hash
 
-# Sentinel distinguishing "registration not attempted yet" from "attempted,
-# got None" (tracking disabled or DB write failed).
+# "Registration not attempted yet". Once attempted, the slot holds
+# (database path, result) — the result being None when tracking was disabled or
+# the write failed. The path is part of the memo because a version id means
+# nothing in another file: a Prompt defined at import time can outlive a
+# configure(db_path=...), and a stale id would file its runs under whatever
+# version happens to own that id over there (or fail the foreign key and lose
+# them).
 _UNSET = object()
 
 
@@ -210,8 +215,9 @@ class Prompt:
         )
         # Same name and template means the same version: a registration already
         # made carries over. (A failed one doesn't — the derived prompt retries.)
-        if isinstance(self._registration, tuple):
-            object.__setattr__(derived, "_registration", self._registration)
+        memo = self._registration
+        if memo is not _UNSET and memo[1] is not None:
+            object.__setattr__(derived, "_registration", memo)
         return derived
 
     def _effective_strict(self) -> bool:
@@ -228,16 +234,20 @@ class Prompt:
         Returns (version_id, version_number) or None when tracking is disabled
         or the write failed. Never raises.
         """
-        registration = self._registration
-        if registration is _UNSET:
-            registration = storage.register_version(
-                self._name,
-                self._template,
-                self._source,
-                self._fn_source_hash,
-                exact_match=self._exact_match,
-            )
-            object.__setattr__(self, "_registration", registration)
+        # The memo is good only for the database it was made against.
+        database = str(get_settings().db_path)
+        memo = self._registration
+        if memo is not _UNSET and memo[0] == database:
+            return memo[1]
+
+        registration = storage.register_version(
+            self._name,
+            self._template,
+            self._source,
+            self._fn_source_hash,
+            exact_match=self._exact_match,
+        )
+        object.__setattr__(self, "_registration", (database, registration))
         return registration
 
     @property
@@ -267,6 +277,7 @@ class Prompt:
         tracking is disabled.
         """
         found = []
+        database = str(get_settings().db_path)
         for row in storage.version_rows(name):
             # A version registered with exact_match=True hashed its raw text;
             # rebuild it the same way, or it would re-register as a new version.
@@ -279,7 +290,7 @@ class Prompt:
                 fn_source_hash=row["fn_source_hash"],
             )
             # It came from the lineage, so it is registered: no lookup needed.
-            object.__setattr__(variant, "_registration", (row["id"], row["version"]))
+            object.__setattr__(variant, "_registration", (database, (row["id"], row["version"])))
             found.append(variant)
         return found
 
