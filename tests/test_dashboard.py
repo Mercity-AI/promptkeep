@@ -159,6 +159,13 @@ class TestConversationsRoutes:
         r = _client().get("/conversations/sess-1")
         assert "2 turns" in r.text
 
+    def test_reported_cost_shows_on_runs_and_conversation(self):
+        cid = storage.get_or_create_conversation("sess-cost")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="q", cost_usd=0.0042)
+        client = _client()
+        assert "$0.0042" in client.get("/runs").text
+        assert "$0.0042" in client.get("/conversations/sess-cost").text
+
     def test_conversation_detail_unknown_is_404(self):
         r = _client().get("/conversations/nope")
         assert r.status_code == 404

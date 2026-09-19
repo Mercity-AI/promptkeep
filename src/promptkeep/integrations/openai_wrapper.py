@@ -3,8 +3,9 @@
 All the shape knowledge for one provider surface: where ``create`` lives,
 that Prompts sit in ``messages[*].content`` (a string or a list of text
 blocks), that the newest non-system message is the current turn, and how a
-response and its streamed chunks report text, ids and usage. Nothing here
-records anything — ``core.py`` does the tracking through the adapter
+response and its streamed chunks report text, ids, usage and — on endpoints
+that say so, like OpenRouter — what the call cost. Nothing here records
+anything — ``core.py`` does the tracking through the adapter
 interface in ``base.py``.
 
 We never monkey-patch the ``openai`` module: only the client object the user
@@ -78,6 +79,7 @@ class OpenAIChatAdapter(ProviderAdapter):
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
+            cost_usd=_reported_cost(usage),
         )
 
     def stream_absorber(self) -> StreamAbsorber:
@@ -127,7 +129,26 @@ class _ChatStreamAbsorber(StreamAbsorber):
             prompt_tokens=getattr(self.usage, "prompt_tokens", None),
             completion_tokens=getattr(self.usage, "completion_tokens", None),
             total_tokens=getattr(self.usage, "total_tokens", None),
+            cost_usd=_reported_cost(self.usage),
         )
+
+
+# --- usage ---------------------------------------------------------------------
+
+
+def _reported_cost(usage: Any) -> float | None:
+    """The cost the endpoint itself reported for a call, in US dollars.
+
+    OpenAI's own API reports none. OpenRouter — the same chat shape — puts
+    ``cost`` on every usage block (in credits, which are dollars), including
+    a stream's final chunk; the OpenAI SDK keeps fields it doesn't model, so
+    it reads like any other attribute. Anything that isn't a plain number is
+    treated as "not reported" rather than guessed at.
+    """
+    cost = getattr(usage, "cost", None)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
 
 
 # --- message processing --------------------------------------------------------

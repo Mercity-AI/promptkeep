@@ -32,6 +32,14 @@ public APIs; each such change is called out below.
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
 
+- Cost tracking: a run records what the provider said the call cost, as
+  `RunInfo.cost_usd` (schema v6 adds `runs.cost_usd`). It is read off the
+  response's usage block — OpenRouter reports `usage.cost` on every response,
+  streamed or not — and is never estimated: a provider that reports nothing
+  (OpenAI's own API) leaves it `None`. `ConversationInfo.total_cost` sums it,
+  `storage.record_run(cost_usd=...)` takes it for hand-recorded runs, and the
+  dashboard shows it per run and per conversation.
+
 ### Changed
 
 - Internal restructuring, no public API change: `storage` is split into
@@ -48,6 +56,12 @@ public APIs; each such change is called out below.
   registered adapters.
 - For a *streamed* checked call, a post-check's `ctx.response` is the
   stream's `ResponseFields` summary rather than a synthetic response object.
+
+### Fixed
+
+- `ConversationInfo.total_tokens` counted a call once per tracked Prompt: a
+  call carrying two Prompts writes two rows repeating the same usage. Totals
+  now count each API call once.
 
 ## [0.3.0] - 2026-09-11
 

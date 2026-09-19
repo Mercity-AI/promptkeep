@@ -498,6 +498,7 @@ def _row_fields(request: Request, fields: ResponseFields) -> dict[str, Any]:
         prompt_tokens=fields.prompt_tokens,
         completion_tokens=fields.completion_tokens,
         total_tokens=fields.total_tokens,
+        cost_usd=fields.cost_usd,
     )
 
 

@@ -108,6 +108,11 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   (`read_response`, the absorber), so an adapter bug loses telemetry, never a call.
   `tests/test_adapters.py` is the contract every adapter must pass — a new provider adds one
   `Scenario` there. Today the only adapter is OpenAI `chat.completions`.
+- **Cost is reported, never estimated.** `runs.cost_usd` (schema v6) holds what the provider
+  itself said the call cost — adapters read it off the usage block (`ResponseFields.cost_usd`;
+  OpenRouter sends `usage.cost` on every response and on a stream's last chunk). A provider
+  that reports nothing leaves it NULL. Don't add a bundled price table: it goes stale, and
+  "unknown" is a better answer than a wrong number.
 - **The wrapper never monkey-patches a provider module** — only the object passed to
   `wrap()` gets its method replaced (idempotent via `_pm_instrumented` on the method's owner).
   Message dicts are copied, never mutated. Streaming defers run recording until the stream

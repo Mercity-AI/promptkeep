@@ -17,7 +17,7 @@ import playhouse.migrate as pm
 from .models import MODELS, CheckRecord, ConversationRecord, PromptVersionRecord, new_run_key
 from .rendering import template_hash
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def migrate(database: pw.SqliteDatabase) -> None:
@@ -112,6 +112,14 @@ def migrate(database: pw.SqliteDatabase) -> None:
                 )
             pm.migrate(migrator.add_index("runs", ("run_key",), True))
             database.execute_sql("PRAGMA user_version = 5")
+
+    # v6: runs.cost_usd — the provider-reported cost of the call. Old rows stay
+    # NULL: nothing recorded what they cost, and a guess would be worse.
+    if user_version < 6:
+        with database.atomic():
+            migrator = pm.SqliteMigrator(database)
+            pm.migrate(migrator.add_column("runs", "cost_usd", pw.FloatField(null=True)))
+            database.execute_sql("PRAGMA user_version = 6")
 
 
 def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:

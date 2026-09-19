@@ -8,18 +8,32 @@ sync and async flavors.
 from types import SimpleNamespace
 
 
+def make_usage(prompt_tokens=10, completion_tokens=5, cost=None):
+    """A usage block. ``cost`` is the field OpenRouter adds to OpenAI's shape;
+    left off entirely when None, as it is against OpenAI's own API."""
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+    if cost is not None:
+        usage.cost = cost
+    return usage
+
+
 def make_response(
-    content="hello!", model="gpt-test", response_id="resp_1", prompt_tokens=10, completion_tokens=5
+    content="hello!",
+    model="gpt-test",
+    response_id="resp_1",
+    prompt_tokens=10,
+    completion_tokens=5,
+    cost=None,
 ):
     """Build a chat-completion response shaped like the real SDK's object."""
     return SimpleNamespace(
         id=response_id,
         model=model,
-        usage=SimpleNamespace(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+        usage=make_usage(prompt_tokens, completion_tokens, cost),
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
     )
 

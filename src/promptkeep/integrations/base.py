@@ -61,7 +61,10 @@ class Request:
 @dataclass(frozen=True)
 class ResponseFields:
     """What a run row records from a response. Every field is optional: an
-    error has no response, a stream may never report usage."""
+    error has no response, a stream may never report usage.
+
+    cost_usd is the cost the provider itself reported for the call, in US
+    dollars — None when it reports none. Adapters must not estimate it."""
 
     model: str | None = None
     response_id: str | None = None
@@ -69,6 +72,7 @@ class ResponseFields:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cost_usd: float | None = None
 
 
 class StreamAbsorber(ABC):

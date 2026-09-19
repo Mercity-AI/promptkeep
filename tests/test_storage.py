@@ -298,6 +298,10 @@ class TestSchemaMigration:
             r[0] or "" for r in conn.execute("SELECT sql FROM sqlite_master WHERE type='index'")
         )
         assert "UNIQUE" in index_sql and "run_key" in index_sql
+        # v6: the cost column arrives empty — old runs never recorded a cost.
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert "cost_usd" in run_cols
+        assert legacy.cost_usd is None
         conn.close()
 
         (chk,) = history.checks(legacy.run_key)

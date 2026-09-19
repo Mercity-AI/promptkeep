@@ -24,6 +24,7 @@ def create_app() -> FastAPI:
     routes read through history/storage at request time, not at import time."""
     app = FastAPI(title="promptkeep")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    templates.env.filters["cost"] = history.format_cost
 
     @app.get("/")
     def root():

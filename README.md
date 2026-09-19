@@ -82,9 +82,14 @@ completion = client.chat.completions.create(
 ```
 
 The API receives a plain string; a *run* is recorded linking this prompt version to the
-variables used, the rendered text, the model, the output, token usage, and latency.
+variables used, the rendered text, the model, the output, token usage, cost, and latency.
 Streaming, async clients, and multi-part content are supported. Tracking failures never
 break the API call. Unwrapped clients work too — just pass `prompt.text`.
+
+**Cost** is whatever the endpoint itself reports: OpenRouter (the same chat shape — point the
+OpenAI SDK at it) returns `usage.cost` on every response, stream or not, and that lands on the
+run as `cost_usd`. OpenAI's own API reports no cost, so those runs read `None` — promptkeep
+never estimates one from a price table that would be stale by next month.
 
 OpenAI `chat.completions` is the only built-in provider today. The wrapper is built on a
 small adapter interface (`promptkeep.integrations.ProviderAdapter`), so another SDK is one
@@ -207,6 +212,7 @@ convo.turns                                  # ordered turns: input, output, ver
 convo.metadata                               # whatever you attached at the start
 convo.versions_used                          # {"REVIEW_SYSTEM": [4, 5]} — what drove it
 convo.total_tokens, convo.duration           # usage summed; wall-clock seconds
+convo.total_cost                             # dollars, as the provider reported them (or None)
 convo.replay()                               # -> messages list, ready to send again
 convo.replay(system=new_prompt)              # ...against a different prompt version
 

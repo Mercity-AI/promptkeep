@@ -95,6 +95,11 @@ class RunRecord(BaseModel):
     original_input_text is set only when a pre-check rewrote the outgoing turn:
     input_text is then what was actually sent, and this column preserves what
     the caller originally passed, so the audit trail shows both sides.
+
+    cost_usd is what the provider *said* the call cost, in US dollars — read
+    off the response's usage block by the adapter (OpenRouter reports it on
+    every response). It is never estimated from a price table: NULL means the
+    provider didn't say, which is the honest answer for one that doesn't.
     """
 
     run_key = pw.TextField(unique=True)
@@ -111,6 +116,7 @@ class RunRecord(BaseModel):
     prompt_tokens = pw.IntegerField(null=True)
     completion_tokens = pw.IntegerField(null=True)
     total_tokens = pw.IntegerField(null=True)
+    cost_usd = pw.FloatField(null=True)
     latency_ms = pw.IntegerField(null=True)
     status = pw.TextField()
     error = pw.TextField(null=True)

@@ -8,6 +8,7 @@
   <div class="sub">
     {{ convo.turns|length }} turn{{ 's' if convo.turns|length != 1 }}
     · <span class="num">{{ convo.total_tokens }}</span> tokens
+    {% if convo.total_cost is not none %}· <span class="num">{{ convo.total_cost|cost }}</span>{% endif %}
     · <span class="num">{{ '%.1f'|format(convo.duration) }}</span>s
     {% for name, versions in convo.versions_used.items() %}
     · <a href="/prompts/{{ name }}">{{ name }}</a>
@@ -23,6 +24,7 @@
     {% if t.prompt_name %}<span class="sep">·</span><a href="/prompts/{{ t.prompt_name }}">{{ t.prompt_name }}</a> <span class="badge">v{{ t.version }}</span>{% endif %}
     {% if t.model %}<span class="sep">·</span><span class="mono">{{ t.model }}</span>{% endif %}
     {% if t.total_tokens is not none %}<span class="sep">·</span><span class="num">{{ t.total_tokens }} tokens</span>{% endif %}
+    {% if t.cost_usd is not none %}<span class="sep">·</span><span class="num">{{ t.cost_usd|cost }}</span>{% endif %}
     <span class="sep">·</span><span class="pill status-{{ t.status }}">{{ t.status }}</span>
   </div>
   {% if t.original_input_text %}

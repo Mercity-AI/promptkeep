@@ -46,7 +46,8 @@ class RunInfo:
     to attach it to. conversation_id/turn_index/input_text are None for a
     run recorded outside any conversation. original_input_text is set only
     when a pre-check rewrote the turn: input_text is then what was sent, and
-    this is what the caller originally passed.
+    this is what the caller originally passed. cost_usd is the cost the
+    provider reported for the call, None when it reported none.
     """
 
     id: int
@@ -71,6 +72,7 @@ class RunInfo:
     turn_index: int | None = None
     input_text: str | None = None
     original_input_text: str | None = None
+    cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -105,9 +107,16 @@ class ConversationInfo:
 
     @property
     def total_tokens(self) -> int:
-        """Tokens across every turn, from the providers' reported usage. A turn
+        """Tokens across every call, from the providers' reported usage. A call
         with no usage (an error, a stream without a usage chunk) counts as 0."""
-        return sum(turn.total_tokens or 0 for turn in self.turns)
+        return sum(call.total_tokens or 0 for call in self._calls())
+
+    @property
+    def total_cost(self) -> float | None:
+        """Dollars across every call, from the providers' reported cost — or
+        None when no call reported one, so "free" and "unknown" stay apart."""
+        known = [call.cost_usd for call in self._calls() if call.cost_usd is not None]
+        return sum(known) if known else None
 
     @property
     def duration(self) -> float:
@@ -167,6 +176,13 @@ class ConversationInfo:
             if head.output_text is not None:
                 messages.append({"role": "assistant", "content": head.output_text})
         return messages
+
+    def _calls(self) -> Iterator[RunInfo]:
+        """One row per physical API call. Rows sharing a turn_index came from
+        the same call and repeat its usage and cost, so summing every row
+        would count that call once per tracked Prompt."""
+        for _index, rows in groupby(self.turns, key=lambda t: t.turn_index):
+            yield next(rows)
 
     def _completed_turns(self) -> Iterator[tuple[int | None, list[RunInfo]]]:
         """Turns that completed, as (turn_index, rows) — rows sharing a
@@ -252,6 +268,17 @@ def verdict(run_status: str, check_infos: list[CheckInfo]) -> str | None:
     return "ok"
 
 
+def format_cost(cost_usd: float | None) -> str:
+    """A cost for display: dollars with as many decimals as it takes — a
+    single call is often a fraction of a cent, so two fixed places would
+    round most of them to $0.00. None (the provider reported nothing) is a
+    dash, never a zero."""
+    if cost_usd is None:
+        return "—"
+    whole, _, decimals = f"{cost_usd:.6f}".partition(".")
+    return f"${whole}.{decimals.rstrip('0').ljust(2, '0')}"
+
+
 # --- row helpers -------------------------------------------------------------------
 
 
@@ -304,6 +331,7 @@ _RUN_COLUMNS = (
     RunRecord.turn_index,
     RunRecord.input_text,
     RunRecord.original_input_text,
+    RunRecord.cost_usd,
 )
 # Added only where the caller reads across conversations and needs to know
 # which one each run belongs to (a conversation's own turns already know).
