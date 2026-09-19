@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from .base import ProviderAdapter, Request, ResponseFields, StreamAbsorber, Target
 from .call import CallResult, acall, call
+from .openai_responses import OpenAIResponsesAdapter
 from .openai_wrapper import OpenAIChatAdapter
 from .registry import adapters, is_wrapped, register_adapter, wrap
 
@@ -23,4 +24,5 @@ __all__ = [
     "StreamAbsorber",
     "Target",
     "OpenAIChatAdapter",
+    "OpenAIResponsesAdapter",
 ]

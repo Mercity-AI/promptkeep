@@ -13,11 +13,12 @@ from typing import Any
 
 from .base import ProviderAdapter, Target
 from .core import instrument, is_instrumented
+from .openai_responses import OpenAIResponsesAdapter
 from .openai_wrapper import OpenAIChatAdapter
 
 # Registration order is also search order. Built-ins first; third parties
 # append with register_adapter().
-_ADAPTERS: list[ProviderAdapter] = [OpenAIChatAdapter()]
+_ADAPTERS: list[ProviderAdapter] = [OpenAIChatAdapter(), OpenAIResponsesAdapter()]
 
 
 def adapters() -> list[ProviderAdapter]:
@@ -37,12 +38,16 @@ def register_adapter(adapter: ProviderAdapter) -> None:
     _ADAPTERS.append(adapter)
 
 
-def locate(client: Any) -> tuple[ProviderAdapter, Target] | None:
+def locate(
+    client: Any, kwargs: dict[str, Any] | None = None
+) -> tuple[ProviderAdapter, Target] | None:
     """The first registered adapter that recognizes ``client``, with the
-    surface it found — or None when no adapter does."""
+    surface it found — or None when no adapter does. One client can carry
+    several surfaces (OpenAI's has chat completions and Responses); pass the
+    call's ``kwargs`` to get the one they are spelled for."""
     for adapter in _ADAPTERS:
         target = adapter.locate(client)
-        if target is not None:
+        if target is not None and (kwargs is None or adapter.accepts(kwargs)):
             return adapter, target
     return None
 

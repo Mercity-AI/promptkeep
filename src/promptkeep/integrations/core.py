@@ -4,9 +4,10 @@
 adapter locates on a client. The replacement builds a ``_Call`` — one
 object holding everything known about the call in flight — and drives it:
 
-1. promptkeep's own kwargs come off and the active conversation is resolved,
-2. the adapter parses the request (Prompts substituted by plain strings, the
-   current turn picked out),
+1. promptkeep's own kwargs come off and the adapter parses the request
+   (Prompts substituted by plain strings, the current turn picked out),
+2. the conversation is resolved — the explicit one, else the one the request
+   itself points back at (``conversation_hint``) — and the turn reserved,
 3. pre-checks run and may block or rewrite,
 4. the real method is called,
 5. post-checks run, one run row per tracked prompt (or one bare turn) is
@@ -205,8 +206,13 @@ class _Call:
         self.adapter = adapter
         self.request: Request = adapter.parse_request(kwargs)
 
-        # The conversation slot: one turn number per physical API call.
-        self.conversation_id, self.turn_index = _prepare_conversation(external_id, title, metadata)
+        # The conversation slot: one turn number per physical API call. With
+        # no explicit conversation, a request that names its predecessor
+        # follows that run's.
+        hint = None if external_id is not None else _conversation_hint(adapter, self.request)
+        self.conversation_id, self.turn_index = _prepare_conversation(
+            external_id, title, metadata, hint
+        )
 
         # Checks across scopes.
         self.pre_checks, self.post_checks = _collect_checks(
@@ -414,24 +420,47 @@ def _resolve_conversation(kwargs: dict[str, Any]) -> tuple[str | None, str | Non
     return None, None, {}
 
 
-def _prepare_conversation(
-    external_id: str | None, title: str | None, metadata: dict[str, Any]
-) -> tuple[int | None, int | None]:
-    """Resolve/create the conversation row and reserve this call's turn number.
-
-    One reservation per physical API call, reused for every run row it
-    produces — a call with two tracked prompts in one message list must not
-    split into two turns. Shielded like every other implicit write path.
-    """
-    if external_id is None:
-        return None, None
+def _conversation_hint(adapter: ProviderAdapter, request: Request) -> str | None:
+    """The response id this request says it continues, per the adapter —
+    shielded, since it runs on the request path before the provider call."""
     try:
-        conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
+        return adapter.conversation_hint(request)
+    except Exception:
+        logger.warning(
+            "promptkeep: %s adapter failed to read a conversation hint",
+            adapter.provider,
+            exc_info=True,
+        )
+        return None
+
+
+def _prepare_conversation(
+    external_id: str | None, title: str | None, metadata: dict[str, Any], hint: str | None
+) -> tuple[int | None, int | None]:
+    """Resolve the conversation row and reserve this call's turn number.
+
+    An explicit conversation is resolved (or created) by its id; failing
+    that, a ``hint`` — the response id the request continues — is followed to
+    the conversation of the run that produced it, which exists only if that
+    run was tracked. One reservation per physical API call, reused for every
+    run row it produces — a call with two tracked prompts in one message
+    list must not split into two turns. Shielded like every other implicit
+    write path.
+    """
+    try:
+        if external_id is not None:
+            conversation_id = storage.get_or_create_conversation(external_id, title, metadata)
+        elif hint is not None:
+            conversation_id = storage.chain_conversation(hint)
+        else:
+            return None, None
         if conversation_id is None:
             return None, None
         return conversation_id, storage.reserve_turn_index(conversation_id)
     except Exception:
-        logger.warning("promptkeep: failed to prepare conversation %r", external_id, exc_info=True)
+        logger.warning(
+            "promptkeep: failed to prepare conversation %r", external_id or hint, exc_info=True
+        )
         return None, None
 
 

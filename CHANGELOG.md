@@ -32,6 +32,22 @@ public APIs; each such change is called out below.
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
 
+- OpenAI Responses API adapter: `wrap()` now also tracks
+  `client.responses.create` (provider `"openai-responses"`) — Prompts as
+  `instructions`, as the `input` string or inside `input` items; typed stream
+  events; `input_tokens`/`output_tokens` usage; checks, cost and async as on
+  chat completions. `promptkeep.call()` picks the surface from how the kwargs
+  are spelled (`messages` vs `input`/`instructions`).
+- Automatic conversation chaining: a call carrying `previous_response_id`
+  joins the conversation of the run that produced that response; the chain's
+  first call is adopted into a new conversation (`response:<id>`) as turn 0.
+  No user code. An explicit conversation wins; an untracked chain is not
+  followed. Schema v7 indexes `runs.response_id` for the lookup. Adapters opt
+  in through a new optional `ProviderAdapter.conversation_hint()`; a second
+  optional method, `accepts()`, tells surfaces on one client apart.
+- `examples/live_smoke.py`: three tiny real calls (key from the environment)
+  that print what was recorded — the check that a live endpoint's responses
+  are shaped the way the adapters read them.
 - `promptkeep.feedback(run_key, score=, label=, comment=)` attaches a human or
   downstream judgement to a run after the fact. It is stored in the `checks`
   table with `phase="feedback"` (no schema change), rides the same write path

@@ -19,6 +19,7 @@ import pytest
 from promptkeep import Prompt, RenderedText, integrations, wrap
 from promptkeep.integrations import (
     OpenAIChatAdapter,
+    OpenAIResponsesAdapter,
     ProviderAdapter,
     Request,
     ResponseFields,
@@ -28,7 +29,16 @@ from promptkeep.integrations import (
     register_adapter,
     registry,
 )
-from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response
+from tests.fakes import (
+    FakeAsyncClient,
+    FakeAsyncResponsesClient,
+    FakeClient,
+    FakeResponsesClient,
+    make_chunk,
+    make_response,
+    make_responses_events,
+    make_responses_response,
+)
 
 
 @dataclass
@@ -75,7 +85,29 @@ def _chat_scenario() -> Scenario:
     )
 
 
-SCENARIOS = [_chat_scenario()]
+def _responses_scenario() -> Scenario:
+    """The Responses API: the system prompt is ``instructions``, the turn an
+    ``input`` item list (test_responses.py covers the string-input spelling)."""
+    return Scenario(
+        adapter=OpenAIResponsesAdapter(),
+        make_client=FakeResponsesClient,
+        make_async_client=FakeAsyncResponsesClient,
+        request=lambda system, user: {
+            "model": "gpt-test",
+            "temperature": 0,
+            "instructions": system,
+            "input": [{"role": "user", "content": user}],
+        },
+        system_only=lambda system: {"model": "gpt-test", "instructions": system},
+        texts=lambda kwargs: (
+            [kwargs["instructions"]] + [item["content"] for item in kwargs.get("input", [])]
+        ),
+        response=lambda text: make_responses_response(text, model="gpt-answered"),
+        chunks=lambda parts: make_responses_events(parts),
+    )
+
+
+SCENARIOS = [_chat_scenario(), _responses_scenario()]
 
 
 @pytest.fixture(params=SCENARIOS, ids=lambda s: s.adapter.provider)

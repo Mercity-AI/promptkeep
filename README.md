@@ -91,7 +91,33 @@ OpenAI SDK at it) returns `usage.cost` on every response, stream or not, and tha
 run as `cost_usd`. OpenAI's own API reports no cost, so those runs read `None` — promptkeep
 never estimates one from a price table that would be stale by next month.
 
-OpenAI `chat.completions` is the only built-in provider today. The wrapper is built on a
+### The Responses API
+
+The same wrapped client tracks `client.responses.create` too — a Prompt works as
+`instructions`, as the `input` string, or inside `input` items:
+
+```python
+first = client.responses.create(model="gpt-5.5", instructions=prompt, input="Longest river?")
+second = client.responses.create(
+    model="gpt-5.5", instructions=prompt, input="And the second?",
+    previous_response_id=first.id,          # <- this is all it takes
+)
+
+history.conversation(f"response:{first.id}").turns    # both calls, in order
+```
+
+Because a chained call names its predecessor, promptkeep follows the chain by itself: a call
+with `previous_response_id` joins the conversation of the run that produced that response,
+and the first link — recorded before there was a chain — is adopted into it as turn 0. No
+`with conversation(...)`, no ids to thread through. An explicit conversation still wins, a
+chain begun inside one stays in it, and a chain promptkeep never tracked (no Prompt, no
+checks) is not followed: conversations are never inferred, only read off what the request
+says. Streaming (`stream=True`), async clients, checks and cost work as on chat
+completions; `responses.stream()` / `responses.parse()` are separate SDK methods and pass
+through untracked.
+
+OpenAI `chat.completions` and the Responses API are the built-in surfaces — which also
+covers OpenRouter and every other OpenAI-compatible endpoint. The wrapper is built on a
 small adapter interface (`promptkeep.integrations.ProviderAdapter`), so another SDK is one
 adapter away — `register_adapter()` teaches `wrap()` a new client shape without touching
 the tracking machinery.

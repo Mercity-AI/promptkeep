@@ -75,9 +75,11 @@ def _entry(client: Any, kwargs: dict[str, Any]) -> tuple[ProviderAdapter, Target
             "wrapped client's create(stream=True) directly and read response.promptkeep "
             "once the stream finishes."
         )
-    located = locate(client)
+    located = locate(client, kwargs)
     if located is None:
-        raise TypeError(f"promptkeep.call(): no supported provider surface on {client!r}")
+        raise TypeError(
+            f"promptkeep.call(): no provider surface on {client!r} takes these arguments"
+        )
     adapter, target = located
     if not is_instrumented(target):
         logger.warning(

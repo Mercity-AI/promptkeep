@@ -41,6 +41,11 @@ class OpenAIChatAdapter(ProviderAdapter):
             return Target(completions, "create")
         return None
 
+    def accepts(self, kwargs: dict[str, Any]) -> bool:
+        """A chat completion is spelled with ``messages`` — the same client
+        also carries the Responses surface, spelled with ``input``."""
+        return "messages" in kwargs
+
     def parse_request(self, kwargs: dict[str, Any]) -> Request:
         """Substitute the Prompts in ``messages``; the newest non-system
         message is the current turn."""

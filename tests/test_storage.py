@@ -302,6 +302,8 @@ class TestSchemaMigration:
         run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
         assert "cost_usd" in run_cols
         assert legacy.cost_usd is None
+        # v7: chained calls look their predecessor up by response id.
+        assert "response_id" in index_sql
         conn.close()
 
         (chk,) = history.checks(legacy.run_key)
@@ -400,3 +402,45 @@ class TestLateVerdicts:
     def test_verdict_without_a_run_key_is_a_no_op(self):
         storage.record_check(None, self._row())  # tracking was off: nothing to attach to
         assert history.all_runs() == []
+
+
+class TestChainConversation:
+    """storage.chain_conversation: the conversation a call continuing a given
+    response belongs in (the wrapper-level behavior is in test_responses.py)."""
+
+    def _run(self, response_id, **fields):
+        return storage.record_run(provider="openai-responses", response_id=response_id, **fields)
+
+    def test_unknown_response_is_none(self):
+        assert storage.chain_conversation("resp_never_seen") is None
+
+    def test_first_link_starts_a_conversation_and_adopts_the_run(self):
+        self._run("resp_1", output_text="a1")
+        cid = storage.chain_conversation("resp_1")
+        assert cid is not None
+        assert storage.reserve_turn_index(cid) == 1  # turn 0 is the adopted run
+        (turn,) = history.conversation("response:resp_1").turns
+        assert (turn.turn_index, turn.output_text) == (0, "a1")
+
+    def test_asking_twice_is_the_same_conversation_and_adopts_once(self):
+        self._run("resp_1")
+        assert storage.chain_conversation("resp_1") == storage.chain_conversation("resp_1")
+        assert len(history.conversation("response:resp_1").turns) == 1
+
+    def test_adoption_never_moves_a_run_already_in_a_conversation(self):
+        mine = storage.get_or_create_conversation("mine")
+        self._run("resp_1", conversation_id=mine)
+        storage._adopt_run({"response_id": "resp_1", "conversation": mine + 1})
+        assert len(history.conversation("mine").turns) == 1
+
+    def test_the_in_process_index_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(storage, "_RESPONSE_INDEX_SIZE", 3)
+        for number in range(10):
+            self._run(f"resp_{number}")
+        assert len(storage._response_index) == 3
+        # An aged-out response is still found — on disk.
+        assert storage.chain_conversation("resp_0") is not None
+
+    def test_disabled_tracking_chains_nothing(self):
+        promptkeep.configure(enabled=False)
+        assert storage.chain_conversation("resp_1") is None

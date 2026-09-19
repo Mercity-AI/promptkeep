@@ -13,6 +13,7 @@ uv run pytest tests/test_prompt.py::TestVersioning::test_changed_text_bumps_vers
 uv run pytest -q --cov --cov-fail-under=85       # what the CI coverage gate runs
 uv run ruff format src tests examples && uv run ruff check src tests examples   # line-length 100
 uv run python examples/playground.py             # narrated sandbox (throwaway DB, no network)
+uv run --with openai python -m pytest tests/test_responses.py   # + the real-SDK shape tests
 uv build                                         # build sdist+wheel into dist/
 ```
 
@@ -107,7 +108,19 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   every surface any adapter locates. Core shields adapter calls made inside the request path
   (`read_response`, the absorber), so an adapter bug loses telemetry, never a call.
   `tests/test_adapters.py` is the contract every adapter must pass — a new provider adds one
-  `Scenario` there. Today the only adapter is OpenAI `chat.completions`.
+  `Scenario` there. Two adapters today, both on the OpenAI client: `chat.completions`
+  (`openai_wrapper.py`) and the Responses API (`openai_responses.py`, which reuses the chat
+  adapter's message helpers — input items are message-shaped). `accepts(kwargs)` tells the
+  two surfaces apart for `call()`.
+- **Conversations are never inferred — but a request may name its predecessor.**
+  `ProviderAdapter.conversation_hint()` returns the response id a call continues (Responses'
+  `previous_response_id`); `storage.chain_conversation()` files the call in the conversation
+  of the run that produced it, or — for a chain's second call — starts `response:<id>` and
+  adopts the first run as turn 0. The predecessor may still be in the writer queue, so the
+  lookup goes through an in-process `response_id → conversation` index before the DB, the
+  adoption is a queue item (`_kind: "adopt"`, behind its run, like late verdicts), and the
+  turn counter is seeded past the adopted turn rather than read from `MAX(turn_index)`.
+  Explicit conversations win; a predecessor promptkeep never recorded means no chaining.
 - **Feedback is a row in `checks`, not a table of its own.** `tracking.feedback(run_key, ...)`
   writes `phase="feedback"` (`name` = the label, `message` = the comment, `status="ok"`)
   through `storage.record_check`, so it inherits the late-verdict machinery: queue ordering
@@ -172,6 +185,10 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 `tests/conftest.py` has an autouse fixture giving every test a fresh tmp DB and reset config —
 tests never touch a real `.promptkeep.db`. OpenAI wrapper tests run against hand-rolled fakes
 in `tests/fakes.py` (no network, no `openai` dependency; core must never import `openai`).
+`test_responses.py::TestAgainstTheRealSDK` builds the SDK's own objects and skips without it —
+run it with `uv run --with openai python -m pytest tests/test_responses.py` (`python -m`, or
+the overlay isn't on the path). `examples/live_smoke.py` is the by-hand check against a real
+endpoint.
 `test_storage.py::test_concurrent_registration_from_threads` is the canary for the SQLite
 locking subtleties above — if a storage change makes it flaky, the change is wrong, not the
 test. The module for the Prompt class is `prompts.py` (plural) because the public `prompt`

@@ -17,7 +17,7 @@ import playhouse.migrate as pm
 from .models import MODELS, CheckRecord, ConversationRecord, PromptVersionRecord, new_run_key
 from .rendering import template_hash
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def migrate(database: pw.SqliteDatabase) -> None:
@@ -120,6 +120,15 @@ def migrate(database: pw.SqliteDatabase) -> None:
             migrator = pm.SqliteMigrator(database)
             pm.migrate(migrator.add_column("runs", "cost_usd", pw.FloatField(null=True)))
             database.execute_sql("PRAGMA user_version = 6")
+
+    # v7: an index on runs.response_id. A call that names its predecessor
+    # (the Responses API's previous_response_id) is filed in that run's
+    # conversation, which is a lookup by response id on the request path.
+    if user_version < 7:
+        with database.atomic():
+            migrator = pm.SqliteMigrator(database)
+            pm.migrate(migrator.add_index("runs", ("response_id",), False))
+            database.execute_sql("PRAGMA user_version = 7")
 
 
 def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:

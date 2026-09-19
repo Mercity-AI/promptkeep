@@ -133,6 +133,20 @@ class ProviderAdapter(ABC):
         provider's response shape that existing code degrades instead of
         crashing. ``blocked`` is the CheckResult that gated the call."""
 
+    def accepts(self, kwargs: dict[str, Any]) -> bool:
+        """Whether these call kwargs are spelled for this surface. Only asked
+        when a client exposes several surfaces and the caller named none —
+        ``promptkeep.call(client, **kwargs)`` — so the default is yes;
+        override on a provider whose client carries more than one surface."""
+        return True
+
+    def conversation_hint(self, request: Request) -> str | None:
+        """The provider response id this call continues, when the request
+        names one (OpenAI Responses' ``previous_response_id``). ``core`` files
+        the call in the same conversation as the run that produced that
+        response. None — the default — when the provider has no such notion."""
+        return None
+
     def is_streaming(self, request: Request) -> bool:
         """Whether this call returns a stream. ``stream=True`` is the spelling
         every supported SDK uses; override if a provider differs."""

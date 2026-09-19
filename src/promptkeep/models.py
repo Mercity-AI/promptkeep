@@ -135,6 +135,8 @@ class RunRecord(BaseModel):
         indexes = (
             (("version", "created_at"), False),
             (("conversation", "turn_index"), False),
+            # A chained call finds its predecessor by the provider's response id.
+            (("response_id",), False),
         )
 
 

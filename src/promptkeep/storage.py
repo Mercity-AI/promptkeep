@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,7 @@ def reset_caches() -> None:
     with _convo_lock:
         _conversation_cache.clear()
         _turn_counters.clear()
+        _response_index.clear()
     with _db_lock:
         if _current_path is not None:
             try:
@@ -296,6 +298,97 @@ def reserve_turn_index(conversation_id: int) -> int:
         return current
 
 
+# --- chaining by response id ------------------------------------------------------
+
+# Which conversation (if any) each recently recorded response belongs to, per
+# (db, response_id). The database has the same answer — once the row lands.
+# In background mode a chained call can arrive while its predecessor is still
+# in the writer queue, so within a process this index is what is consulted
+# first. Bounded: a chain is followed up promptly or not at all, and anything
+# that has aged out is on disk by then.
+_response_index: OrderedDict[tuple[str, str], int | None] = OrderedDict()
+_RESPONSE_INDEX_SIZE = 4096
+
+
+def _index_response(response_id: str, conversation_id: int | None) -> None:
+    """Remember which conversation a recorded response belongs to (None: none yet)."""
+    key = (str(get_settings().db_path), response_id)
+    with _convo_lock:
+        _response_index[key] = conversation_id
+        _response_index.move_to_end(key)
+        while len(_response_index) > _RESPONSE_INDEX_SIZE:
+            _response_index.popitem(last=False)
+
+
+def chain_conversation(previous_response_id: str) -> int | None:
+    """The conversation a call continuing ``previous_response_id`` belongs in.
+
+    Providers that chain server-side (OpenAI Responses) name a call's
+    predecessor in the request, so the conversation can be followed with no
+    user code: whatever conversation the run that produced that response is
+    in, this call joins. When that run is in none — it was the first call of
+    the chain, which had nothing to point back at — one is started here,
+    keyed ``response:<id>``, and the earlier run is adopted into it as turn 0.
+
+    Returns None when no recorded run produced that response: a chain is
+    followed only from a call promptkeep tracked, never inferred. Raises like
+    any storage call; the caller shields.
+    """
+    settings = get_settings()
+    if not settings.enabled or get_db() is None:
+        return None
+
+    # The predecessor: the in-process index first (its row may still be
+    # queued), then the database (another process, or an earlier session).
+    key = (str(settings.db_path), previous_response_id)
+    with _convo_lock:
+        known = key in _response_index
+        conversation_id = _response_index.get(key)
+    if not known:
+        row = (
+            RunRecord.select(RunRecord.conversation)
+            .where(RunRecord.response_id == previous_response_id)
+            .order_by(RunRecord.id)
+            .tuples()
+            .first()
+        )
+        if row is None:
+            return None
+        conversation_id = row[0]
+    if conversation_id is not None:
+        return conversation_id
+
+    # First link of a chain: start its conversation. The adopted run takes
+    # turn 0, so the counter starts past it — the adoption may still be
+    # queued, which the DB's MAX(turn_index) would not see.
+    conversation_id = get_or_create_conversation(f"response:{previous_response_id}")
+    if conversation_id is None:
+        return None
+    counter_key = (str(settings.db_path), conversation_id)
+    with _convo_lock:
+        if counter_key not in _turn_counters:
+            max_turn = (
+                RunRecord.select(pw.fn.MAX(RunRecord.turn_index))
+                .where(RunRecord.conversation == conversation_id)
+                .scalar()
+            )
+            _turn_counters[counter_key] = max(1, 0 if max_turn is None else max_turn + 1)
+
+    # The adoption takes the same road as the run it touches: queued behind
+    # it in background mode (so it finds the row), applied directly in sync.
+    adoption = {
+        "_kind": "adopt",
+        "response_id": previous_response_id,
+        "conversation": conversation_id,
+    }
+    if settings.write_mode == "background":
+        writer.submit(adoption)
+    elif settings.write_mode != "off":
+        _adopt_run(adoption)
+    _index_response(previous_response_id, conversation_id)
+    return conversation_id
+
+
 # --- runs and verdicts ------------------------------------------------------------
 
 
@@ -402,6 +495,10 @@ def record_run(
                 )
                 return None
 
+        # A kept run is one a later call can chain onto by its response id.
+        if response_id is not None:
+            _index_response(response_id, conversation_id)
+
         # Persist: hand off to the writer thread, or insert right here.
         if settings.write_mode == "background":
             writer.submit(row)
@@ -469,14 +566,18 @@ def write_batch(items: list[dict[str, Any]]) -> None:
 
 
 def _persist(item: dict[str, Any]) -> None:
-    """Apply one queued item: a run row (the default) or a late check verdict.
+    """Apply one queued item: a run row (the default), a late check verdict,
+    or a run's adoption into a conversation.
 
-    These are the dicts record_run/record_check hand to the writer; in sync
-    mode the same two functions insert directly. A ``_kind`` marker tells the
-    shapes apart — everything else in the dict is column data.
+    These are the dicts record_run/record_check/chain_conversation hand to the
+    writer; in sync mode the same functions apply them directly. A ``_kind``
+    marker tells the shapes apart — everything else in the dict is column data.
     """
-    if item.get("_kind") == "check":
+    kind = item.get("_kind")
+    if kind == "check":
         _insert_check(item)
+    elif kind == "adopt":
+        _adopt_run(item)
     else:
         _insert_run(item)
 
@@ -526,6 +627,20 @@ def _insert_check(item: dict[str, Any]) -> None:
         return
     fields = {k: v for k, v in item.items() if k not in ("_kind", "run_key")}
     CheckRecord.create(run=run_id, **fields)
+
+
+def _adopt_run(item: dict[str, Any]) -> None:
+    """File the run(s) that produced a response under a conversation, as its
+    turn 0 — the first call of a chain, recorded before there was a chain.
+
+    By response id rather than run key: a call carrying several Prompts wrote
+    several rows for the one response, and they are one turn. Only rows still
+    outside any conversation are touched, so replaying an adoption (or racing
+    another process to it) changes nothing.
+    """
+    RunRecord.update(conversation=item["conversation"], turn_index=0).where(
+        (RunRecord.response_id == item["response_id"]) & RunRecord.conversation.is_null()
+    ).execute()
 
 
 def _drain_to_db(items: list[dict[str, Any]]) -> None:
