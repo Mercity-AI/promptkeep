@@ -2,7 +2,8 @@
 
 *Snapshot: 19 September 2026 · `main` after the refactor (PR #4) and the reach batch — cost
 tracking, `feedback()`, the Responses API adapter with automatic conversation chaining, the
-full CLI, `Prompt.variants()` · v0.2.0 on PyPI, **nothing since is published** · one open
+full CLI, `Prompt.variants()` — and a hardening pass that found async chat runs being recorded
+empty on the real `AsyncOpenAI` (fixed; **the bug is in the published 0.2.0**) · v0.2.0 on PyPI, **nothing since is published** · one open
 branch: `typing` (`mypy --strict` clean, awaiting a PR)*
 
 This is the handoff document: what the library is, what is actually built, how to use it, and
@@ -51,7 +52,7 @@ runs off it.
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
 | **Branches** | `main`, plus `typing` (strict typing, to be merged by PR). PR #1 merged `feat/conversations-dashboard`, PR #3 `feat/checks`, PR #4 `refactor`; feature batches are committed straight to main, one commit each. |
-| **Tests** | 398 (395 + 3 that build the real OpenAI SDK's objects and skip without it), ~4s, no network, verified locally on Python 3.11 on macOS. Coverage 94%. |
+| **Tests** | 426, ~4s, no network, verified locally on Python 3.11, 3.12, 3.13 and 3.14 on macOS. Coverage 94%. 16 of them use the real `openai` SDK (dev group): 13 drive its clients over a mock transport, 3 build its response objects. |
 | **Size** | ~5,700 LOC Python + ~450 LOC HTML templates · ~5,000 LOC tests |
 | **Python** | ≥ 3.11. **No CI yet**: the workflows (ruff, the suite on 3.11–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
@@ -503,9 +504,10 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-398 tests, no network, ~4s. Coverage 94% (only `cli._serve`, the uvicorn launcher, is
-excluded). No `openai` dependency: three tests in `test_responses.py` build the real SDK's
-objects and skip without it — `uv run --with openai python -m pytest tests/test_responses.py`.
+426 tests, no network, ~4s. Coverage 94% (only `cli._serve`, the uvicorn launcher, is
+excluded). Most run against the hand-rolled fakes in `tests/fakes.py`; `test_real_sdk.py` and a
+class in `test_responses.py` use the real `openai` SDK (dev group only — the package does not
+depend on it) and skip without it.
 
 | File | Tests | Covers |
 |---|---:|---|
@@ -513,13 +515,14 @@ objects and skip without it — `uv run --with openai python -m pytest tests/tes
 | `test_rendering.py` | 30 | lenient/strict matrix, JSON braces, normalization |
 | `test_adapters.py` | 46 | the adapter contract, run per registered adapter; the registry |
 | `test_conversation.py` | 27 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing |
-| `test_prompt.py` | 25 | immutability, versioning, provenance, equality |
+| `test_prompt.py` | 28 | immutability, versioning, provenance, equality |
 | `test_responses.py` | 38 | Responses request shapes, recording, streaming, checks, `previous_response_id` chaining (sync, background, cross-process), the real SDK's objects |
+| `test_real_sdk.py` | 13 | the real `openai` clients — sync/async, chat/Responses, plain/SSE — over an httpx `MockTransport`; found the async-detection bug |
 | `test_cli.py` | 29 | every CLI command's output, error exits, `history.stats()` |
-| `test_storage.py` | 27 | dedup, version counters, concurrency, migrations, run_key, conversations, `chain_conversation` |
+| `test_storage.py` | 28 | dedup, version counters, concurrency, migrations, run_key, conversations, `chain_conversation` |
 | `test_cost.py` | 21 | reported cost (response, stream, junk, zero vs none), conversation totals, formatting |
-| `test_feedback.py` | 20 | a handle on every recorded call; feedback storage, validation, shielding, redaction |
-| `test_openai_wrapper.py` | 19 | substitution, run rows, streaming, async, error paths |
+| `test_feedback.py` | 22 | a handle on every recorded call; feedback storage, validation, shielding, redaction |
+| `test_openai_wrapper.py` | 28 | substitution, run rows, streaming, async, error paths, async methods hidden behind a sync decorator |
 | `test_dashboard.py` | 18 | every route via `TestClient`, 404s, filters, stats line |
 | `test_decorator.py` | 16 | defaults, kwargs capture, fn source hash, async builders |
 | `test_controls.py` | 15 | sampling (always-keep rules, per-conversation decision, env), redaction (every field, failure modes) |
@@ -632,8 +635,10 @@ fifteen seconds" shape (no GIF).
 3. **Enable CI** (`TODO.md`): re-issue the token with the `workflow` scope, move
    `docs/workflows/` to `.github/workflows/`, and watch the first run — Windows has never
    executed this suite.
-4. **Cut a release.** PyPI is still at 0.2.0 and the local `v0.3.0` tag is far behind main;
-   decide the number (0.4.0 is the honest one), fold "Unreleased" into it, retag, publish.
+4. **Cut a release — this is now the urgent one.** PyPI is still at 0.2.0, which records every
+   `AsyncOpenAI` chat completion empty (see CHANGELOG "Fixed"); anyone using the published
+   package with an async client is collecting blank runs. The local `v0.3.0` tag is far behind
+   main; decide the number (0.4.0 is the honest one), fold "Unreleased" into it, retag, publish.
 5. Then what is left of **v0.5**: Anthropic and LiteLLM adapters, `compare()` / weighted
    routing if still wanted, a docs site. `parent_run_id` (tree-shaped conversations) is the
    one v0.3 item still open.
