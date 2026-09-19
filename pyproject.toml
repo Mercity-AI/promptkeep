@@ -59,10 +59,6 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["promptkeep"]
 
-[tool.coverage.report]
-# cli.py is the `serve` launcher: it starts uvicorn, which no unit test should.
-omit = ["*/promptkeep/cli.py"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"

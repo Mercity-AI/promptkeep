@@ -263,6 +263,7 @@ convo.total_cost                             # dollars, as the provider reported
 convo.replay()                               # -> messages list, ready to send again
 convo.replay(system=new_prompt)              # ...against a different prompt version
 
+history.stats("REVIEW_SYSTEM")               # per version: runs, errors, pass rate, scores, cost
 history.list_prompts()                       # every prompt + version/run counts
 history.list_conversations()                 # every session + turn counts
 history.list_conversations(prompt="REVIEW_SYSTEM", version=4)   # sessions v4 drove
@@ -272,6 +273,33 @@ history.all_runs()                           # everything, newest first
 `replay()` walks the completed turns in order and emits the system prompt that was in play
 (again whenever it changed mid-session), then each user message as it was actually sent and
 the assistant's reply — the raw material for re-running a session against a new version.
+
+## Command line
+
+The same history, from a terminal — plain text, pipeable, no extra dependencies:
+
+```bash
+promptkeep list                              # every prompt, with version and run counts
+promptkeep versions REVIEW_SYSTEM            # the lineage (--full prints whole templates)
+promptkeep diff REVIEW_SYSTEM 4 5            # what changed (coloured on a terminal)
+promptkeep runs REVIEW_SYSTEM --version 5    # recorded calls, newest first (no name: all)
+promptkeep convo user-42-session-9           # a conversation, turn by turn, with its labels
+promptkeep stats REVIEW_SYSTEM               # how each version has performed
+promptkeep export --prompt REVIEW_SYSTEM -o runs.jsonl   # runs + their labels, as JSON lines
+```
+
+```
+$ promptkeep stats REVIEW_SYSTEM
+VER  RUNS  ERRORS  BLOCKED  CHECKS OK  SCORE  FEEDBACK  LATENCY  TOKENS    COST
+v4   1203       9        2        88%   0.71      0.64   1340ms    2100  $12.40
+v5    847       3        0        94%   0.79      0.81   1190ms    1950   $8.10
+```
+
+`stats` is the "did the change actually help?" table: per version, how many runs and how
+many failed, the share of checked runs whose every verdict was ok, the average check score
+next to the average `feedback()` score, latency, tokens and reported cost
+(`history.stats(name)` returns the same rows). Every command takes `--db PATH`; none of them
+writes — a mistyped path is an error, not a new empty database.
 
 ## Local dashboard
 

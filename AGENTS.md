@@ -12,6 +12,7 @@ uv run pytest tests/test_storage.py -q           # one file
 uv run pytest tests/test_prompt.py::TestVersioning::test_changed_text_bumps_version  # one test
 uv run pytest -q --cov --cov-fail-under=85       # what the CI coverage gate runs
 uv run ruff format src tests examples && uv run ruff check src tests examples   # line-length 100
+uv run promptkeep stats NAME --db demo.promptkeep.db   # the CLI (seed one: examples/seed_demo.py)
 uv run python examples/playground.py             # narrated sandbox (throwaway DB, no network)
 uv run --with openai python -m pytest tests/test_responses.py   # + the real-SDK shape tests
 uv build                                         # build sdist+wheel into dist/
@@ -137,6 +138,11 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   `wrap()` gets its method replaced (idempotent via `_pm_instrumented` on the method's owner).
   Message dicts are copied, never mutated. Streaming defers run recording until the stream
   ends (`_StreamRecorder.finish()` is write-once).
+- **The CLI presents, `history` reads.** Every `cli.py` command except `serve` formats the
+  result of a `history` function; a command that needs new data gets a new read in
+  `history` (as `stats` did), never a query in `cli.py`. Output is plain aligned text with no
+  truncation, so it pipes and greps. Read commands refuse a missing DB file rather than
+  letting `get_db()` create an empty one.
 - **Rendering is lenient by default** (`rendering.py`): unknown `{placeholders}` and JSON
   braces pass through literally; unparseable templates return unrendered. Strict mode is
   opt-in per Prompt or via `configure(strict=True)`.

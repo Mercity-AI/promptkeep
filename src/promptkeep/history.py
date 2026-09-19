@@ -205,6 +205,33 @@ class PromptSummary:
 
 
 @dataclass(frozen=True)
+class VersionStats:
+    """How one version of a prompt has performed — a row of ``stats()``.
+
+    Every average is over the runs (or labels) that reported the number, and
+    None when none did: an unknown cost is not a zero cost. check_pass_rate
+    is the share of *checked* runs whose every verdict was ok; avg_score
+    averages the scores checks gave, avg_feedback the scores given through
+    ``promptkeep.feedback()`` — kept apart because one is automatic and the
+    other is a person's.
+    """
+
+    version: int
+    created_at: str
+    runs: int
+    errors: int
+    blocked: int
+    avg_latency_ms: float | None
+    avg_tokens: float | None
+    total_cost: float | None
+    checked_runs: int = 0
+    check_pass_rate: float | None = None
+    avg_score: float | None = None
+    feedback_count: int = 0
+    avg_feedback: float | None = None
+
+
+@dataclass(frozen=True)
 class ConversationSummary:
     """One conversation's row in an overview listing: id plus turn count."""
 
@@ -342,6 +369,12 @@ _RUN_COLUMNS = (
 _CONVERSATION_ID_COLUMN = ConversationRecord.external_id.alias("conversation_id")
 
 
+def _count_status(status: str) -> pw.Node:
+    """How many runs in a group have this status (0, not NULL, for an empty group)."""
+    matches = pw.Case(None, [(RunRecord.status == status, 1)], 0)
+    return pw.fn.COALESCE(pw.fn.SUM(matches), 0)
+
+
 def _run_info(row: dict[str, Any]) -> RunInfo:
     """One projected run row as a RunInfo; the two JSON columns are decoded."""
     return RunInfo(
@@ -395,8 +428,9 @@ def diff(name: str, old: int, new: int) -> str:
     return "\n".join(lines)
 
 
-def runs(name: str, version: int | None = None, limit: int = 50) -> list[RunInfo]:
-    """Recorded runs for a prompt (optionally one version), newest first."""
+def runs(name: str, version: int | None = None, limit: int | None = 50) -> list[RunInfo]:
+    """Recorded runs for a prompt (optionally one version), newest first.
+    ``limit=None`` returns every one."""
     if not _ready():
         return []
     # Join through versions to prompts so callers filter by name, not ids.
@@ -414,8 +448,9 @@ def runs(name: str, version: int | None = None, limit: int = 50) -> list[RunInfo
     return [_run_info(row) for row in query]
 
 
-def all_runs(limit: int = 100) -> list[RunInfo]:
-    """Every recorded run regardless of prompt (or with none), newest first.
+def all_runs(limit: int | None = 100) -> list[RunInfo]:
+    """Every recorded run regardless of prompt (or with none), newest first
+    (``limit=None``: all of them).
 
     Left-joined throughout: a conversation-only turn has no version/prompt
     to join to, and a run outside any conversation has no conversation to
@@ -434,6 +469,94 @@ def all_runs(limit: int = 100) -> list[RunInfo]:
         .dicts()
     )
     return [_run_info(row) for row in query]
+
+
+def stats(name: str) -> list[VersionStats]:
+    """Every version of a prompt with how its runs went, oldest first — the
+    table that answers "did the change actually help?".
+
+    Counts, latency, tokens and cost come from the runs; pass rate and scores
+    from the labels on them. A version with no runs yet still gets a row.
+    Three grouped queries rather than one: joining runs to their labels fans
+    out, which would double-count every run that has more than one verdict.
+    """
+    if not _ready():
+        return []
+
+    # The runs: one row per version, versions without runs included.
+    per_version = (
+        PromptVersionRecord.select(
+            PromptVersionRecord.version,
+            PromptVersionRecord.created_at,
+            pw.fn.COUNT(RunRecord.id).alias("runs"),
+            _count_status("error").alias("errors"),
+            _count_status("blocked").alias("blocked"),
+            pw.fn.AVG(RunRecord.latency_ms).alias("avg_latency_ms"),
+            pw.fn.AVG(RunRecord.total_tokens).alias("avg_tokens"),
+            pw.fn.SUM(RunRecord.cost_usd).alias("total_cost"),
+        )
+        .join(PromptRecord)
+        .switch(PromptVersionRecord)
+        .join(RunRecord, pw.JOIN.LEFT_OUTER)
+        .where(PromptRecord.name == name)
+        .group_by(PromptVersionRecord.id)
+        .order_by(PromptVersionRecord.version)
+        .dicts()
+    )
+
+    # The labels, by version and kind: check scores apart from feedback scores.
+    is_feedback = CheckRecord.phase == "feedback"
+    labels = (
+        CheckRecord.select(
+            PromptVersionRecord.version,
+            is_feedback.alias("feedback"),
+            pw.fn.COUNT(CheckRecord.id).alias("count"),
+            pw.fn.AVG(CheckRecord.score).alias("score"),
+        )
+        .join(RunRecord)
+        .join(PromptVersionRecord)
+        .join(PromptRecord)
+        .where(PromptRecord.name == name)
+        .group_by(PromptVersionRecord.version, is_feedback)
+        .tuples()
+    )
+    by_kind = {
+        (version, bool(feedback)): (count, score) for version, feedback, count, score in labels
+    }
+
+    # The pass rate: a run passes when every one of its verdicts is ok, so
+    # this is a fold per run first, then a share per version.
+    all_ok = pw.fn.MIN(pw.Case(None, [(CheckRecord.status == "ok", 1)], 0))
+    verdicts = (
+        CheckRecord.select(PromptVersionRecord.version, all_ok.alias("passed"))
+        .join(RunRecord)
+        .join(PromptVersionRecord)
+        .join(PromptRecord)
+        .where((PromptRecord.name == name) & ~is_feedback)
+        .group_by(PromptVersionRecord.version, RunRecord.id)
+        .tuples()
+    )
+    passed: dict[int, list[int]] = {}
+    for version, run_passed in verdicts:
+        passed.setdefault(version, []).append(run_passed)
+
+    # One VersionStats per version, the three reads folded together.
+    result = []
+    for row in per_version:
+        checked = passed.get(row["version"], [])
+        _count, avg_score = by_kind.get((row["version"], False), (0, None))
+        feedback_count, avg_feedback = by_kind.get((row["version"], True), (0, None))
+        result.append(
+            VersionStats(
+                **row,
+                checked_runs=len(checked),
+                check_pass_rate=sum(checked) / len(checked) if checked else None,
+                avg_score=avg_score,
+                feedback_count=feedback_count,
+                avg_feedback=avg_feedback,
+            )
+        )
+    return result
 
 
 def list_prompts() -> list[PromptSummary]:

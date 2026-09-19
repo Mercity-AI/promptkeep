@@ -32,6 +32,14 @@ public APIs; each such change is called out below.
   through `fn` before it is written, in every write mode; a failing hook drops
   the row rather than storing it unredacted.
 
+- The rest of the CLI: `promptkeep list`, `versions`, `diff` (coloured on a
+  terminal), `runs`, `convo`, `stats` and `export --format jsonl` (each run
+  with its check verdicts and feedback). Plain text, no new dependencies,
+  `--db PATH` on every command; read commands never create the file they were
+  pointed at.
+- `history.stats(name)` — per-version runs, errors, blocked, check pass rate,
+  average check score, average feedback score, latency, tokens and cost.
+  `history.runs()` / `all_runs()` accept `limit=None` for "everything".
 - OpenAI Responses API adapter: `wrap()` now also tracks
   `client.responses.create` (provider `"openai-responses"`) — Prompts as
   `instructions`, as the `input` string or inside `input` items; typed stream
