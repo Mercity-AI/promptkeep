@@ -74,7 +74,7 @@ class Dataset:
         installed (``pip install dspy``) — promptkeep doesn't depend on it.
         """
         try:
-            import dspy
+            import dspy  # type: ignore[import-not-found, unused-ignore]
         except ImportError:
             raise ImportError(
                 "Dataset.to_dspy() needs DSPy, which promptkeep doesn't install: pip install dspy"

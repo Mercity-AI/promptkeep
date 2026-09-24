@@ -735,12 +735,15 @@ def _forget_conversations(conversation_ids: list[int]) -> None:
     path = str(get_settings().db_path)
     gone = set(conversation_ids)
     with _convo_lock:
-        for key in [k for k, cid in _conversation_cache.items() if k[0] == path and cid in gone]:
-            del _conversation_cache[key]
-        for key in [k for k in _turn_counters if k[0] == path and k[1] in gone]:
-            del _turn_counters[key]
-        for key in [k for k, v in _response_index.items() if k[0] == path and v[0] in gone]:
-            del _response_index[key]
+        cached = [k for k, cid in _conversation_cache.items() if k[0] == path and cid in gone]
+        for external in cached:
+            del _conversation_cache[external]
+        counters = [k for k in _turn_counters if k[0] == path and k[1] in gone]
+        for counter in counters:
+            del _turn_counters[counter]
+        indexed = [k for k, v in _response_index.items() if k[0] == path and v[0] in gone]
+        for response in indexed:
+            del _response_index[response]
 
 
 # --- the batch path (what the writer thread drains into) ----------------------------

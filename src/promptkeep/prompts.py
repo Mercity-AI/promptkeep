@@ -318,6 +318,7 @@ class Prompt:
             raise ValueError(f"no stored versions of prompt {name!r}{disabled}")
 
         # Pick the row: the one asked for, else the newest.
+        row: dict[str, Any] | None
         if version is None:
             row = rows[-1]
         else:

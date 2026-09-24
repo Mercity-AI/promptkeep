@@ -234,7 +234,7 @@ def _sample_rate_from_env(raw: str | None) -> float:
     return value if _valid_sample_rate(value) else 1.0
 
 
-def _valid_retention(value) -> bool:
+def _valid_retention(value: object) -> bool:
     """A positive, finite number of days (bool excluded, as for sample_rate)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
