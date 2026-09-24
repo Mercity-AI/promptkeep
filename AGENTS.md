@@ -205,6 +205,14 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   conversation from its row id; a failing `redact` hook drops the row rather than storing it
   unredacted. Templates are never redacted (they're code, and the version hash depends on
   them).
+- **Retention rides the write path too.** `record_run` schedules the sweep
+  (`storage._schedule_prune`: first run, then hourly per process), which in background mode
+  is a `_kind: "prune"` queue item run *after* its batch's transaction, never inside it.
+  `prune()` deletes conversations whole by `updated_at` and other runs by `created_at`, in
+  chunked IMMEDIATE transactions, and evicts deleted conversation ids from the in-process
+  caches. Because a queued or another-process-cached turn can outlive its conversation,
+  `_insert_run` catches the FK failure and records the turn unattached. Never delete
+  prompts or versions.
 
 ## Tests
 

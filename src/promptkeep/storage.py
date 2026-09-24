@@ -2,8 +2,8 @@
 
 The tables live in ``models``, schema upgrades in ``migrations``, the read
 side in ``history``. This module owns the connection and the writes: version
-registration, conversation resolution, run and verdict recording, and the
-batch insert the background writer drains into.
+registration, conversation resolution, run and verdict recording, the
+batch insert the background writer drains into, and the retention sweep.
 
 All write paths that run implicitly (version registration on first render,
 run recording inside a wrapped call) are exception-shielded: a broken DB
@@ -15,15 +15,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections import OrderedDict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import peewee as pw
 
 from . import controls, writer
-from .config import get_settings
+from .config import Settings, get_settings
 from .migrations import migrate
 from .models import (
     CheckRecord,
@@ -89,6 +90,8 @@ def reset_caches() -> None:
     writer.reset()
     with _reg_lock:
         _registration_cache.clear()
+    with _prune_lock:
+        _next_prune.clear()
     with _convo_lock:
         _conversation_cache.clear()
         _turn_counters.clear()
@@ -568,6 +571,9 @@ def record_run(
         if response_id is not None:
             _index_response(response_id, conversation_id, run_key)
 
+        # Retention rides the write path: a sweep, if one is due.
+        _schedule_prune(settings)
+
         # Persist: hand off to the writer thread, or insert right here.
         if settings.write_mode == "background":
             writer.submit(row)
@@ -618,6 +624,125 @@ def record_check(run_key: str | None, check_row: dict[str, Any]) -> None:
         logger.warning("promptkeep: failed to record check", exc_info=True)
 
 
+# --- retention --------------------------------------------------------------------
+
+# When the next sweep is due, per database (a time.monotonic() deadline). A
+# sweep is cheap when there is nothing to delete, but it is still a write
+# transaction, so it runs at most this often per process.
+_PRUNE_INTERVAL = 3600.0
+# Rows deleted per transaction: a first sweep over a year of history must not
+# hold the write lock long enough to time out every other writer.
+_PRUNE_CHUNK = 500
+_next_prune: dict[str, float] = {}
+_prune_lock = threading.Lock()
+
+
+def _schedule_prune(settings: Settings) -> None:
+    """Run a retention sweep if one is due — the first on the first run this
+    process records, then hourly. Queued behind the rows ahead of it in
+    background mode (so it runs on the writer thread, off the request path);
+    inline in sync mode. Called from the shielded write path."""
+    if settings.retention_days is None:
+        return
+    path = str(settings.db_path)
+    now = time.monotonic()
+    with _prune_lock:
+        if now < _next_prune.get(path, 0.0):
+            return
+        _next_prune[path] = now + _PRUNE_INTERVAL
+    if settings.write_mode == "background":
+        writer.submit({"_kind": "prune", "retention_days": settings.retention_days})
+    else:
+        _sweep(settings.retention_days)
+
+
+def _sweep(retention_days: float) -> None:
+    """Run ``prune`` shielded. A sweep is housekeeping riding someone else's
+    write — a run row in sync mode, a batch in background mode — and a
+    failure (a locked file, say) must cost neither; the next sweep is an
+    hour away and retries."""
+    try:
+        prune(retention_days)
+    except Exception:
+        logger.warning("promptkeep: retention sweep failed", exc_info=True)
+
+
+def prune(retention_days: float) -> int:
+    """Delete recorded history older than ``retention_days``; return how many
+    runs went.
+
+    A conversation is the unit, as it is for sampling: it goes whole — its
+    runs, their verdicts and feedback, the conversation row — once its *last*
+    activity is older than the cutoff, so a long-running session never loses
+    its opening turns while it is still in use. A run outside any
+    conversation (or whose conversation no longer exists) goes by its own
+    timestamp. Prompts and versions are never deleted: they are the code's
+    history, not the traffic's, and they hold no user data.
+
+    Chunked, one IMMEDIATE transaction per chunk, so the write lock is never
+    held for long. Deleting frees pages for SQLite to reuse; the file itself
+    does not shrink (run ``VACUUM`` for that). Called by the scheduled sweep;
+    raises like any storage call.
+    """
+    if get_db() is None:
+        return 0
+    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+    deleted = 0
+
+    # Conversations idle since before the cutoff, a chunk at a time. The
+    # in-process caches forget them too, or the next turn of a resumed
+    # session would point at a row that no longer exists.
+    while True:
+        with db_proxy.atomic("IMMEDIATE"):
+            expired = [
+                cid
+                for (cid,) in ConversationRecord.select(ConversationRecord.id)
+                .where(ConversationRecord.updated_at < cutoff)
+                .limit(_PRUNE_CHUNK)
+                .tuples()
+            ]
+            if not expired:
+                break
+            their_runs = RunRecord.select(RunRecord.id).where(RunRecord.conversation.in_(expired))
+            CheckRecord.delete().where(CheckRecord.run.in_(their_runs)).execute()
+            deleted += RunRecord.delete().where(RunRecord.conversation.in_(expired)).execute()
+            ConversationRecord.delete().where(ConversationRecord.id.in_(expired)).execute()
+        _forget_conversations(expired)
+
+    # Runs that belong to no (surviving) conversation, by their own age.
+    unattached = RunRecord.conversation.is_null() | RunRecord.conversation.not_in(
+        ConversationRecord.select(ConversationRecord.id)
+    )
+    while True:
+        with db_proxy.atomic("IMMEDIATE"):
+            expired = [
+                rid
+                for (rid,) in RunRecord.select(RunRecord.id)
+                .where(unattached & (RunRecord.created_at < cutoff))
+                .limit(_PRUNE_CHUNK)
+                .tuples()
+            ]
+            if not expired:
+                break
+            CheckRecord.delete().where(CheckRecord.run.in_(expired)).execute()
+            deleted += RunRecord.delete().where(RunRecord.id.in_(expired)).execute()
+    return deleted
+
+
+def _forget_conversations(conversation_ids: list[int]) -> None:
+    """Drop deleted conversations from this process's caches: the id memo,
+    the turn counters and the response index all name them by row id."""
+    path = str(get_settings().db_path)
+    gone = set(conversation_ids)
+    with _convo_lock:
+        for key in [k for k, cid in _conversation_cache.items() if k[0] == path and cid in gone]:
+            del _conversation_cache[key]
+        for key in [k for k in _turn_counters if k[0] == path and k[1] in gone]:
+            del _turn_counters[key]
+        for key in [k for k, v in _response_index.items() if k[0] == path and v[0] in gone]:
+            del _response_index[key]
+
+
 # --- the batch path (what the writer thread drains into) ----------------------------
 
 
@@ -625,13 +750,20 @@ def write_batch(items: list[dict[str, Any]]) -> None:
     """Persist queued items in one transaction (called from the writer thread).
 
     Raises on failure — the writer shields and logs, keeping the whole batch
-    as the unit of loss rather than half-writing it.
+    as the unit of loss rather than half-writing it. A queued retention sweep
+    is not part of that unit: it runs after the batch, in transactions of its
+    own (see ``prune``).
     """
     if not items or get_db() is None:
         return
-    with db_proxy.atomic():
-        for item in items:
-            _persist(item)
+    sweeps = [item for item in items if item.get("_kind") == "prune"]
+    rows = [item for item in items if item.get("_kind") != "prune"]
+    if rows:
+        with db_proxy.atomic():
+            for item in rows:
+                _persist(item)
+    for sweep in sweeps:
+        _sweep(sweep["retention_days"])
 
 
 def _persist(item: dict[str, Any]) -> None:
@@ -662,7 +794,24 @@ def _insert_run(row: dict[str, Any]) -> int:
     """
     row = dict(row)
     checks = row.pop("_checks", None)
-    run = RunRecord.create(**row)
+    try:
+        run = RunRecord.create(**row)
+    except pw.IntegrityError:
+        # Retention can delete a conversation while one of its turns is on
+        # the way — queued here, or cached by another process. Record the
+        # turn outside any conversation rather than lose it; forgetting the
+        # conversation lets the next turn start it afresh.
+        conversation_id = row.get("conversation")
+        if conversation_id is None or ConversationRecord.get_or_none(id=conversation_id):
+            raise
+        _forget_conversations([conversation_id])
+        logger.warning(
+            "promptkeep: conversation %s was pruned; run %s recorded outside it",
+            conversation_id,
+            row["run_key"],
+        )
+        row.update(conversation=None, turn_index=None)
+        run = RunRecord.create(**row)
 
     # Bundled verdicts ride in the same transaction as their run.
     if checks:

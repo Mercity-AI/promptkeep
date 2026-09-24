@@ -99,6 +99,14 @@ public APIs; each such change is called out below.
   strictness, which versions don't store, are given at load. Raises
   `ValueError` for an unknown prompt or version.
 
+- `configure(retention_days=N)` (or `PROMPTKEEP_RETENTION_DAYS`) deletes
+  history older than N days: conversations whole once their last turn is
+  that old, other runs by their own age, verdicts and feedback with their
+  run; prompts and versions never. The sweep rides the write path — hourly,
+  chunked, on the writer thread in background mode — and a failed sweep
+  never costs a run. A turn whose conversation was pruned under it (by
+  another process) is recorded outside it rather than lost.
+
 ### Changed
 
 - Internal restructuring, no public API change: `storage` is split into

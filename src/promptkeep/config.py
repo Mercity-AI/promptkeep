@@ -1,14 +1,16 @@
 """Global library configuration: DB location, tracking on/off, strict rendering,
-the run-write mode, and the production controls (sampling, redaction).
+the run-write mode, and the production controls (sampling, redaction,
+retention).
 
 Settings are resolved fresh on every access with a simple precedence:
 explicit ``configure()`` overrides win, then environment variables
 (``PROMPTKEEP_DB``, ``PROMPTKEEP_DISABLED``, ``PROMPTKEEP_WRITE_MODE``,
-``PROMPTKEEP_SAMPLE_RATE``), then defaults.
+``PROMPTKEEP_SAMPLE_RATE``, ``PROMPTKEEP_RETENTION_DAYS``), then defaults.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -41,6 +43,7 @@ class Settings:
     on_block: str
     sample_rate: float
     redact: Callable[[str], str] | None
+    retention_days: float | None = None
 
 
 def configure(
@@ -56,6 +59,7 @@ def configure(
     on_block: str | None = None,
     sample_rate: float | None = None,
     redact: Callable[[str], str] | None = None,
+    retention_days: float | None = None,
 ) -> None:
     """Override library settings. Only the arguments you pass are changed.
 
@@ -98,6 +102,16 @@ def configure(
       rewritten text) before it is written. Templates, prompt names and
       conversation metadata are not passed through it. If the hook raises or
       returns a non-string the row is dropped, never stored unredacted.
+      ``redact=lambda text: ""`` stores metadata only — model, tokens, cost,
+      latency, status — and no text at all.
+    - retention_days: delete recorded history older than this many days
+      (default: keep forever, or the PROMPTKEEP_RETENTION_DAYS env var). A
+      conversation goes whole, once its last turn is older than that; a run
+      outside any conversation goes by its own age; check verdicts and
+      feedback go with their run. Prompts and versions are never deleted —
+      they are code. The sweep runs on the write path, at most once an hour,
+      starting with the first run recorded (off the request path in
+      background mode).
     """
     with _lock:
         if db_path is not None:
@@ -140,6 +154,12 @@ def configure(
                     f"redact must be callable (str -> str), got {type(redact).__name__}"
                 )
             _overrides["redact"] = redact
+        if retention_days is not None:
+            if not _valid_retention(retention_days):
+                raise ValueError(
+                    f"retention_days must be a positive number, got {retention_days!r}"
+                )
+            _overrides["retention_days"] = float(retention_days)
 
 
 def get_settings() -> Settings:
@@ -173,6 +193,12 @@ def get_settings() -> Settings:
         if sample_rate is None:
             sample_rate = _sample_rate_from_env(os.environ.get("PROMPTKEEP_SAMPLE_RATE"))
 
+        # Retention: override, then $PROMPTKEEP_RETENTION_DAYS; anything
+        # unparseable means "keep everything" — never delete on a typo.
+        retention_days = _overrides.get("retention_days")
+        if retention_days is None:
+            retention_days = _retention_from_env(os.environ.get("PROMPTKEEP_RETENTION_DAYS"))
+
         return Settings(
             db_path=db_path,
             enabled=enabled,
@@ -186,6 +212,7 @@ def get_settings() -> Settings:
             on_block=_overrides.get("on_block", "raise"),
             sample_rate=sample_rate,
             redact=_overrides.get("redact"),
+            retention_days=retention_days,
         )
 
 
@@ -205,6 +232,24 @@ def _sample_rate_from_env(raw: str | None) -> float:
     except ValueError:
         return 1.0
     return value if _valid_sample_rate(value) else 1.0
+
+
+def _valid_retention(value) -> bool:
+    """A positive, finite number of days (bool excluded, as for sample_rate)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value > 0
+
+
+def _retention_from_env(raw: str | None) -> float | None:
+    """Parse $PROMPTKEEP_RETENTION_DAYS; invalid or missing means no retention."""
+    if not raw:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if _valid_retention(value) else None
 
 
 def reset() -> None:

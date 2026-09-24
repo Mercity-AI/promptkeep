@@ -402,13 +402,14 @@ don't lose rows. `write_mode="off"` drops run telemetry entirely (versioning sti
 
 ## Production controls
 
-Two knobs for running this in anger — a busy service that doesn't need every row, and a
-regulated one that must never store certain text:
+Three knobs for running this in anger — a busy service that doesn't need every row, a
+regulated one that must never store certain text, and one that must not keep it forever:
 
 ```python
 promptkeep.configure(
     sample_rate=0.1,          # store 10% of uneventful runs ($PROMPTKEEP_SAMPLE_RATE)
     redact=scrub_pii,         # str -> str, applied to every stored text field
+    retention_days=90,        # delete history older than 90 days ($PROMPTKEEP_RETENTION_DAYS)
 )
 ```
 
@@ -427,6 +428,17 @@ input and output, the JSON-encoded variables and request params, error text) and
 verdict (message, rewritten text). Templates, prompt names and conversation metadata are not
 passed through it: templates are code, and the metadata is what you attached on purpose. If
 the hook raises or returns a non-string, the row is dropped rather than stored unredacted.
+`redact=lambda text: ""` keeps metadata only — model, tokens, cost, latency, status and
+verdicts, with no prompt or response text at all.
+
+**Retention** deletes recorded history once it is older than `retention_days`. A
+conversation is deleted whole, once its *last* turn is that old, so a session still in use
+never loses its opening turns; a run outside any conversation goes by its own age; verdicts
+and feedback go with their run. Prompts and versions are never deleted — they are your
+code's history, not your traffic's. The sweep rides the write path: at most once an hour per
+process, starting with the first run recorded, on the writer thread in background mode. A
+failed sweep is logged and retried an hour later, and never costs a run. SQLite reuses the
+freed space; to shrink the file itself, run `VACUUM` on it.
 
 ## Configuration
 
@@ -446,6 +458,7 @@ promptkeep.configure(
     on_block="raise",               # blocked pre-check: "raise" PromptBlocked | "return" a stub
     sample_rate=1.0,                # fraction of uneventful runs to store ($PROMPTKEEP_SAMPLE_RATE)
     redact=None,                    # str -> str hook applied to every stored text field
+    retention_days=None,            # delete history older than this ($PROMPTKEEP_RETENTION_DAYS)
 )
 ```
 
