@@ -59,7 +59,8 @@ version; static text, repetition patterns, and format specs still distinguish ve
 Modules, bottom up: `rendering`, `conversation`, `config` (no package imports) → `writer`
 (the queue; its sink is injected by storage) → `models` (peewee tables) → `migrations` →
 `controls` (sampling, redaction) → `storage` (the connection and every write) → `prompts` →
-`history` (the read side: queries → frozen dataclasses) → `checks` → `tracking` →
+`history` (the read side: queries → frozen dataclasses) → `datasets` (history filtered
+and exported to JSONL / DSPy / promptfoo) → `checks` → `tracking` →
 `integrations/` (`base` = the adapter interface, `core` = the shared interceptor built around
 one `_Call` object per call, `registry` = `wrap()` and the adapter list, `call` = the explicit
 `call()` shape, `openai_wrapper` = the one adapter).

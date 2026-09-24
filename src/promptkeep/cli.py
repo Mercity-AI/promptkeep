@@ -234,10 +234,11 @@ def _export(args: argparse.Namespace) -> None:
         found = history.runs(args.prompt, version=args.version, limit=args.limit)
 
     # One object per line; a file when asked for one, else stdout.
+    by_run = history.labels([run.run_key for run in found])
     out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
     try:
         for run in found:
-            record = {**asdict(run), "checks": [asdict(c) for c in history.checks(run.run_key)]}
+            record = {**asdict(run), "checks": [asdict(c) for c in by_run[run.run_key]]}
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
     finally:
         if args.output:

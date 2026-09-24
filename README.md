@@ -309,6 +309,29 @@ through `redact` — and a run can collect any number of them. `feedback(None, .
 no-op, which is what `run_key` is when a run wasn't stored (sampled out, tracking off), so
 the call is always safe to make.
 
+## Datasets
+
+Everything promptkeep records is raw material for evaluating a prompt — or optimizing it.
+`promptkeep.dataset()` picks out the runs worth learning from and hands them to the tools that
+do that work:
+
+```python
+ds = promptkeep.dataset("REVIEW_SYSTEM", version=4, passed=True, limit=500)
+
+ds.to_jsonl("review_v4.jsonl")          # neutral: variables, input, output, labels per line
+trainset = ds.to_dspy()                 # dspy.Example objects, inputs marked (needs dspy)
+ds.to_promptfoo("review_tests.jsonl")   # promptfoo test cases: `tests: file://review_tests.jsonl`
+```
+
+Only completed runs with a reply are included. The filters combine: `version=`; `passed=True`
+(every check returned ok) or `passed=False` (the failures, for a negative set);
+`feedback="thumbs_up"` (runs given that label); `min_feedback=0.8` (average feedback score);
+and `limit=` — the newest N *after* filtering. An example's inputs are the run's variables plus
+the user turn when the call had one; its output is the reply. promptfoo cases carry the
+recorded reply as `metadata.reference_output` and no assertions — what counts as a pass is
+yours to say. promptkeep is the memory; DSPy and promptfoo are the optimizer and the eval
+harness.
+
 ## History
 
 ```python

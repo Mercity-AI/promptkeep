@@ -107,6 +107,13 @@ public APIs; each such change is called out below.
   never costs a run. A turn whose conversation was pruned under it (by
   another process) is recorded outside it rather than lost.
 
+- `promptkeep.dataset(prompt, version=, passed=, feedback=, min_feedback=,
+  limit=)` turns a prompt's completed runs into a `Dataset`, filtered by
+  check verdicts and feedback, with `to_jsonl()`, `to_dspy()` (DSPy is not a
+  dependency) and `to_promptfoo()` (JSONL test cases). `history.labels(keys)`
+  reads the labels of many runs in one query; `promptkeep export` uses it
+  instead of one query per run.
+
 ### Changed
 
 - Internal restructuring, no public API change: `storage` is split into

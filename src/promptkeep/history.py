@@ -359,6 +359,37 @@ def checks(run_key: str) -> list[CheckInfo]:
     return [CheckInfo(**row) for row in query]
 
 
+def labels(run_keys: list[str]) -> dict[str, list[CheckInfo]]:
+    """The labels on many runs at once — ``checks()`` for a batch, in one
+    query per few hundred runs rather than one per run. Every key asked for
+    is in the result, oldest label first; a run with none maps to []."""
+    found: dict[str, list[CheckInfo]] = {key: [] for key in run_keys}
+    if not run_keys or not _ready():
+        return found
+
+    # Chunked: SQLite caps the number of bound parameters in one statement.
+    for start in range(0, len(run_keys), _KEYS_PER_QUERY):
+        chunk = run_keys[start : start + _KEYS_PER_QUERY]
+        query = (
+            CheckRecord.select(
+                RunRecord.run_key,
+                CheckRecord.name,
+                CheckRecord.phase,
+                CheckRecord.status,
+                CheckRecord.score,
+                CheckRecord.message,
+                CheckRecord.rewritten,
+            )
+            .join(RunRecord)
+            .where(RunRecord.run_key.in_(chunk))
+            .order_by(CheckRecord.id)
+            .dicts()
+        )
+        for row in query:
+            found[row.pop("run_key")].append(CheckInfo(**row))
+    return found
+
+
 def verdict(run_status: str, check_infos: list[CheckInfo]) -> str | None:
     """The one-word headline for a run's checks, for a badge in the UI.
 
@@ -445,6 +476,8 @@ _RUN_COLUMNS = (
     RunRecord.cost_usd,
     RunRecord.parent_run_key,
 )
+# Run keys bound per query by batch reads — well under SQLite's parameter cap.
+_KEYS_PER_QUERY = 500
 # Added only where the caller reads across conversations and needs to know
 # which one each run belongs to (a conversation's own turns already know).
 _CONVERSATION_ID_COLUMN = ConversationRecord.external_id.alias("conversation_id")

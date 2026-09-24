@@ -12,6 +12,7 @@ from . import history
 from .checks import CheckContext, PromptBlocked, Verdict, check, suppress
 from .config import configure, get_settings
 from .conversation import conversation
+from .datasets import Dataset, dataset
 from .decorator import prompt
 from .integrations import acall, call, wrap
 from .prompts import Prompt, RenderedText
@@ -34,6 +35,8 @@ __all__ = [
     "get_settings",
     "history",
     "conversation",
+    "dataset",
+    "Dataset",
     "flush",
     "feedback",
     "check",
