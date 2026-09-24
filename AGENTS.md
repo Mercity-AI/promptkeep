@@ -42,6 +42,11 @@ that ruff does not enforce — keep them when adding or editing code:
   that way — the docstrings are where the design reasoning lives (see `storage._register`,
   `writer`, `controls.keep_run`). A one-liner is fine when that is all there is to say.
 
+The public API is written down in `docs/API.md` and pinned by
+`tests/test_package.py::test_the_public_api_changes_only_on_purpose`. Adding a public name
+means updating that test and the CHANGELOG; removing or renaming one goes through a
+`DeprecationWarning` for at least one minor release first.
+
 Module graph is a DAG: no function-level intra-package imports (`tests/test_package.py`
 enforces it; `cli.py`'s lazy dashboard import is the one exception). If an import cycle appears,
 one dependency is pointing the wrong way — fix that rather than deferring the import.

@@ -3,7 +3,8 @@
 All notable changes to promptkeep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/). Until 1.0, minor versions may change
-public APIs; each such change is called out below.
+public APIs; each such change is called out below. What counts as public API, and
+how deprecations work, is in [docs/API.md](docs/API.md).
 
 ## [Unreleased]
 
@@ -113,6 +114,12 @@ public APIs; each such change is called out below.
   dependency) and `to_promptfoo()` (JSONL test cases). `history.labels(keys)`
   reads the labels of many runs in one query; `promptkeep export` uses it
   instead of one query per run.
+
+- `docs/API.md`: the public API and stability policy — what is public, the
+  behavioural contracts, database-file compatibility, and the deprecation
+  process (a `DeprecationWarning` for at least one minor release before
+  anything is removed). A test pins the public surface so it only changes
+  on purpose.
 
 ### Changed
 

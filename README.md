@@ -485,6 +485,15 @@ promptkeep.configure(
 )
 ```
 
+## Stability
+
+promptkeep follows semantic versioning. The public API is `promptkeep.__all__`,
+`promptkeep.history`, `promptkeep.integrations.__all__`, the `promptkeep_*` call kwargs,
+`configure()` and its environment variables, and the CLI's commands. Before 1.0 a minor release
+may change it, always with a changelog entry saying what to do instead; anything being removed
+first warns with a `DeprecationWarning` for at least one release. Database files upgrade
+forward automatically. The full policy is in [docs/API.md](docs/API.md).
+
 ## Development
 
 ```bash
