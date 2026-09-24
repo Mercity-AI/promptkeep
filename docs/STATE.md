@@ -1,10 +1,12 @@
 # promptkeep — Current State
 
-*Snapshot: 19 September 2026 · `main` after the refactor (PR #4) and the reach batch — cost
+*Snapshot: 24 September 2026 · `main` after the refactor (PR #4), the reach batch — cost
 tracking, `feedback()`, the Responses API adapter with automatic conversation chaining, the
-full CLI, `Prompt.variants()` — and a hardening pass that found async chat runs being recorded
-empty on the real `AsyncOpenAI` (fixed; **the bug is in the published 0.2.0**) · v0.2.0 on PyPI, **nothing since is published** · one open
-branch: `typing` (`mypy --strict` clean, awaiting a PR)*
+full CLI, `Prompt.variants()` — a hardening pass that found async chat runs being recorded
+empty on the real `AsyncOpenAI` (fixed; **the bug is in the published 0.2.0**), and the v1
+batch — tree-shaped conversations, `Prompt.load()`, retention, dataset export, the API policy
+(§4.15) · v0.2.0 on PyPI, **nothing since is published**, and `main` is not pushed · one open
+branch: `typing` (`mypy --strict` clean, rebased onto the v1 batch, awaiting a PR)*
 
 This is the handoff document: what the library is, what is actually built, how to use it, and
 where the edges are. Anyone picking this project up should be able to read this and be
@@ -51,13 +53,13 @@ runs off it.
 |---|---|
 | **Package** | `promptkeep` on PyPI — v0.2.0, published 4 July 2026. **v0.3.0 is declared in `pyproject.toml`, described in `CHANGELOG.md`, tagged `v0.3.0` locally and built into `dist/`, but not published** — see §7 for the two blockers. Everything from conversations onward is unreleased on PyPI. |
 | **Repo** | `github.com/Mercity-AI/promptkeep` (local dir still named `prompt-manager`) |
-| **Branches** | `main`, plus `typing` (strict typing, to be merged by PR). PR #1 merged `feat/conversations-dashboard`, PR #3 `feat/checks`, PR #4 `refactor`; feature batches are committed straight to main, one commit each. |
-| **Tests** | 426, ~4s, no network, verified locally on Python 3.11, 3.12, 3.13 and 3.14 on macOS. Coverage 94%. 16 of them use the real `openai` SDK (dev group): 13 drive its clients over a mock transport, 3 build its response objects. |
+| **Branches** | `main`, plus `typing` (strict typing, rebased onto `main` on 24 Sep, to be merged by PR). PR #1 merged `feat/conversations-dashboard`, PR #3 `feat/checks`, PR #4 `refactor`; feature batches are committed straight to main, one commit each. |
+| **Tests** | 503, ~4s, no network, verified locally on Python 3.11, 3.12, 3.13 and 3.14 on macOS. Coverage 94%. 16 of them use the real `openai` SDK (dev group): 13 drive its clients over a mock transport, 3 build its response objects. |
 | **Size** | ~5,700 LOC Python + ~450 LOC HTML templates · ~5,000 LOC tests |
 | **Python** | ≥ 3.11. **No CI yet**: the workflows (ruff, the suite on 3.11–3.14 × Linux/macOS/Windows, an 85% coverage gate; tag-driven publishing) are written in `docs/workflows/` but not enabled — the push token lacks the `workflow` scope. See `TODO.md`. Windows is untested. |
 | **Deps** | `peewee>=3.17` only. Extras: `[openai]` → `openai>=1.0`; `[serve]` → fastapi, uvicorn, jinja2. Dev: pytest, pytest-cov, ruff, the serve stack, httpx. |
 | **License** | MIT |
-| **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Two provider surfaces, both OpenAI-shaped (`chat.completions`, Responses) — which covers OpenRouter and every compatible endpoint; no Anthropic or LiteLLM adapter yet. |
+| **Maturity** | Beta. Core is solid and covered. Deployable: writes are off the hot path, sampling and redaction exist. Two provider surfaces, both OpenAI-shaped (`chat.completions`, Responses) — which covers OpenRouter and every compatible endpoint. Anthropic and LiteLLM adapters are out of scope by decision (24 Sep). |
 
 ```bash
 pip install promptkeep            # core
@@ -95,12 +97,13 @@ around it does. Breaking this rule would make the version history useless within
 ### Tables
 
 `prompts` → `prompt_versions` → `runs` ← `conversations`, plus `checks` → `runs`. Schema
-version is tracked in `PRAGMA user_version` (**5**) with a forward-only migration runner in
-`storage._migrate()`; each step runs in its own transaction together with its version bump.
+version is tracked in `PRAGMA user_version` (**8**) with a forward-only migration runner in
+`migrations.migrate()`; each step runs in its own transaction together with its version bump.
 
 `runs` columns added in v3: `conversation_id`, `turn_index`, `input_text` (the user turn's text,
-so a conversation can be replayed even when no `Prompt` was in the message). The roadmap's
-`parent_run_id` (tree-shaped conversations) was **not** built — conversations are linear.
+so a conversation can be replayed even when no `Prompt` was in the message). v8 added
+`parent_run_key` — the roadmap's `parent_run_id`, by key rather than row id because the parent
+may still be queued — which makes a conversation a tree (§4.15).
 
 ---
 
@@ -429,6 +432,43 @@ to its version. No weighted routing — `compare()` and A/B routing remain open.
 what was recorded: the check that a live endpoint is shaped the way the adapters read it.
 **It has not been run yet** — no key was available in the session that wrote it.
 
+### 4.15 The v1 batch *(24 September 2026)*
+
+**Tree-shaped conversations.** `runs.parent_run_key` (schema v8) names the run a turn
+continues from when that isn't the turn before it — a regeneration, a retry, a sub-agent call.
+Set by `promptkeep_parent=` (a response, a `RunHandle` or a key) or automatically from a
+Responses `previous_response_id` (the in-process response index now maps a response id to its
+*primary* run's key as well as its conversation). NULL keeps its old meaning — "followed the
+previous turn" — so `ConversationInfo` derives the tree from one rule: `forks`, `leaves`,
+`path(run_key)`, and `replay()` following the branch that ends at the latest turn
+(`replay(upto=)` for another). Linear conversations read exactly as before. The CLI and
+dashboard mark where a branch forks.
+
+**`Prompt.load(name, version=None, *, strict=, pre=, post=)`.** One stored version, pinned or
+the highest-numbered, bound to its row like a variant — the prompt registry. Checks and
+strictness aren't stored with versions, so they are given at load.
+
+**Retention.** `configure(retention_days=N)` / `PROMPTKEEP_RETENTION_DAYS`. `record_run`
+schedules a sweep (first run, then hourly per process): inline in sync mode, a `_kind: "prune"`
+queue item in background mode, run after its batch's transaction. `storage.prune()` deletes
+conversations whole by `updated_at`, other runs by `created_at`, in 500-row IMMEDIATE
+transactions; never prompts or versions. A turn whose conversation vanished under it (a queued
+turn, or another process's cache) is recorded unattached instead of failing its batch.
+Metadata-only storage needs no new flag: `redact=lambda text: ""`.
+
+**Datasets.** `promptkeep.dataset(prompt, version=, passed=, feedback=, min_feedback=,
+limit=)` → a `Dataset` of completed runs with their labels; `to_jsonl()`, `to_dspy()` (DSPy
+optional, imported lazily), `to_promptfoo()` (JSONL test cases, reply in
+`metadata.reference_output`, no assertions). New module `datasets.py` above `history`;
+`history.labels(keys)` is the batch label read (the CLI export uses it too).
+
+**API policy.** `docs/API.md` — what is public, the behavioural contracts, database-file
+compatibility, deprecation (a `DeprecationWarning` for at least one minor release). A test in
+`test_package.py` pins the public names.
+
+Not done, by decision: benchmarks, the storage backend interface (no second backend to
+design it against yet — see §7), `compare()` and weighted routing, Anthropic and LiteLLM.
+
 ## 5. Architecture
 
 ```
@@ -504,7 +544,7 @@ Breaking any of these breaks the library's contract:
 
 ## 6. Tests
 
-426 tests, no network, ~4s. Coverage 94% (only `cli._serve`, the uvicorn launcher, is
+503 tests, no network, ~4s. Coverage 94% (only `cli._serve`, the uvicorn launcher, is
 excluded). Most run against the hand-rolled fakes in `tests/fakes.py`; `test_real_sdk.py` and a
 class in `test_responses.py` use the real `openai` SDK (dev group only — the package does not
 depend on it) and skip without it.
@@ -514,22 +554,24 @@ depend on it) and skip without it.
 | `test_checks.py` | 39 | pre/post checks, verdicts, timeouts, rewrite, RunHandle, call()/acall(), streaming |
 | `test_rendering.py` | 30 | lenient/strict matrix, JSON braces, normalization |
 | `test_adapters.py` | 46 | the adapter contract, run per registered adapter; the registry |
-| `test_conversation.py` | 27 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing |
+| `test_conversation.py` | 40 | context manager, kwarg path, turn ordering, async, replay(), derived stats, filtered listing, branching (`promptkeep_parent`, forks, leaves, path) |
 | `test_prompt.py` | 28 | immutability, versioning, provenance, equality |
-| `test_responses.py` | 38 | Responses request shapes, recording, streaming, checks, `previous_response_id` chaining (sync, background, cross-process), the real SDK's objects |
+| `test_responses.py` | 43 | Responses request shapes, recording, streaming, checks, `previous_response_id` chaining (sync, background, cross-process) and the parents it sets, the real SDK's objects |
 | `test_real_sdk.py` | 13 | the real `openai` clients — sync/async, chat/Responses, plain/SSE — over an httpx `MockTransport`; found the async-detection bug |
-| `test_cli.py` | 29 | every CLI command's output, error exits, `history.stats()` |
+| `test_cli.py` | 30 | every CLI command's output, error exits, `history.stats()` |
 | `test_storage.py` | 28 | dedup, version counters, concurrency, migrations, run_key, conversations, `chain_conversation` |
 | `test_cost.py` | 21 | reported cost (response, stream, junk, zero vs none), conversation totals, formatting |
 | `test_feedback.py` | 22 | a handle on every recorded call; feedback storage, validation, shielding, redaction |
 | `test_openai_wrapper.py` | 28 | substitution, run rows, streaming, async, error paths, async methods hidden behind a sync decorator |
-| `test_dashboard.py` | 18 | every route via `TestClient`, 404s, filters, stats line |
+| `test_dashboard.py` | 19 | every route via `TestClient`, 404s, filters, stats line |
 | `test_decorator.py` | 16 | defaults, kwargs capture, fn source hash, async builders |
 | `test_controls.py` | 15 | sampling (always-keep rules, per-conversation decision, env), redaction (every field, failure modes) |
 | `test_writer.py` | 9 | batching, overflow/drop counting, flush, reset, atexit |
-| `test_variants.py` | 9 | `Prompt.variants()`: ordering, no new versions, exact_match round-trip, runs filed under the variant |
+| `test_variants.py` | 17 | `Prompt.variants()` and `Prompt.load()`: ordering, latest vs pinned, no new versions, exact_match round-trip, runs filed under the variant, checks at load |
+| `test_retention.py` | 28 | the setting and env var, what `prune()` deletes and keeps, chunking, cache eviction, a turn outliving its conversation, the hourly sweep in both write modes |
+| `test_datasets.py` | 20 | `dataset()` filters and limit, JSONL / DSPy / promptfoo shapes, field collisions, `history.labels()` |
 | `test_history.py` | 7 | versions/diff/runs shaping |
-| `test_package.py` | 3 | `__version__` matches `pyproject.toml`; `__all__` resolves; no import cycles |
+| `test_package.py` | 4 | `__version__` matches `pyproject.toml`; `__all__` resolves; the public surface is pinned; no import cycles |
 
 `tests/conftest.py` gives every test a fresh tmp DB, reset config, `write_mode="sync"`, and a
 reset writer — tests never touch a real `.promptkeep.db`.
@@ -559,17 +601,17 @@ started.
 | Background writer, `flush()`, atexit, bounded drop-oldest queue | **Done** | `writer.py`, `configure(write_mode/queue_size/flush_interval/batch_size)` |
 | Fork safety | **Done** | `os.register_at_fork`, POSIX only |
 | `write_mode="sync"` in tests | **Done** | conftest |
-| Conversations: schema v3, context manager, async twin, kwarg escape hatch | **Done** | linear only |
+| Conversations: schema v3, context manager, async twin, kwarg escape hatch | **Done** | |
 | `history.conversation()` with ordered turns | **Done** | |
 | `convo.replay()`, `versions_used`, `total_tokens`, `duration` | **Done** | `replay(system=)` for re-runs |
 | `history.conversations(prompt=, version=)` filter | **Done** | as `list_conversations(prompt=, version=)` — one name, not two |
-| `parent_run_id` (tree-shaped conversations) | Open | |
+| `parent_run_id` (tree-shaped conversations) | **Done** | as `parent_run_key` (schema v8); `promptkeep_parent=`, automatic on Responses chains; `forks` / `leaves` / `path()` / `replay(upto=)` |
 | `@prompt` on `async def` | **Done** | |
 | `sample_rate` | **Done** | per-conversation decision; async verdicts can't rescue a dropped run |
 | `redact` hook | **Done** | fails closed |
 | `__version__` via `importlib.metadata` | **Done** | |
 | `testing.py` → `examples/`, drop `testing.db` | **Done** | `examples/playground.py` |
-| CI (matrix, ruff, coverage gate) | Partial | workflows written in `docs/workflows/`, not enabled — `TODO.md` |
+| CI (matrix, ruff, coverage gate) | Partial | workflows written in `docs/workflows/`, not enabled — `TODO.md`; deferred by decision (24 Sep) |
 
 ### v0.4 — Checks
 
@@ -590,22 +632,22 @@ started.
 | Rest of the CLI: `list`, `versions`, `diff`, `runs`, `convo`, `stats`, `export` | **Done** | plain text, no deps; `export` is JSONL only |
 | Provider adapter interface (`integrations/base.py`) | **Done** | OpenAI chat is the first adapter; contract suite in `test_adapters.py` |
 | OpenAI Responses API + automatic conversation chaining | **Done** | `responses.create` only — `.stream()` / `.parse()` pass through untracked |
-| Anthropic adapter | Open | |
-| LiteLLM adapter | Open | |
+| Anthropic adapter | Dropped | not needed (decision, 24 Sep) |
+| LiteLLM adapter | Dropped | not needed (decision, 24 Sep) |
 | Cost tracking (`cost_usd`, price table) | **Done** | provider-reported only, by decision: no bundled price table |
 | `compare()` and `Prompt.variants()` A/B routing | Partial | `Prompt.variants(name)` returns the stored versions and `history.stats()` / `promptkeep stats` is the comparison table; `compare()` and weighted routing deliberately left out |
-| Docs site | Open | |
+| Docs site | Open | wanted; Pranav is taking it on |
 
 ### v1.0 — Stability
 
-| Item | Status |
-|---|---|
-| API freeze + deprecation policy | Open |
-| `Prompt.load()` version pinning | Open |
-| Dataset export (`to_dspy` / `to_jsonl` / `to_promptfoo`) | Open |
-| Storage backend interface | Open |
-| Published benchmarks | Open |
-| Retention | Open |
+| Item | Status | Notes |
+|---|---|---|
+| API freeze + deprecation policy | **Done** (policy) | `docs/API.md` + a test pinning the public names; the freeze itself happens at the 1.0 tag |
+| `Prompt.load()` version pinning | **Done** | pinned or latest (highest-numbered); checks given at load |
+| Dataset export (`to_dspy` / `to_jsonl` / `to_promptfoo`) | **Done** | `promptkeep.dataset()` with verdict and feedback filters; no `where=` string DSL — keyword filters instead |
+| Storage backend interface | Deferred | by decision: one implementation is not enough to design the interface against; nothing is blocked on it, and it isn't public API, so it can land after 1.0 |
+| Published benchmarks | Dropped for now | by decision (24 Sep) |
+| Retention | **Done** | `retention_days`; conversations go whole; `redact=lambda t: ""` covers the roadmap's `store_outputs=False` "metadata only" |
 
 ### Engineering standards (roadmap §8)
 
@@ -614,8 +656,9 @@ badges on the README. Written but **not enabled** (`docs/workflows/`, see `TODO.
 workflow (matrix 3.11–3.14 × 3 OSes, ruff, 85% coverage gate) and release automation (a pushed
 `v*` tag re-runs the suite, checks the tag matches the declared version, publishes via PyPI
 Trusted Publishing, opens a GitHub Release).
-Not started: `CONTRIBUTING.md` / `SECURITY.md` / issue templates, `mypy --strict`, benchmarks,
-docs site. The README documents every feature but is not yet rewritten to the "sell in
+Semver and the public API are stated (`docs/API.md`). `mypy --strict` is clean on the
+`typing` branch, not yet merged. Not started: `CONTRIBUTING.md` / `SECURITY.md` / issue
+templates, docs site. The README documents every feature but is not yet rewritten to the "sell in
 fifteen seconds" shape (no GIF).
 
 ### Open questions (roadmap §10) — where they landed
@@ -629,19 +672,20 @@ fifteen seconds" shape (no GIF).
 
 ### Suggested next moves, in order
 
-1. **Merge `typing`** (PR): `mypy --strict` clean, mypy added to the gate.
+1. **Merge `typing`** (PR): `mypy --strict` clean — rebased onto the v1 batch on 24 Sep and
+   re-verified (strict clean, 503 passing) — with mypy added to the gate.
 2. **Run `examples/live_smoke.py`** against OpenRouter (and OpenAI, for the Responses chain)
    — the adapters are tested against fakes and the SDK's own types, not yet a live endpoint.
-3. **Enable CI** (`TODO.md`): re-issue the token with the `workflow` scope, move
-   `docs/workflows/` to `.github/workflows/`, and watch the first run — Windows has never
-   executed this suite.
-4. **Cut a release — this is now the urgent one.** PyPI is still at 0.2.0, which records every
-   `AsyncOpenAI` chat completion empty (see CHANGELOG "Fixed"); anyone using the published
-   package with an async client is collecting blank runs. The local `v0.3.0` tag is far behind
-   main; decide the number (0.4.0 is the honest one), fold "Unreleased" into it, retag, publish.
-5. Then what is left of **v0.5**: Anthropic and LiteLLM adapters, `compare()` / weighted
-   routing if still wanted, a docs site. `parent_run_id` (tree-shaped conversations) is the
-   one v0.3 item still open.
+3. **Push `main` and cut a release — the urgent one.** PyPI is still at 0.2.0, which records
+   every `AsyncOpenAI` chat completion empty (see CHANGELOG "Fixed"); anyone using the
+   published package with an async client is collecting blank runs. The local `v0.3.0` tag
+   is far behind main; decide the number (0.4.0 is the honest one), fold "Unreleased" into
+   it, retag, publish.
+4. **The docs site** (MkDocs Material, per the roadmap) — `docs/API.md` is written to drop
+   straight into it.
+5. **Enable CI** when wanted (`TODO.md`) — Windows has never executed this suite.
+6. Toward 1.0: `CONTRIBUTING.md` / `SECURITY.md` / issue templates, the README rewrite, then
+   the freeze itself — and the storage backend interface once a second backend is real.
 
 ---
 
