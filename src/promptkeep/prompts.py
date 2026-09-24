@@ -276,23 +276,88 @@ class Prompt:
         raises if the database is broken. Empty for an unknown name, or when
         tracking is disabled.
         """
-        found = []
         database = str(get_settings().db_path)
-        for row in storage.version_rows(name):
-            # A version registered with exact_match=True hashed its raw text;
-            # rebuild it the same way, or it would re-register as a new version.
-            exact = template_hash(row["template"]) != row["template_hash"]
-            variant = cls(
-                row["template"],
-                name=name,
-                exact_match=exact,
-                source=row["source"],
-                fn_source_hash=row["fn_source_hash"],
-            )
-            # It came from the lineage, so it is registered: no lookup needed.
-            object.__setattr__(variant, "_registration", (database, (row["id"], row["version"])))
-            found.append(variant)
-        return found
+        return [cls._stored(name, row, database) for row in storage.version_rows(name)]
+
+    @classmethod
+    def load(
+        cls,
+        name: str,
+        version: int | None = None,
+        *,
+        strict: bool | None = None,
+        pre: list | None = None,
+        post: list | None = None,
+    ) -> Prompt:
+        """One stored version of ``name`` as a Prompt — ``version``, or the
+        latest (the highest-numbered) when it is omitted.
+
+            review = Prompt.load("REVIEW_SYSTEM", version=4)   # pinned
+            review = Prompt.load("REVIEW_SYSTEM")              # whatever is newest
+            review.format(focus="security").text
+
+        This is the prompt registry: the template comes from the database
+        instead of a literal in the code, so the prompt in play can change
+        without a deploy — register a new version anywhere that writes to the
+        same file (a script, a notebook, another service) and the next load
+        picks it up. Like ``variants()``, the result already knows its version
+        and records its runs under it; it carries no variables. Checks and
+        strictness aren't stored with a version, so they are passed here.
+
+        Latest means highest-numbered, not most recently used: if the code
+        went back to an older template, that template kept its old number, and
+        the newest version is still the one after it.
+
+        An explicit read — do it at startup or per request, not at import
+        time. Raises ValueError when the prompt has no stored versions (an
+        unknown name, or tracking disabled) or no such version.
+        """
+        rows = storage.version_rows(name)
+        if not rows:
+            disabled = "" if get_settings().enabled else " (tracking is disabled)"
+            raise ValueError(f"no stored versions of prompt {name!r}{disabled}")
+
+        # Pick the row: the one asked for, else the newest.
+        if version is None:
+            row = rows[-1]
+        else:
+            row = next((r for r in rows if r["version"] == version), None)
+            if row is None:
+                raise ValueError(f"prompt {name!r} has no version {version}")
+        database = str(get_settings().db_path)
+        return cls._stored(name, row, database, strict=strict, pre=pre, post=post)
+
+    @classmethod
+    def _stored(
+        cls,
+        name: str,
+        row: dict[str, Any],
+        database: str,
+        strict: bool | None = None,
+        pre: list | None = None,
+        post: list | None = None,
+    ) -> Prompt:
+        """A stored version row rebuilt as a Prompt already bound to it.
+
+        It must reproduce the identity the version was hashed under, or using
+        it would mint a new version: one registered with exact_match=True
+        hashed its raw text, which shows as a stored hash that differs from
+        the normalized one. The registration memo is seeded from the row —
+        it came from the lineage, so no lookup is needed.
+        """
+        exact = template_hash(row["template"]) != row["template_hash"]
+        stored = cls(
+            row["template"],
+            name=name,
+            strict=strict,
+            exact_match=exact,
+            source=row["source"],
+            fn_source_hash=row["fn_source_hash"],
+            pre=pre,
+            post=post,
+        )
+        object.__setattr__(stored, "_registration", (database, (row["id"], row["version"])))
+        return stored
 
     # --- dunders ------------------------------------------------------------
 

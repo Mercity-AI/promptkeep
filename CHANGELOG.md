@@ -92,6 +92,13 @@ public APIs; each such change is called out below.
   every turn — identical for a conversation that never branched. `promptkeep
   convo` and the dashboard mark where a branch forks.
 
+- `Prompt.load(name, version=None, *, strict=, pre=, post=)` — one stored
+  version as a Prompt, pinned or the latest (highest-numbered): the prompt
+  registry, so the template in play can change without a deploy. Bound to
+  its version like a variant (no lookup, never a new version); checks and
+  strictness, which versions don't store, are given at load. Raises
+  `ValueError` for an unknown prompt or version.
+
 ### Changed
 
 - Internal restructuring, no public API change: `storage` is split into

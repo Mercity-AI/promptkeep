@@ -270,6 +270,24 @@ Each variant records its runs under its own version — so `promptkeep stats REV
 compares the two on real traffic — and loading one never creates a version. A version stores
 a template, not variables (those are run data), so `.format(...)` them in.
 
+### Loading a version: the prompt registry
+
+`Prompt.load()` takes one version — pinned, or the latest — so the template comes from the
+database instead of a literal in your code, and the prompt in play can change without a
+deploy:
+
+```python
+review = Prompt.load("REVIEW_SYSTEM", version=4)      # pinned
+review = Prompt.load("REVIEW_SYSTEM")                 # the newest version
+review = Prompt.load("REVIEW_SYSTEM", pre=[no_pii])   # checks aren't stored, so attach them here
+```
+
+Register a new version from anywhere that writes to the same file — a script, a notebook,
+another service — and the next `load()` picks it up. "Latest" is the highest version number:
+going back to an older template in code doesn't renumber it. It raises `ValueError` for an
+unknown prompt or version. It reads the database, so call it at startup or per request, not
+at import time.
+
 ## Feedback
 
 Checks label a run automatically; `feedback()` is the label a person (or a downstream

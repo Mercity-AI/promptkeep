@@ -1,7 +1,18 @@
-"""Prompt.variants(): every stored version of a prompt, back as Prompt objects."""
+"""Prompt.variants() and Prompt.load(): stored versions of a prompt, back as Prompt objects."""
+
+import pytest
 
 import promptkeep
-from promptkeep import Prompt, history, storage, wrap
+from promptkeep import (
+    MissingVariableError,
+    Prompt,
+    PromptBlocked,
+    Verdict,
+    check,
+    history,
+    storage,
+    wrap,
+)
 from tests.fakes import FakeClient
 
 
@@ -78,3 +89,68 @@ class TestVariants:
         (run,) = history.runs("VAR_SYS")
         assert run.version == 1
         assert run.rendered_text == "Review code."
+
+
+class TestLoad:
+    """Prompt.load(): one stored version — pinned, or the latest."""
+
+    def test_latest_by_default(self):
+        register("Review {what}.", "Review {what} briefly.")
+        loaded = Prompt.load("VAR_SYS")
+        assert (loaded.version, loaded.raw) == (2, "Review {what} briefly.")
+
+    def test_a_pinned_version(self):
+        register("Review {what}.", "Review {what} briefly.")
+        assert Prompt.load("VAR_SYS", version=1).raw == "Review {what}."
+
+    def test_latest_is_the_highest_number_not_the_last_used(self):
+        register("Review {what}.", "Review {what} briefly.", "Review {what}.")
+        assert Prompt.load("VAR_SYS").version == 2
+
+    def test_a_version_registered_elsewhere_is_picked_up_by_the_next_load(self):
+        register("Review {what}.")
+        assert Prompt.load("VAR_SYS").version == 1
+        register("Review {what}, then summarise.")  # another process, a notebook, ...
+        assert Prompt.load("VAR_SYS").raw == "Review {what}, then summarise."
+
+    def test_an_unknown_name_or_version_raises(self):
+        register("Review {what}.")
+        with pytest.raises(ValueError, match="no stored versions of prompt 'NOPE'"):
+            Prompt.load("NOPE")
+        with pytest.raises(ValueError, match="has no version 7"):
+            Prompt.load("VAR_SYS", version=7)
+
+    def test_disabled_tracking_says_so(self):
+        register("Review {what}.")
+        promptkeep.configure(enabled=False)
+        with pytest.raises(ValueError, match="tracking is disabled"):
+            Prompt.load("VAR_SYS")
+
+    def test_loading_and_using_never_creates_a_version(self, monkeypatch):
+        register("Review {what}.", "Review {what} briefly.")
+        loaded = Prompt.load("VAR_SYS", version=1)
+
+        def no_lookups(*args, **kwargs):
+            raise AssertionError("a loaded prompt must not re-register")
+
+        monkeypatch.setattr(storage, "register_version", no_lookups)
+        wrap(FakeClient()).chat.completions.create(
+            model="m", messages=[{"role": "system", "content": loaded.format(what="code")}]
+        )
+        (run,) = history.runs("VAR_SYS")
+        assert (run.version, run.rendered_text) == (1, "Review code.")
+
+    def test_checks_and_strictness_are_given_at_load(self):
+        register("Review {what}.")
+
+        @check.pre(name="never")
+        def never(ctx):
+            return Verdict.block("not today")
+
+        loaded = Prompt.load("VAR_SYS", strict=True, pre=[never])
+        with pytest.raises(MissingVariableError):
+            loaded.text
+        with pytest.raises(PromptBlocked):
+            wrap(FakeClient()).chat.completions.create(
+                model="m", messages=[{"role": "system", "content": loaded.format(what="x")}]
+            )
