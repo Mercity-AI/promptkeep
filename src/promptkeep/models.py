@@ -100,6 +100,14 @@ class RunRecord(BaseModel):
     off the response's usage block by the adapter (OpenRouter reports it on
     every response). It is never estimated from a price table: NULL means the
     provider didn't say, which is the honest answer for one that doesn't.
+
+    parent_run_key names the run this one continues from, when that isn't
+    simply the previous turn: a regeneration, a branch, a retry, a sub-agent
+    call. It is what makes a conversation a tree rather than a list. A key
+    rather than a foreign key, for the same reason run_key exists — the
+    parent's row may still be in the write queue when its child is recorded
+    — so nothing guarantees the parent is (still) on disk; readers treat a
+    missing parent as the root of a branch.
     """
 
     run_key = pw.TextField(unique=True)
@@ -127,9 +135,10 @@ class RunRecord(BaseModel):
     turn_index = pw.IntegerField(null=True)
     input_text = pw.TextField(null=True)
     original_input_text = pw.TextField(null=True)
+    parent_run_key = pw.TextField(null=True)
 
     class Meta:
-        """Table name and the two indexes reads depend on."""
+        """Table name and the indexes reads depend on."""
 
         table_name = "runs"
         indexes = (
@@ -137,6 +146,8 @@ class RunRecord(BaseModel):
             (("conversation", "turn_index"), False),
             # A chained call finds its predecessor by the provider's response id.
             (("response_id",), False),
+            # A run's children, for walking a conversation tree downwards.
+            (("parent_run_key",), False),
         )
 
 

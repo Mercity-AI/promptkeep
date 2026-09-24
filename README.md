@@ -149,6 +149,35 @@ already covered by version lineage, so nothing is duplicated as history grows. W
 prompt version drove each turn is recorded inline — so "which version was live at turn 6
 of this session?" is a lookup, not an investigation.
 
+### Branches: regenerations, retries, sub-agents
+
+A conversation is a tree, not just a list. By default each turn continues from the one
+before it; a turn that continues from somewhere else — a regenerated reply, a retry, an
+edit-and-resend, a sub-agent call — names its parent:
+
+```python
+first = client.chat.completions.create(...)              # turn 0
+client.chat.completions.create(...)                      # turn 1: the reply the user disliked
+client.chat.completions.create(..., promptkeep_parent=first)   # turn 2: regenerated from turn 0
+```
+
+`promptkeep_parent=` takes a response, its `response.promptkeep` handle, or a bare
+`run_key`, and is stripped before the request goes out. On the Responses API it is
+automatic: `previous_response_id` already names the parent, so pointing it at an older
+response *is* a branch. Reading a tree back:
+
+```python
+convo = history.conversation("user-42-session-9")
+convo.forks                      # {2: 0} — turn 2 branches from turn 0
+convo.leaves                     # the tip of every branch
+convo.path(run_key)              # the turns that led to one run, root first
+convo.replay()                   # the latest branch — what the model actually saw
+convo.replay(upto=run_key)       # any other branch
+```
+
+`replay()` follows one branch, so a reply that was regenerated away is not replayed as if
+the model had seen it. A conversation nobody branched reads exactly as before.
+
 ## Checks
 
 Run your own function before a call (a gate that can stop it) and after it (an

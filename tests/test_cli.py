@@ -166,6 +166,22 @@ class TestConvo:
         assert "[pre] no_pii: warn" in out
         assert "[feedback] meh (0.5)" in out
 
+    def test_a_branch_says_where_it_forks_from(self, isolated_db, capsys):
+        cid = storage.get_or_create_conversation("forked")
+        root = storage.record_run(provider="openai", conversation_id=cid, input_text="q0")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="q1")
+        storage.record_run(
+            provider="openai", conversation_id=cid, input_text="q1 again", parent_run_key=root
+        )
+        outside = storage.record_run(provider="openai")
+        storage.record_run(
+            provider="openai", conversation_id=cid, input_text="sub", parent_run_key=outside
+        )
+        out = run(capsys, "convo", "forked")
+        assert out.count("↳ branches from") == 2
+        assert "#2 · ok · —\n  ↳ branches from #0" in out
+        assert "↳ branches from another conversation" in out
+
     def test_unknown_conversation(self, seeded):
         with pytest.raises(SystemExit, match="no conversation found"):
             cli.main(["convo", "nope"])

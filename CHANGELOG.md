@@ -82,6 +82,16 @@ public APIs; each such change is called out below.
   `storage.record_run(cost_usd=...)` takes it for hand-recorded runs, and the
   dashboard shows it per run and per conversation.
 
+- Conversations are trees (schema v8: `runs.parent_run_key`). A call can
+  name the run it continues from — `promptkeep_parent=` takes a response, a
+  `RunHandle` or a `run_key` — for regenerations, retries and sub-agent calls;
+  a Responses API call's `previous_response_id` sets it automatically, so
+  continuing an older response is a branch. `RunInfo.parent_run_key`;
+  `ConversationInfo.forks`, `.leaves` and `.path(run_key)`;
+  `replay(upto=run_key)`. `replay()` now follows the latest branch rather than
+  every turn — identical for a conversation that never branched. `promptkeep
+  convo` and the dashboard mark where a branch forks.
+
 ### Changed
 
 - Internal restructuring, no public API change: `storage` is split into

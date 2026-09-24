@@ -17,10 +17,12 @@
   </div>
 </div>
 
+{% set forks = convo.forks %}
 {% for t in convo.turns %}
 <div class="turn">
   <div class="meta">
     <span class="turn-no">#{{ t.turn_index }}</span>
+    {% if t.turn_index in forks %}<span class="sep">·</span><span class="badge">↳ branches from {{ 'another conversation' if forks[t.turn_index] is none else '#' ~ forks[t.turn_index] }}</span>{% endif %}
     {% if t.prompt_name %}<span class="sep">·</span><a href="/prompts/{{ t.prompt_name }}">{{ t.prompt_name }}</a> <span class="badge">v{{ t.version }}</span>{% endif %}
     {% if t.model %}<span class="sep">·</span><span class="mono">{{ t.model }}</span>{% endif %}
     {% if t.total_tokens is not none %}<span class="sep">·</span><span class="num">{{ t.total_tokens }} tokens</span>{% endif %}

@@ -329,24 +329,71 @@ def reserve_turn_index(conversation_id: int) -> int:
 
 # --- chaining by response id ------------------------------------------------------
 
-# Which conversation (if any) each recently recorded response belongs to, per
-# (db, response_id). The database has the same answer — once the row lands.
-# In background mode a chained call can arrive while its predecessor is still
-# in the writer queue, so within a process this index is what is consulted
-# first. Bounded: a chain is followed up promptly or not at all, and anything
-# that has aged out is on disk by then.
-_response_index: OrderedDict[tuple[str, str], int | None] = OrderedDict()
+# The run that produced each recently recorded response, per (db, response_id):
+# (its conversation or None, its run key). The database has the same answer —
+# once the row lands. In background mode a chained call can arrive while its
+# predecessor is still in the writer queue, so within a process this index is
+# what is consulted first. Bounded: a chain is followed up promptly or not at
+# all, and anything that has aged out is on disk by then.
+_response_index: OrderedDict[tuple[str, str], tuple[int | None, str]] = OrderedDict()
 _RESPONSE_INDEX_SIZE = 4096
 
 
-def _index_response(response_id: str, conversation_id: int | None) -> None:
-    """Remember which conversation a recorded response belongs to (None: none yet)."""
+def _index_response(response_id: str, conversation_id: int | None, run_key: str) -> None:
+    """Remember which run (and conversation) produced a recorded response.
+
+    A call carrying several Prompts records several rows for one response. The
+    first is its primary run — the one its verdicts are filed under — and it
+    stays the run a successor points back to; later rows of the same call
+    leave the key alone.
+    """
     key = (str(get_settings().db_path), response_id)
     with _convo_lock:
-        _response_index[key] = conversation_id
+        known = _response_index.get(key)
+        if known is not None:
+            run_key = known[1]
+        _response_index[key] = (conversation_id, run_key)
         _response_index.move_to_end(key)
         while len(_response_index) > _RESPONSE_INDEX_SIZE:
             _response_index.popitem(last=False)
+
+
+def _lookup_response(response_id: str) -> tuple[int | None, str] | None:
+    """(conversation or None, run key) of the run that produced ``response_id``
+    — the in-process index first (its row may still be queued), then the
+    database (another process, or an earlier session). None when no recorded
+    run produced it. The caller has checked that there is a database."""
+    key = (str(get_settings().db_path), response_id)
+    with _convo_lock:
+        known = _response_index.get(key)
+    if known is not None:
+        return known
+    row = (
+        RunRecord.select(RunRecord.conversation, RunRecord.run_key)
+        .where(RunRecord.response_id == response_id)
+        .order_by(RunRecord.id)
+        .tuples()
+        .first()
+    )
+    return None if row is None else (row[0], row[1])
+
+
+def _recording() -> bool:
+    """Whether run rows are being written at all — tracking on, a write mode
+    other than "off", and a database to write to."""
+    settings = get_settings()
+    return settings.enabled and settings.write_mode != "off" and get_db() is not None
+
+
+def predecessor(previous_response_id: str) -> str | None:
+    """The key of the run that produced ``previous_response_id`` — the parent
+    of a call that continues it — or None when promptkeep never recorded that
+    response (or isn't recording now). Raises like any storage call; the
+    caller shields."""
+    if not _recording():
+        return None
+    found = _lookup_response(previous_response_id)
+    return None if found is None else found[1]
 
 
 def chain_conversation(previous_response_id: str) -> int | None:
@@ -365,27 +412,12 @@ def chain_conversation(previous_response_id: str) -> int | None:
     """
     # Nothing is being recorded, so there is nothing to group: don't leave a
     # conversation row behind for a run that will never be written.
-    settings = get_settings()
-    if not settings.enabled or settings.write_mode == "off" or get_db() is None:
+    if not _recording():
         return None
-
-    # The predecessor: the in-process index first (its row may still be
-    # queued), then the database (another process, or an earlier session).
-    key = (str(settings.db_path), previous_response_id)
-    with _convo_lock:
-        known = key in _response_index
-        conversation_id = _response_index.get(key)
-    if not known:
-        row = (
-            RunRecord.select(RunRecord.conversation)
-            .where(RunRecord.response_id == previous_response_id)
-            .order_by(RunRecord.id)
-            .tuples()
-            .first()
-        )
-        if row is None:
-            return None
-        conversation_id = row[0]
+    found = _lookup_response(previous_response_id)
+    if found is None:
+        return None
+    conversation_id, run_key = found
     if conversation_id is not None:
         return conversation_id
 
@@ -395,6 +427,7 @@ def chain_conversation(previous_response_id: str) -> int | None:
     conversation_id = get_or_create_conversation(f"response:{previous_response_id}")
     if conversation_id is None:
         return None
+    settings = get_settings()
     counter_key = (str(settings.db_path), conversation_id)
     with _convo_lock:
         if counter_key not in _turn_counters:
@@ -414,9 +447,9 @@ def chain_conversation(previous_response_id: str) -> int | None:
     }
     if settings.write_mode == "background":
         writer.submit(adoption)
-    elif settings.write_mode != "off":
+    else:
         _adopt_run(adoption)
-    _index_response(previous_response_id, conversation_id)
+    _index_response(previous_response_id, conversation_id, run_key)
     return conversation_id
 
 
@@ -445,6 +478,7 @@ def record_run(
     turn_index: int | None = None,
     input_text: str | None = None,
     original_input_text: str | None = None,
+    parent_run_key: str | None = None,
     checks: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Record one run row, honoring the configured write_mode. Never raises.
@@ -475,6 +509,9 @@ def record_run(
     reserve_turn_index() up front and pass it to every row from that call —
     otherwise each row would claim its own turn, splitting one exchange into
     several.
+
+    parent_run_key names the run this one branched from; leave it unset for a
+    run that simply follows the one before it.
     """
     try:
         settings = get_settings()
@@ -509,6 +546,7 @@ def record_run(
             "turn_index": turn_index,
             "input_text": input_text,
             "original_input_text": original_input_text,
+            "parent_run_key": parent_run_key,
         }
         if checks:
             row["_checks"] = list(checks)
@@ -528,7 +566,7 @@ def record_run(
 
         # A kept run is one a later call can chain onto by its response id.
         if response_id is not None:
-            _index_response(response_id, conversation_id)
+            _index_response(response_id, conversation_id, run_key)
 
         # Persist: hand off to the writer thread, or insert right here.
         if settings.write_mode == "background":

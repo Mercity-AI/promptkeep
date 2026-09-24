@@ -135,6 +135,13 @@ Load-bearing design decisions (breaking these breaks the library's contract):
   adoption is a queue item (`_kind: "adopt"`, behind its run, like late verdicts), and the
   turn counter is seeded past the adopted turn rather than read from `MAX(turn_index)`.
   Explicit conversations win; a predecessor promptkeep never recorded means no chaining.
+- **A conversation is a tree; NULL `parent_run_key` means "continues the turn before".**
+  A run names its parent by key (`promptkeep_parent=`, or automatically from the chain
+  lookup above — the index maps a response id to its *primary* run's key), never by row id,
+  because the parent may still be queued. `history.ConversationInfo` derives everything from
+  that rule (`_predecessors`): `replay()` follows the branch ending at the latest turn, so a
+  linear conversation reads exactly as it always did. A parent that isn't in the
+  conversation (or was pruned) starts a branch; readers never assume it exists.
 - **Feedback is a row in `checks`, not a table of its own.** `tracking.feedback(run_key, ...)`
   writes `phase="feedback"` (`name` = the label, `message` = the comment, `status="ok"`)
   through `storage.record_check`, so it inherits the late-verdict machinery: queue ordering

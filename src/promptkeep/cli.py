@@ -179,10 +179,14 @@ def _convo(args: argparse.Namespace) -> None:
         f"{history.format_cost(convo.total_cost)} · {convo.duration:.1f}s"
         + (f" · {used}" if used else "")
     )
+    forks = convo.forks
     for turn in convo.turns:
         # One block per row: who drove it, what went in, what came out.
         lineage = f" · {turn.prompt_name} v{turn.version}" if turn.prompt_name else ""
         print(f"\n#{turn.turn_index} · {turn.status}{lineage} · {turn.model or '—'}")
+        if turn.turn_index in forks:
+            origin = forks[turn.turn_index]
+            print(f"  ↳ branches from {'another conversation' if origin is None else f'#{origin}'}")
         if turn.original_input_text is not None:
             print(f"  user (as received): {turn.original_input_text}")
         if turn.input_text is not None:

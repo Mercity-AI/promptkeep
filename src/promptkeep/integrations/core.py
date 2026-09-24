@@ -7,7 +7,8 @@ object holding everything known about the call in flight — and drives it:
 1. promptkeep's own kwargs come off and the adapter parses the request
    (Prompts substituted by plain strings, the current turn picked out),
 2. the conversation is resolved — the explicit one, else the one the request
-   itself points back at (``conversation_hint``) — and the turn reserved,
+   itself points back at (``conversation_hint``) — the turn reserved, and the
+   run it branches from (if any) named,
 3. pre-checks run and may block or rewrite,
 4. the real method is called,
 5. post-checks run, one run row per tracked prompt (or one bare turn) is
@@ -54,7 +55,12 @@ from .base import ProviderAdapter, Request, ResponseFields, Target
 logger = logging.getLogger("promptkeep")
 
 # The kwargs promptkeep understands and strips before the request goes out.
-_PROMPTKEEP_KWARGS = ("promptkeep_conversation", "promptkeep_pre", "promptkeep_post")
+_PROMPTKEEP_KWARGS = (
+    "promptkeep_conversation",
+    "promptkeep_parent",
+    "promptkeep_pre",
+    "promptkeep_post",
+)
 
 
 # --- instrumentation -----------------------------------------------------------------
@@ -228,6 +234,7 @@ class _Call:
         """Parse the call and reserve everything it needs. No provider I/O."""
         # promptkeep's kwargs never reach the provider; take them off first.
         external_id, title, metadata = _resolve_conversation(kwargs)
+        explicit_parent = _parent_key(kwargs.pop("promptkeep_parent", None))
         per_call_pre, per_call_post = _pop_check_kwargs(kwargs)
 
         # The adapter turns what's left into a Request (Prompts substituted).
@@ -237,10 +244,14 @@ class _Call:
         # The conversation slot: one turn number per physical API call. With
         # no explicit conversation, a request that names its predecessor
         # follows that run's.
-        hint = None if external_id is not None else _conversation_hint(adapter, self.request)
+        hint = _conversation_hint(adapter, self.request)
         self.conversation_id, self.turn_index = _prepare_conversation(
             external_id, title, metadata, hint
         )
+
+        # The run this call branches from: the one the caller named, else the
+        # one that produced the response the request continues.
+        self.parent_run_key = explicit_parent or _predecessor(hint)
 
         # Checks across scopes.
         self.pre_checks, self.post_checks = _collect_checks(
@@ -414,6 +425,7 @@ class _Call:
             turn_index=self.turn_index,
             input_text=self.request.input_text,
             original_input_text=self.original_input_text,
+            parent_run_key=self.parent_run_key,
             **_row_fields(self.request, fields),
         )
         tracked = self.request.tracked
@@ -446,6 +458,32 @@ def _resolve_conversation(kwargs: dict[str, Any]) -> tuple[str | None, str | Non
     if active is not None:
         return active.external_id, active.title, active.metadata
     return None, None, {}
+
+
+def _parent_key(parent: Any) -> str | None:
+    """The run key a ``promptkeep_parent=`` value names: a run key itself, a
+    RunHandle, or a response carrying one (``response.promptkeep``). Anything
+    else is logged and ignored — a malformed parent costs the branch link,
+    never the call."""
+    if parent is None or isinstance(parent, str):
+        return parent
+    handle = getattr(parent, "promptkeep", parent)
+    if hasattr(handle, "run_key") and (handle.run_key is None or isinstance(handle.run_key, str)):
+        return handle.run_key
+    logger.warning("promptkeep: ignoring promptkeep_parent=%r — not a run key or handle", parent)
+    return None
+
+
+def _predecessor(hint: str | None) -> str | None:
+    """The key of the run that produced the response a request continues —
+    shielded, since it runs on the request path."""
+    if hint is None:
+        return None
+    try:
+        return storage.predecessor(hint)
+    except Exception:
+        logger.warning("promptkeep: failed to look up the run behind %r", hint, exc_info=True)
+        return None
 
 
 def _conversation_hint(adapter: ProviderAdapter, request: Request) -> str | None:

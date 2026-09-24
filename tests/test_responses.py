@@ -393,6 +393,51 @@ class TestChaining:
         (run,) = history.runs("RESP_SYS")
         assert run.conversation_id is None
 
+    def test_each_link_names_its_predecessor_as_parent(self):
+        self.chain(wrap(FakeResponsesClient(responses=replies("a1", "a2", "a3"))))
+        turns = history.conversation("response:resp_1").turns
+        assert [t.parent_run_key for t in turns] == [None, turns[0].run_key, turns[1].run_key]
+        assert history.conversation("response:resp_1").forks == {}
+
+    def test_continuing_an_older_response_is_a_branch(self):
+        """previous_response_id is how the Responses API forks: pointing back
+        past the latest reply starts a new branch from that one."""
+        client = wrap(FakeResponsesClient(responses=replies("a1", "a2", "a3")))
+        self.chain(client, count=2)
+        client.responses.create(
+            model="m", instructions=make_prompt(), input="question 3", previous_response_id="resp_1"
+        )
+        convo = history.conversation("response:resp_1")
+        assert convo.forks == {2: 0}
+        assert [leaf.input_text for leaf in convo.leaves] == ["question 2", "question 3"]
+        users = [m["content"] for m in convo.replay() if m["role"] == "user"]
+        assert users == ["question 1", "question 3"]
+
+    def test_the_parent_is_found_while_the_predecessor_is_queued(self):
+        configure(write_mode="background")
+        self.chain(wrap(FakeResponsesClient(responses=replies("a1", "a2"))), count=2)
+        assert promptkeep.flush(timeout=5)
+        first, second = history.conversation("response:resp_1").turns
+        assert second.parent_run_key == first.run_key
+
+    def test_a_call_with_two_prompts_is_continued_from_its_primary_run(self):
+        client = wrap(FakeResponsesClient(responses=replies("a1", "a2")))
+        first = client.responses.create(
+            model="m", instructions=make_prompt("RESP_A"), input=make_prompt("RESP_B")
+        )
+        client.responses.create(model="m", input="question 2", previous_response_id=first.id)
+        turns = history.conversation("response:resp_1").turns
+        assert turns[2].parent_run_key == first.promptkeep.run_key == turns[0].run_key
+
+    def test_an_explicit_parent_wins_over_the_chain(self):
+        client = wrap(FakeResponsesClient(responses=replies("a1", "a2", "a3")))
+        self.chain(client, count=2)
+        root = history.conversation("response:resp_1").turns[0].run_key
+        client.responses.create(
+            model="m", input="question 3", previous_response_id="resp_2", promptkeep_parent=root
+        )
+        assert history.conversation("response:resp_1").forks == {2: 0}
+
     def test_a_failing_hint_costs_the_grouping_not_the_call(self, caplog):
         class BrokenHint(OpenAIResponsesAdapter):
             def conversation_hint(self, request):

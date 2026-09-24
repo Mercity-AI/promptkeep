@@ -251,7 +251,8 @@ class TestSchemaMigration:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "checks" in tables
         run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
-        assert {"run_key", "original_input_text"} <= run_cols
+        assert {"run_key", "original_input_text", "cost_usd", "parent_run_key"} <= run_cols
+        assert legacy.parent_run_key is None  # every old run followed the turn before it
         check_cols = {r[1] for r in conn.execute("PRAGMA table_info(checks)")}
         assert "rewritten" in check_cols
         conn.close()

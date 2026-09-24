@@ -48,6 +48,8 @@ class RunInfo:
     when a pre-check rewrote the turn: input_text is then what was sent, and
     this is what the caller originally passed. cost_usd is the cost the
     provider reported for the call, None when it reported none.
+    parent_run_key names the run this one branched from (a regeneration, a
+    retry, a chained Responses call); None means it followed the turn before.
     """
 
     id: int
@@ -73,6 +75,7 @@ class RunInfo:
     input_text: str | None = None
     original_input_text: str | None = None
     cost_usd: float | None = None
+    parent_run_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,13 @@ class ConversationInfo:
     ``turns`` holds one RunInfo per run row. A single API call that carried
     more than one tracked Prompt produced several rows sharing a turn_index;
     the derived views below treat those as one turn.
+
+    A conversation is a tree. Each turn continues from one earlier turn: the
+    run named by its ``parent_run_key`` when it has one (a regeneration, a
+    branch, a chained Responses call), otherwise the turn just before it. A
+    session nobody branched is a single line, and every view below reads it
+    exactly as before; once it branches, ``leaves`` are the tips of its
+    branches and ``path()`` / ``replay(upto=...)`` follow one of them.
     """
 
     external_id: str
@@ -138,9 +148,57 @@ class ConversationInfo:
             return 0.0
         return max(0.0, (max(ends) - min(starts)).total_seconds())
 
-    def replay(self, system: Any = None) -> list[dict[str, Any]]:
+    @property
+    def leaves(self) -> list[RunInfo]:
+        """The tip of every branch — each turn no later turn continues from —
+        oldest first. One for a session that never branched: its last turn."""
+        continued = set(self._predecessors().values())
+        return [rows[0] for index, rows in self._turn_rows().items() if index not in continued]
+
+    @property
+    def forks(self) -> dict[int | None, int | None]:
+        """Every turn that doesn't continue the turn just before it, mapped to
+        the turn it does continue — None when that is a run outside this
+        conversation. Empty for a session that never branched."""
+        predecessors = self._predecessors()
+        found: dict[int | None, int | None] = {}
+        previous: int | None = None
+        for index in self._turn_rows():
+            if predecessors[index] != previous:
+                found[index] = predecessors[index]
+            previous = index
+        return found
+
+    def path(self, run_key: str) -> list[RunInfo]:
+        """The branch that led to a run: every turn from the start of the
+        conversation to the one holding ``run_key``, following each turn back
+        to the one it continued from. Rows of the same API call stay together.
+        A branch whose parent lives outside this conversation (or was never
+        persisted) starts at that turn. Raises ValueError for a run that isn't
+        in this conversation."""
+        turns = self._turn_rows()
+        index = next((t.turn_index for t in self.turns if t.run_key == run_key), None)
+        if index is None:
+            raise ValueError(f"run {run_key!r} is not in conversation {self.external_id!r}")
+
+        # Walk back to the root; the visited set guards against a cycle that
+        # only corrupt parent keys could make.
+        predecessors = self._predecessors()
+        chain: list[int | None] = []
+        while index is not None and index not in chain:
+            chain.append(index)
+            index = predecessors.get(index)
+        return [row for index in reversed(chain) for row in turns[index]]
+
+    def replay(self, system: Any = None, upto: str | None = None) -> list[dict[str, Any]]:
         """Rebuild the conversation as a chat ``messages`` list, ready to send
         back to a provider — the raw material of every eval and re-run.
+
+        A replay follows one branch: the one ending at ``upto`` (a run key),
+        or by default the one ending at the latest turn — for a session that
+        never branched, simply every turn. Turns on an abandoned branch (a
+        reply that was regenerated) are not part of the history the next
+        turn saw, so they are left out.
 
         Completed turns (status "ok") are walked in order. Each contributes the
         system prompt that was in play (the tracked Prompt's rendered text —
@@ -160,7 +218,10 @@ class ConversationInfo:
         if system is not None:
             messages.append({"role": "system", "content": system})
         previous_prompts: set = set()
-        for _index, rows in self._completed_turns():
+        if upto is None and self.turns:
+            upto = self.turns[-1].run_key
+        branch = self.path(upto) if upto is not None else []
+        for rows in _completed_turns(branch):
             head = rows[0]
             # A Prompt that *was* the user turn is already the input; it is
             # not a system prompt, so don't emit it twice.
@@ -184,14 +245,33 @@ class ConversationInfo:
         for _index, rows in groupby(self.turns, key=lambda t: t.turn_index):
             yield next(rows)
 
-    def _completed_turns(self) -> Iterator[tuple[int | None, list[RunInfo]]]:
-        """Turns that completed, as (turn_index, rows) — rows sharing a
-        turn_index came from the same API call. Relies on ``turns`` being
+    def _turn_rows(self) -> dict[int | None, list[RunInfo]]:
+        """The rows of each turn, by turn_index, in turn order — rows sharing
+        a turn_index came from the same API call. Relies on ``turns`` being
         ordered by turn_index, which the storage read guarantees."""
-        for index, group in groupby(self.turns, key=lambda t: t.turn_index):
-            rows = [r for r in group if r.status == "ok"]
-            if rows:
-                yield index, rows
+        return {index: list(rows) for index, rows in groupby(self.turns, lambda t: t.turn_index)}
+
+    def _predecessors(self) -> dict[int | None, int | None]:
+        """Each turn's predecessor, by turn_index: the turn holding its
+        parent run if it names one, else the turn before it. None for a turn
+        that starts a branch — the first turn, or one whose parent isn't here."""
+        turn_of = {t.run_key: t.turn_index for t in self.turns}
+        found: dict[int | None, int | None] = {}
+        previous: int | None = None
+        for index, rows in self._turn_rows().items():
+            parent = rows[0].parent_run_key
+            found[index] = previous if parent is None else turn_of.get(parent)
+            previous = index
+        return found
+
+
+def _completed_turns(rows: list[RunInfo]) -> Iterator[list[RunInfo]]:
+    """The turns among ``rows`` that completed, each as its rows (grouped by
+    turn_index — rows of one API call), in order."""
+    for _index, group in groupby(rows, key=lambda t: t.turn_index):
+        completed = [r for r in group if r.status == "ok"]
+        if completed:
+            yield completed
 
 
 @dataclass(frozen=True)
@@ -363,6 +443,7 @@ _RUN_COLUMNS = (
     RunRecord.input_text,
     RunRecord.original_input_text,
     RunRecord.cost_usd,
+    RunRecord.parent_run_key,
 )
 # Added only where the caller reads across conversations and needs to know
 # which one each run belongs to (a conversation's own turns already know).

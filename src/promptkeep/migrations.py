@@ -17,7 +17,7 @@ import playhouse.migrate as pm
 from .models import MODELS, CheckRecord, ConversationRecord, PromptVersionRecord, new_run_key
 from .rendering import template_hash
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def migrate(database: pw.SqliteDatabase) -> None:
@@ -129,6 +129,18 @@ def migrate(database: pw.SqliteDatabase) -> None:
             migrator = pm.SqliteMigrator(database)
             pm.migrate(migrator.add_index("runs", ("response_id",), False))
             database.execute_sql("PRAGMA user_version = 7")
+
+    # v8: runs.parent_run_key — the run a turn branched from, which makes a
+    # conversation a tree. Old rows stay NULL: every one of them followed the
+    # turn before it, which is exactly what NULL means.
+    if user_version < 8:
+        with database.atomic():
+            migrator = pm.SqliteMigrator(database)
+            pm.migrate(
+                migrator.add_column("runs", "parent_run_key", pw.TextField(null=True)),
+                migrator.add_index("runs", ("parent_run_key",), False),
+            )
+            database.execute_sql("PRAGMA user_version = 8")
 
 
 def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:

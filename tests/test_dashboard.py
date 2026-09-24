@@ -166,6 +166,15 @@ class TestConversationsRoutes:
         assert "$0.0042" in client.get("/runs").text
         assert "$0.0042" in client.get("/conversations/sess-cost").text
 
+    def test_conversation_detail_marks_a_branch(self):
+        cid = storage.get_or_create_conversation("sess-fork")
+        root = storage.record_run(provider="openai", conversation_id=cid, input_text="q0")
+        storage.record_run(provider="openai", conversation_id=cid, input_text="q1")
+        storage.record_run(
+            provider="openai", conversation_id=cid, input_text="q1b", parent_run_key=root
+        )
+        assert "branches from #0" in _client().get("/conversations/sess-fork").text
+
     def test_conversation_detail_unknown_is_404(self):
         r = _client().get("/conversations/nope")
         assert r.status_code == 404

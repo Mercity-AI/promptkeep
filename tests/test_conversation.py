@@ -2,6 +2,7 @@
 and the history.conversation() read side."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -390,3 +391,135 @@ class TestConversationReadModel:
     def test_list_conversations_version_without_prompt_is_an_error(self):
         with pytest.raises(ValueError, match="requires prompt="):
             history.list_conversations(version=1)
+
+
+class TestBranching:
+    """Conversations as trees: parent_run_key, and the views that follow it."""
+
+    def _turn(self, cid, text, parent=None, status="ok"):
+        """Record one question/answer turn, optionally branching from ``parent``."""
+        return storage.record_run(
+            provider="openai",
+            conversation_id=cid,
+            input_text=text,
+            output_text=f"re: {text}",
+            status=status,
+            parent_run_key=parent,
+        )
+
+    def _regenerated(self):
+        """q0 -> q1, then q1 regenerated as q2 (both continue q0), then q3
+        continuing the regeneration. Returns the run keys in turn order."""
+        cid = storage.get_or_create_conversation("branchy")
+        k0 = self._turn(cid, "q0")
+        k1 = self._turn(cid, "q1")
+        k2 = self._turn(cid, "q2", parent=k0)
+        k3 = self._turn(cid, "q3")
+        return [k0, k1, k2, k3]
+
+    def test_a_linear_conversation_has_no_forks_and_one_leaf(self):
+        cid = storage.get_or_create_conversation("straight")
+        keys = [self._turn(cid, f"q{n}") for n in range(3)]
+        convo = history.conversation("straight")
+        assert convo.forks == {}
+        assert [leaf.run_key for leaf in convo.leaves] == [keys[-1]]
+        assert [t.run_key for t in convo.path(keys[-1])] == keys
+
+    def test_the_parent_is_recorded_and_read_back(self):
+        k0, _k1, k2, k3 = self._regenerated()
+        turns = history.conversation("branchy").turns
+        assert [t.parent_run_key for t in turns] == [None, None, k0, None]
+
+    def test_forks_and_leaves_describe_the_tree(self):
+        _k0, k1, _k2, k3 = self._regenerated()
+        convo = history.conversation("branchy")
+        assert convo.forks == {2: 0}
+        assert [leaf.run_key for leaf in convo.leaves] == [k1, k3]
+
+    def test_path_follows_parents_back_to_the_root(self):
+        k0, k1, k2, k3 = self._regenerated()
+        convo = history.conversation("branchy")
+        assert [t.run_key for t in convo.path(k3)] == [k0, k2, k3]
+        assert [t.run_key for t in convo.path(k1)] == [k0, k1]
+
+    def test_replay_follows_the_latest_branch_by_default(self):
+        self._regenerated()
+        messages = history.conversation("branchy").replay()
+        assert [m["content"] for m in messages if m["role"] == "user"] == ["q0", "q2", "q3"]
+
+    def test_replay_upto_follows_the_chosen_branch(self):
+        _k0, k1, _k2, _k3 = self._regenerated()
+        messages = history.conversation("branchy").replay(upto=k1)
+        assert [m["content"] for m in messages] == ["q0", "re: q0", "q1", "re: q1"]
+
+    def test_a_failed_turn_stays_on_its_path_but_out_of_the_replay(self):
+        cid = storage.get_or_create_conversation("with-error")
+        k0 = self._turn(cid, "q0")
+        k1 = self._turn(cid, "q1", status="error")
+        k2 = self._turn(cid, "q2")
+        convo = history.conversation("with-error")
+        assert [t.run_key for t in convo.path(k2)] == [k0, k1, k2]
+        assert [m["content"] for m in convo.replay() if m["role"] == "user"] == ["q0", "q2"]
+
+    def test_a_parent_outside_the_conversation_starts_a_branch(self):
+        outside = storage.record_run(provider="openai", output_text="planner said so")
+        cid = storage.get_or_create_conversation("sub-agent")
+        k0 = self._turn(cid, "q0")
+        k1 = self._turn(cid, "q1", parent=outside)
+        convo = history.conversation("sub-agent")
+        assert convo.forks == {1: None}
+        assert [t.run_key for t in convo.path(k1)] == [k1]
+        assert [leaf.run_key for leaf in convo.leaves] == [k0, k1]
+
+    def test_path_of_a_run_elsewhere_is_an_error(self):
+        self._regenerated()
+        with pytest.raises(ValueError, match="not in conversation"):
+            history.conversation("branchy").path("no-such-run")
+
+    def test_rows_of_one_call_stay_together_on_a_path(self):
+        cid = storage.get_or_create_conversation("two-prompts")
+        k0 = self._turn(cid, "q0")
+        turn = storage.reserve_turn_index(cid)
+        a = storage.record_run(provider="openai", conversation_id=cid, turn_index=turn)
+        b = storage.record_run(provider="openai", conversation_id=cid, turn_index=turn)
+        assert [t.run_key for t in history.conversation("two-prompts").path(b)] == [k0, a, b]
+
+    def test_a_wrapped_call_branches_from_a_response_a_handle_or_a_key(self):
+        client = wrap(FakeClient(response=make_response(content="reply")))
+        ask = {"model": "gpt-test", "messages": [{"role": "user", "content": "q"}]}
+        with promptkeep.conversation("regen"):
+            # The fake hands back one response object for every call, so keep
+            # the handle — later calls re-attach theirs to that same object.
+            handle = client.chat.completions.create(**ask).promptkeep
+            root = handle.run_key
+            client.chat.completions.create(**ask)
+            client.chat.completions.create(
+                **ask, promptkeep_parent=SimpleNamespace(promptkeep=handle)
+            )
+            client.chat.completions.create(**ask, promptkeep_parent=handle)
+            client.chat.completions.create(**ask, promptkeep_parent=root)
+        assert all("promptkeep_parent" not in call for call in client.calls)
+        turns = history.conversation("regen").turns
+        assert [t.parent_run_key for t in turns] == [None, None, root, root, root]
+        assert history.conversation("regen").forks == {2: 0, 3: 0, 4: 0}
+
+    def test_a_malformed_parent_costs_the_link_not_the_call(self, caplog):
+        client = wrap(FakeClient(response=make_response(content="reply")))
+        response = client.chat.completions.create(
+            model="gpt-test",
+            messages=[{"role": "user", "content": "q"}],
+            promptkeep_conversation="odd-parent",
+            promptkeep_parent=42,
+        )
+        assert response.choices[0].message.content == "reply"
+        (turn,) = history.conversation("odd-parent").turns
+        assert turn.parent_run_key is None
+        assert "promptkeep_parent" in caplog.text
+
+    def test_the_untracked_passthrough_strips_the_parent_kwarg(self):
+        client = wrap(FakeClient())
+        with promptkeep.suppress():
+            client.chat.completions.create(
+                model="gpt-test", messages=[{"role": "user", "content": "q"}], promptkeep_parent="k"
+            )
+        assert "promptkeep_parent" not in client.calls[0]
