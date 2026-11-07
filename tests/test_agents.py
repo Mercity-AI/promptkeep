@@ -5,13 +5,27 @@ provider. Each test starts from the autouse fresh database.
 """
 
 import asyncio
+import logging
 import os
+import time
+from datetime import datetime
 
 import pytest
 
 import promptkeep
 from promptkeep import Prompt, PromptBlocked, Verdict, agents, check, controls, history, wrap
-from tests.fakes import FakeAsyncClient, FakeClient, make_chunk, make_response, make_usage
+from tests.fakes import (
+    FakeAsyncClient,
+    FakeClient,
+    FakeResponsesClient,
+    make_chunk,
+    make_response,
+    make_responses_response,
+    make_tool_call,
+    make_tool_call_delta,
+    make_tool_call_item,
+    make_usage,
+)
 
 
 def _client(**kwargs):
@@ -62,9 +76,27 @@ class TestScopeLifecycle:
             last.output("first")
             last.output("last")
 
-        assert history.trace(omitted.trace_key).root.output is history._UNSET
-        assert history.trace(null.trace_key).root.output is None
+        omitted_root = history.trace(omitted.trace_key).root
+        assert omitted_root.output is history._UNSET
+        assert omitted_root.has_output is False
+        null_root = history.trace(null.trace_key).root
+        assert null_root.output is None
+        assert null_root.has_output is True
         assert history.trace(last.trace_key).root.output == "last"
+
+    def test_fail_marks_a_scope_error_without_raising(self):
+        with promptkeep.agent("tool-failure") as task:
+            with promptkeep.tool("flaky") as tool:
+                tool.output("partial")
+                tool.fail("exit code 1")
+
+        trace = history.trace(task.trace_key)
+        assert trace.status == "ok"
+        assert trace.error_count == 1
+        (tool_span,) = _spans(task.trace_key, "tool")
+        assert tool_span.status == "error"
+        assert tool_span.error == "exit code 1"
+        assert tool_span.output == "partial"
 
     def test_input_and_output_are_snapshotted(self):
         source = {"question": "before"}
@@ -94,10 +126,13 @@ class TestScopeLifecycle:
             pass
         assert history.trace(after.trace_key).root.parent_span_key is None
 
-    def test_tool_outside_agent_is_a_usage_error(self):
-        with pytest.raises(RuntimeError, match="inside an agent"):
-            with promptkeep.tool("orphan"):
-                pass
+    def test_tool_outside_agent_warns_and_records_nothing(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="promptkeep"):
+            with promptkeep.tool("orphan") as orphan:
+                orphan.output("ignored")
+        assert orphan.trace_key is None
+        assert history.list_traces() == []
+        assert "outside an agent" in caplog.text
 
     def test_reentry_and_closed_output_are_usage_errors(self):
         scope = promptkeep.agent("once")
@@ -110,6 +145,8 @@ class TestScopeLifecycle:
                 pass
         with pytest.raises(RuntimeError, match="open"):
             scope.output("late")
+        with pytest.raises(RuntimeError, match="open"):
+            scope.fail("late")
 
     @pytest.mark.parametrize("name", ["", "   ", None, 1])
     def test_names_must_be_non_empty_strings(self, name):
@@ -223,11 +260,37 @@ class TestModelRecording:
         (llm,) = _spans(task.trace_key, "llm")
         assert response.promptkeep.span_key == llm.span_key
         assert llm.parent_span_key == task.span_key
+        assert llm.name == "gpt-test"  # the model the provider reported
         assert len(llm.runs) == 1
         assert llm.runs[0].prompt_name is None
         assert llm.runs[0].output_text == "hello!"
         assert trace.total_tokens == 15
         assert trace.model_calls == 1
+
+    def test_model_span_interval_covers_the_provider_call_only(self):
+        @check.pre(name="slow")
+        def slow(ctx):
+            time.sleep(0.05)
+            return Verdict.ok()
+
+        prompt = Prompt("system", name="SLOW_CHECK", pre=[slow])
+        client = _client()
+        with promptkeep.agent("timing") as task:
+            client.chat.completions.create(
+                model="m",
+                messages=[
+                    {"role": "developer", "content": prompt},
+                    {"role": "user", "content": "hi"},
+                ],
+            )
+
+        (llm,) = _spans(task.trace_key, "llm")
+        assert llm.ended_at is not None and llm.duration_ms is not None
+        start = datetime.fromisoformat(llm.started_at)
+        end = datetime.fromisoformat(llm.ended_at)
+        measured = (end - start).total_seconds() * 1000
+        assert abs(measured - llm.duration_ms) <= 1
+        assert llm.duration_ms < 50  # the pre-check's sleep is not in the span
 
     def test_a_trace_inside_a_conversation_keeps_one_existing_turn(self):
         client = _client()
@@ -533,6 +596,73 @@ class TestModelRecording:
         assert trace.status == "ok"
 
 
+class TestToolCallLinking:
+    def test_a_tool_call_id_becomes_a_child_of_its_model_span(self):
+        response = make_response(content=None, tool_calls=[make_tool_call(call_id="call_1")])
+        client = _client(response=response)
+        with promptkeep.agent("linked") as task:
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "hi"}])
+            with promptkeep.tool("search", call_id="call_1") as search:
+                search.output("found")
+
+        (llm,) = _spans(task.trace_key, "llm")
+        (tool_span,) = _spans(task.trace_key, "tool")
+        assert tool_span.parent_span_key == llm.span_key
+
+    def test_a_streamed_tool_call_links_too(self):
+        chunks = [make_chunk(tool_calls=[make_tool_call_delta(call_id="call_s")])]
+        client = _client(stream_chunks=chunks)
+        with promptkeep.agent("stream-linked") as task:
+            stream = client.chat.completions.create(
+                model="m", stream=True, messages=[{"role": "user", "content": "hi"}]
+            )
+            list(stream)
+            with promptkeep.tool("search", call_id="call_s"):
+                pass
+
+        (llm,) = _spans(task.trace_key, "llm")
+        (tool_span,) = _spans(task.trace_key, "tool")
+        assert tool_span.parent_span_key == llm.span_key
+
+    def test_a_responses_function_call_links_too(self):
+        response = make_responses_response(
+            text=None, tool_calls=[make_tool_call_item(call_id="call_r")]
+        )
+        client = wrap(FakeResponsesClient(responses=[response]))
+        with promptkeep.agent("responses-linked") as task:
+            client.responses.create(model="m", input="hi")
+            with promptkeep.tool("search", call_id="call_r"):
+                pass
+
+        (llm,) = _spans(task.trace_key, "llm")
+        (tool_span,) = _spans(task.trace_key, "tool")
+        assert tool_span.parent_span_key == llm.span_key
+
+    def test_an_unknown_call_id_keeps_the_ambient_parent(self):
+        with promptkeep.agent("unlinked") as task:
+            with promptkeep.tool("search", call_id="call_missing"):
+                pass
+
+        (tool_span,) = _spans(task.trace_key, "tool")
+        assert tool_span.parent_span_key == task.span_key
+
+    def test_a_call_id_from_another_trace_keeps_the_ambient_parent(self):
+        response = make_response(content=None, tool_calls=[make_tool_call(call_id="call_x")])
+        client = _client(response=response)
+        with promptkeep.agent("first"):
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "hi"}])
+        with promptkeep.agent("second") as second:
+            with promptkeep.tool("search", call_id="call_x"):
+                pass
+
+        (tool_span,) = _spans(second.trace_key, "tool")
+        assert tool_span.parent_span_key == second.span_key
+
+    def test_a_non_string_call_id_is_a_usage_error(self):
+        with pytest.raises(ValueError, match="call_id"):
+            promptkeep.tool("search", call_id=1)
+
+
 class TestSamplingAndPayloads:
     def test_sampled_out_success_is_not_stored(self):
         promptkeep.configure(sample_rate=0.0)
@@ -599,7 +729,7 @@ class TestSamplingAndPayloads:
         assert tool_span.status == "error"
         assert tool_span.output == "partial"
 
-    def test_redaction_covers_name_input_output_and_error(self):
+    def test_redaction_covers_payloads_and_errors_but_not_names(self):
         promptkeep.configure(redact=lambda text: text.replace("secret", "[X]"))
         with pytest.raises(RuntimeError, match="secret"):
             with promptkeep.agent("secret agent", input={"key": "secret"}) as task:
@@ -608,11 +738,11 @@ class TestSamplingAndPayloads:
                     raise RuntimeError("secret error")
 
         trace = history.trace(task.trace_key)
-        assert trace.root.name == "[X] agent"
+        assert trace.root.name == "secret agent"
         assert trace.root.input == {"key": "[X]"}
         assert "[X] error" in trace.root.error
         (tool_span,) = _spans(task.trace_key, "tool")
-        assert tool_span.name == "[X] tool"
+        assert tool_span.name == "secret tool"
         assert tool_span.input == "[X] in"
         assert tool_span.output == "[X] out"
 
@@ -648,17 +778,38 @@ class TestSamplingAndPayloads:
             pass
         root = history.trace(task.trace_key).root
         assert root.input is history._UNSET
+        assert root.has_input is False
         assert root.status == "ok"
 
+    def test_a_span_input_is_queued_once(self, monkeypatch):
+        from promptkeep import writer
 
-def test_inherited_scope_is_ignored_after_process_change(monkeypatch):
-    """An inherited frame cannot attach child work to the parent's trace."""
+        promptkeep.configure(write_mode="background")
+        seen = []
+        monkeypatch.setattr(writer, "submit", lambda item: seen.append(item))
+        with promptkeep.agent("once", input={"big": "x" * 100}) as task:
+            task.output("done")
+
+        span_items = [item for item in seen if item.get("_kind") == "span"]
+        carried = [item for item in span_items if item.get("input_json") is not None]
+        assert len(carried) == 1
+        assert carried[0]["status"] == "running"
+
+
+def test_inherited_scope_is_ignored_after_process_change(monkeypatch, caplog):
+    """An inherited frame cannot attach child work to the parent's trace, and
+    a tool entered under the changed identity warns instead of raising."""
     with promptkeep.agent("parent") as parent:
         pid = os.getpid()
         with monkeypatch.context() as patch:
             patch.setattr(agents.os, "getpid", lambda: pid + 1)
             assert agents.current() is None
-            with pytest.raises(RuntimeError, match="inside an agent"):
-                with promptkeep.tool("child"):
-                    pass
+            with caplog.at_level(logging.WARNING, logger="promptkeep"):
+                with promptkeep.tool("child") as child:
+                    child.output("ignored")
+            assert child.trace_key is None
+            assert "outside an agent" in caplog.text
         assert agents.current().span_key == parent.span_key
+
+    # Only the parent's own rows were written: the child never attached.
+    assert [span.kind for span in history.trace(parent.trace_key).spans] == ["agent"]

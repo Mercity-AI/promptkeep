@@ -31,7 +31,7 @@ def test_all_names_resolve():
 # breaking change that goes through a deprecation first.
 PUBLIC_TOP_LEVEL = {
     "Prompt", "RenderedText", "prompt", "wrap", "configure", "get_settings", "history",
-    "conversation", "agent", "tool", "dataset", "Dataset", "flush", "feedback", "check",
+    "conversation", "agent", "tool", "Span", "dataset", "Dataset", "flush", "feedback", "check",
     "call", "acall", "Verdict", "CheckContext", "PromptBlocked", "suppress",
     "extract_placeholders", "MissingVariableError", "TemplateParseError", "__version__",
 }  # fmt: skip

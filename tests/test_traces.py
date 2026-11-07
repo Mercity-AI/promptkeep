@@ -204,8 +204,76 @@ class TestSpanUpsert:
         by_name = {span.name: span for span in history.trace(trace_key).spans}
         assert by_name["omitted"].input is history._UNSET
         assert by_name["omitted"].output is history._UNSET
+        assert by_name["omitted"].has_input is False
+        assert by_name["omitted"].has_output is False
         assert by_name["explicit"].input is None
         assert by_name["explicit"].output is None
+        assert by_name["explicit"].has_input is True
+        assert by_name["explicit"].has_output is True
+
+    def test_a_final_row_never_clears_a_stored_input(self):
+        trace_key = _root()
+        tool_key = new_run_key()
+        storage.record_span(
+            span_key=tool_key,
+            trace_key=trace_key,
+            parent_span_key=trace_key,
+            kind="tool",
+            name="once",
+            started_at=_now(),
+            status="running",
+            input_json='"payload"',
+        )
+        storage.record_span(
+            span_key=tool_key,
+            trace_key=trace_key,
+            parent_span_key=trace_key,
+            kind="tool",
+            name="once",
+            started_at=_now(),
+            ended_at=_now(),
+            duration_ms=1,
+            status="ok",
+            input_json=None,
+        )
+        row = SpanRecord.get(SpanRecord.span_key == tool_key)
+        assert row.status == "ok"
+        assert row.input_json == '"payload"'
+
+    def test_batch_writes_begin_immediately(self, monkeypatch):
+        # _insert_span/_insert_check read before writing; a deferred batch
+        # transaction would fail its read→write lock upgrade when another
+        # connection commits in between, dropping the whole batch.
+        database = storage.get_db().obj
+        original = database.execute_sql
+        statements = []
+
+        def capture(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+
+        monkeypatch.setattr(database, "execute_sql", capture)
+        storage.write_batch(
+            [
+                {
+                    "_kind": "span",
+                    "span_key": new_run_key(),
+                    "trace_key": new_run_key(),
+                    "parent_span_key": None,
+                    "kind": "agent",
+                    "name": "batch",
+                    "started_at": _now(),
+                    "ended_at": _now(),
+                    "duration_ms": 1,
+                    "status": "ok",
+                    "input_json": None,
+                    "output_json": None,
+                    "error": None,
+                    "sampled": True,
+                }
+            ]
+        )
+        assert any("BEGIN IMMEDIATE" in statement.upper() for statement in statements)
 
 
 class TestTraceReads:
@@ -522,9 +590,11 @@ class TestSamplingPolicy:
             task.output("secret out")
         span_rows = [item for item in seen if item.get("_kind") == "span"]
         assert span_rows
-        assert all("secret" not in str(item) for item in span_rows)
-        assert any(item["name"] == "[X]" for item in span_rows)
+        assert any(item["name"] == "secret" for item in span_rows)  # names stay structural
         assert any(item.get("input_json") == '"[X] in"' for item in span_rows)
+        assert any(item.get("output_json") == '"[X] out"' for item in span_rows)
+        assert all("secret" not in (item.get("input_json") or "") for item in span_rows)
+        assert all("secret" not in (item.get("output_json") or "") for item in span_rows)
 
     def test_span_redaction_failure_never_stores_original(self):
         promptkeep.configure(redact=lambda text: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -533,13 +603,13 @@ class TestSamplingPolicy:
         assert history.list_traces() == []
         assert SpanRecord.select().count() == 0
 
-    def test_span_name_and_error_are_redacted(self):
+    def test_span_name_is_kept_and_error_is_redacted(self):
         promptkeep.configure(redact=lambda text: text.replace("secret", "[X]"))
         with pytest.raises(RuntimeError):
             with promptkeep.agent("secret agent") as task:
                 raise RuntimeError("secret error")
         trace = history.trace(task.trace_key)
-        assert trace.root.name == "[X] agent"
+        assert trace.root.name == "secret agent"
         assert "[X] error" in trace.root.error
 
 

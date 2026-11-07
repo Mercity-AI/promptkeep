@@ -28,9 +28,20 @@ from .models import (
     SpanRecord,
 )
 
+
+class _Unset:
+    """The "payload was never recorded" sentinel: distinct from a recorded
+    JSON null, and printable so a span shows ``<unset>`` rather than an
+    object address."""
+
+    def __repr__(self) -> str:
+        """A stable, readable stand-in for the sentinel."""
+        return "<unset>"
+
+
 # A span payload that was never recorded (SQLite NULL), as opposed to an
-# explicit JSON null. Kept private; the dataclass exposes it as the default.
-_UNSET = object()
+# explicit JSON null. Kept private; SpanInfo exposes it via has_input/has_output.
+_UNSET = _Unset()
 
 
 @dataclass(frozen=True)
@@ -94,12 +105,14 @@ class SpanInfo:
     """One recorded span: an agent scope, a tool scope, or a model call.
 
     ``input``/``output`` use a private sentinel for "never recorded", which is
-    different from an explicitly recorded JSON ``null``. A payload that the
-    redaction hook made unparsable is returned as the redacted raw string, so
-    it stays inspectable instead of silently becoming empty. ``runs`` holds
-    the existing run rows linked to an ``llm`` span; a missing run row is
-    shown by ``run_unavailable`` rather than invented. ``sampled`` is this
-    span's successful-span decision; for a root it is the trace cohort.
+    different from an explicitly recorded JSON ``null``; ``has_input`` and
+    ``has_output`` answer the question without touching the sentinel. A
+    payload that the redaction hook made unparsable is returned as the
+    redacted raw string, so it stays inspectable instead of silently becoming
+    empty. ``runs`` holds the existing run rows linked to an ``llm`` span; a
+    missing run row is shown by ``run_unavailable`` rather than invented.
+    ``sampled`` is this span's successful-span decision; for a root it is the
+    trace cohort.
     """
 
     span_key: str
@@ -122,6 +135,16 @@ class SpanInfo:
     def duration_seconds(self) -> float | None:
         """Elapsed seconds, or None while the span has no recorded duration."""
         return None if self.duration_ms is None else self.duration_ms / 1000
+
+    @property
+    def has_input(self) -> bool:
+        """Whether an input payload was actually recorded for this span."""
+        return self.input is not _UNSET
+
+    @property
+    def has_output(self) -> bool:
+        """Whether an output payload was recorded — omitted output is not null."""
+        return self.output is not _UNSET
 
     @property
     def primary_run(self) -> RunInfo | None:

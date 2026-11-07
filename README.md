@@ -205,20 +205,25 @@ trace.versions_used                         # {"REVIEW_SYSTEM": [4]}
 ```
 
 `async with promptkeep.agent(...)` / `async with promptkeep.tool(...)` work the same way.
-A tool must be entered inside an agent; entering one without it is a usage error. Nested
-agents and tools stay in the same trace, and a model call inside a tool is that tool's
-child. The handle exposes `span_key` immediately; `trace_key` is known after entry. Keys
-identify attempts, not rows: sampling, redaction, a full queue or `write_mode="off"` can
-drop the row. `history.list_traces(limit=100)` lists root agent spans only.
+Entering a tool with no active agent records nothing and logs a warning rather than
+raising, so helper code (including one that runs in a forked worker) stays safe to call.
+Nested agents and tools stay in the same trace, and a model call inside a tool is that
+tool's child. Pass the provider's tool-call id to parent a tool under the model call that
+requested it: `tool("web_search", call_id=tool_call.id)`. Call `handle.fail(message)` when
+a tool returns normally but failed (a non-zero exit code, an `is_error` result) — the span
+becomes an error without an exception. The handle is a `promptkeep.Span`, exposing
+`span_key` immediately; `trace_key` is known after entry. Keys identify attempts, not rows:
+sampling, redaction, a full queue or `write_mode="off"` can drop the row.
+`history.list_traces(limit=100)` lists root agent spans only.
 
 A caught tool/provider error is a child failure, not a root failure. A trace can be
 partial by design: a missing root, parent, or linked run is reported as missing, never
-reconstructed. Agent/tool names, input, output and errors go through `redact` before
-queueing; each payload is capped at 64 KiB with a visible marker. Sampling chooses one
-cohort for the trace's normal model steps and still keeps errors, blocks and non-ok
-verdicts, so a sampled-out task that hits a problem can appear as a problem-only trace.
-Retention expires spans in whole traces using their latest activity; prompt/version rows
-are never deleted.
+reconstructed. Agent/tool input, output and errors go through `redact` before queueing;
+each payload is capped at 64 KiB with a visible marker, and names stay readable, like
+prompt names. Sampling chooses one cohort for the trace's normal model steps and still
+keeps errors, blocks and non-ok verdicts, so a sampled-out task that hits a problem can
+appear as a problem-only trace. Retention expires spans in whole traces using their latest
+activity; prompt/version rows are never deleted.
 
 Context follows normal `contextvars` inheritance (including async tasks), not arbitrary
 threads or processes. Enter a new scope inside each thread. A child task or stream started
@@ -491,18 +496,20 @@ the decision is made once per session (derived from the session's id, so every w
 process agrees), so a kept conversation is complete rather than full of holes. `0.0` means
 "store only problems". An agent trace uses one cohort for its root and normal model steps;
 errors, blocks and non-ok known verdicts can still leave a problem-only trace, without
-recovering earlier steps that were already dropped. Version lineage is never sampled.
-Because the decision is made when the run is recorded, a verdict from an *async* post-check
-can't rescue a dropped run — use `mode="blocking"` for a check whose failures must always be
-kept. A sampled-out run's `response.promptkeep.run_key` is `None`; its verdicts are still on
-the handle.
+recovering earlier steps that were already dropped. A trace that runs inside a
+conversation follows that session's one keep-or-drop decision, so a session's traces
+survive or drop together — problems still keep their own problem-only traces. Version
+lineage is never sampled. Because the decision is made when the run is recorded, a verdict
+from an *async* post-check can't rescue a dropped run — use `mode="blocking"` for a check
+whose failures must always be kept. A sampled-out run's `response.promptkeep.run_key` is
+`None`; its verdicts are still on the handle.
 
 **Redaction** runs before anything is written, in every write mode — plaintext never even
 enters the background queue. The hook sees each stored text field of a run (rendered prompt,
 input and output, the JSON-encoded variables and request params, error text), of a check
-verdict (message, rewritten text), and of an agent span (name, input/output payload, error).
-Templates, prompt names and conversation metadata are not
-passed through it: templates are code, and the metadata is what you attached on purpose. If
+verdict (message, rewritten text), and of an agent span (input/output payload, error).
+Templates, prompt names, span names and conversation metadata are not passed through it:
+templates are code, and the names and metadata are what you attached on purpose. If
 the hook raises or returns a non-string, the row is dropped rather than stored unredacted.
 `redact=lambda text: ""` keeps metadata only — model, tokens, cost, latency, status and
 verdicts, with no prompt or response text at all.

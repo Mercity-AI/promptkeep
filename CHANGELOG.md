@@ -10,18 +10,22 @@ how deprecations work, is in [docs/API.md](docs/API.md).
 
 ### Added
 
-- Agent traces: `promptkeep.agent(name, input=)` and `promptkeep.tool(name, input=)`
+- Agent traces: `promptkeep.agent(name, input=)` and `promptkeep.tool(name, input=, call_id=)`
   are explicit sync/async scopes for one task and its application-executed steps. A
   wrapped model call inside a scope records one `llm` span linked to every run row from
-  that physical call; `RunHandle.span_key` carries its identity. Nested agents/tools stay
-  in one trace, caught child failures stay visible without changing the root exit status,
-  and existing check suppression still keeps judge calls out. `history.list_traces()` and
-  `history.trace(trace_key)` read the result as `SpanInfo`/`TraceInfo`, counting tokens and
-  cost once per model call and tolerating missing roots, parents, and linked runs. Span
-  input/output is snapshotted, redacted before queueing, and capped at 64 KiB with a visible
-  marker; traces reuse the existing sampling cohort and retention sweep. Schema v9 adds the
-  `spans` table and nullable indexed `runs.span_key` (historical runs stay unlinked).
-  `examples/agent_trace_demo.py` is the offline walkthrough.
+  that physical call; `RunHandle.span_key` carries its identity and the handle is the
+  public `promptkeep.Span`. Nested agents/tools stay in one trace, a tool can pass the
+  provider's tool-call id to become a child of the model call that requested it, and
+  `handle.fail(message)` marks a normal return as a failed span. Caught child failures
+  stay visible without changing the root exit status, and existing check suppression still
+  keeps judge calls out. `history.list_traces()` and `history.trace(trace_key)` read the
+  result as `SpanInfo`/`TraceInfo`, counting tokens and cost once per model call and
+  tolerating missing roots, parents, and linked runs; `SpanInfo.has_input`/`has_output`
+  separate "never recorded" from an explicit JSON null. Span input/output is snapshotted,
+  redacted before queueing (names stay, like prompt names), and capped at 64 KiB with a
+  visible marker; traces reuse the existing sampling cohort and retention sweep. Schema v9
+  adds the `spans` table and nullable indexed `runs.span_key` (historical runs stay
+  unlinked). `examples/agent_trace_demo.py` is the offline walkthrough.
 
 - Provider adapter interface (`promptkeep.integrations.ProviderAdapter`): all
   provider-specific knowledge now lives in an adapter, and the tracking

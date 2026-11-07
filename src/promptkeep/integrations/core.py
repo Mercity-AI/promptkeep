@@ -36,12 +36,12 @@ from typing import Any
 
 from .. import controls, storage
 from ..agents import (
-    current as current_agent,
+    attached,
+    finalize_model_span,
+    register_tool_calls,
 )
 from ..agents import (
-    finalize_model_span,
-    new_span_key,
-    utcnow,
+    current as current_agent,
 )
 from ..checks import (
     Check,
@@ -141,6 +141,7 @@ def _make_sync_create(original: Any, adapter: ProviderAdapter) -> Any:
                 return blocked
 
         # The real call. A provider error is recorded, then re-raised untouched.
+        call.begin_model_call()
         start = time.perf_counter()
         try:
             response = original(*args, **call.request.kwargs)
@@ -184,6 +185,7 @@ def _make_async_create(original: Any, adapter: ProviderAdapter) -> Any:
 
         # A provider error raised before there is anything to await (argument
         # validation) is recorded like one raised while awaiting.
+        call.begin_model_call()
         start = time.perf_counter()
         try:
             pending = original(*args, **call.request.kwargs)
@@ -245,9 +247,7 @@ class _Call:
         # valid association for this call; ordinary recording follows the
         # current configuration in that case.
         context = current_agent()
-        if context is not None and (
-            not context.tracked or str(get_settings().db_path) != context.db_path
-        ):
+        if context is not None and not attached(context):
             context = None
         self.agent_context = context
         self.model_span_key: str | None = None
@@ -284,10 +284,11 @@ class _Call:
         # One model span per physical call. Its successful-span decision is
         # the trace cohort, except when this call explicitly moves to another
         # conversation: then that conversation's existing cohort applies and
-        # a dropped model link stays honestly missing from the trace.
+        # a dropped model link stays honestly missing from the trace. Its
+        # start is stamped by begin_model_call, around the provider call
+        # itself, not around parsing or the writes that follow.
         if self.agent_context is not None:
-            self.model_span_key = new_span_key()
-            self.model_started_at = utcnow()
+            self.model_span_key = new_run_key()
             cohort = None
             if (
                 self.conversation_id is None
@@ -380,6 +381,7 @@ class _Call:
         blocked = self.outcome.blocked
         if blocked is None:
             return None
+        self.begin_model_call()
         run_key = self._write(ResponseFields(), 0, "blocked", f"blocked by check {blocked.name!r}")
         if get_settings().on_block == "raise":
             raise PromptBlocked(blocked.name, blocked.message)
@@ -389,7 +391,18 @@ class _Call:
         _attach_handle(stub, self.handle)
         return stub
 
-    # --- phase 2: the outcome -----------------------------------------------
+    # --- phase 2: the provider call -----------------------------------------
+
+    def begin_model_call(self) -> None:
+        """Stamp the provider interaction's start, just before the real call.
+
+        Called from the interceptors — and from the blocked path, where the
+        span is still recorded — so a model span's interval is the provider
+        call, not the pre-checks that ran before it or the writes after.
+        """
+        self.model_started_at = storage._utcnow()
+
+    # --- phase 3: the outcome -----------------------------------------------
 
     def record_error(
         self, error_repr: str, latency_ms: int, fields: ResponseFields | None = None
@@ -466,15 +479,26 @@ class _Call:
             return None
         verdicts = self.outcome.results if results is None else results
         check_rows = [r.to_row() for r in verdicts] or None
+
         # If the configured database changed during the call, the run rows
         # follow the new database but must not carry a key from the old
         # trace. The model span itself is skipped by finalize_model_span.
+        context = self.agent_context
         span_key = self.model_span_key
-        if (
-            self.agent_context is not None
-            and str(get_settings().db_path) != self.agent_context.db_path
-        ):
+        if context is not None and not attached(context):
             span_key = None
+
+        # The provider's tool-call ids become resolvable for tool(call_id=...)
+        # in this same trace, so a tool span can parent under the model call
+        # that requested it.
+        if context is not None and span_key is not None and fields.tool_call_ids:
+            register_tool_calls(
+                fields.tool_call_ids,
+                span_key=span_key,
+                trace_key=context.trace_key,
+                db_path=context.trace.db_path,
+            )
+
         common: dict[str, Any] = dict(
             provider=self.adapter.provider,
             latency_ms=latency_ms,
@@ -492,7 +516,7 @@ class _Call:
         tracked = self.request.tracked
         if not tracked:
             run_key = _record_bare(run_key=self.run_key, checks=check_rows, **common)
-            self._finalize_model_span(status, error, check_rows, latency_ms)
+            self._finalize_model_span(fields, status, error, check_rows, latency_ms)
             return run_key
         (prompt_obj, variables, rendered), *rest = tracked
         run_key = record_prompt_run(
@@ -500,11 +524,12 @@ class _Call:
         )
         for prompt_obj, variables, rendered in rest:
             record_prompt_run(prompt_obj, variables, rendered, **common)
-        self._finalize_model_span(status, error, check_rows, latency_ms)
+        self._finalize_model_span(fields, status, error, check_rows, latency_ms)
         return run_key
 
     def _finalize_model_span(
         self,
+        fields: ResponseFields,
         status: str,
         error: str | None,
         check_rows: list[dict[str, Any]] | None,
@@ -517,7 +542,7 @@ class _Call:
         finalization site. It uses the context snapshotted at call start, not
         the ambient context at stream completion, and the same latency the run
         row carries so the span describes the provider call, not the writes
-        that followed it.
+        that followed it. The span is named after the model the call used.
         """
         if (
             self.agent_context is None
@@ -528,6 +553,7 @@ class _Call:
         finalize_model_span(
             self.agent_context,
             span_key=self.model_span_key,
+            name=fields.model or self.request.kwargs.get("model") or "model",
             started_at=self.model_started_at,
             duration_ms=latency_ms,
             status=status,

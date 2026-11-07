@@ -96,7 +96,8 @@ class OpenAIResponsesAdapter(ProviderAdapter):
 
     def read_response(self, response: Any) -> ResponseFields:
         """Reply text from the ``output`` message items, counts from ``usage``
-        (``input_tokens`` / ``output_tokens`` on this surface)."""
+        (``input_tokens`` / ``output_tokens`` on this surface), and the
+        ``call_id`` of every tool-call output item."""
         usage = getattr(response, "usage", None)
         return ResponseFields(
             model=getattr(response, "model", None),
@@ -106,6 +107,7 @@ class OpenAIResponsesAdapter(ProviderAdapter):
             completion_tokens=getattr(usage, "output_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
             cost_usd=_reported_cost(usage),
+            tool_call_ids=_tool_call_ids(response),
         )
 
     def stream_absorber(self) -> StreamAbsorber:
@@ -150,7 +152,8 @@ class _ResponsesStreamAbsorber(StreamAbsorber):
     def summary(self) -> ResponseFields:
         """The last Response seen, with the streamed deltas as its text — they
         are what the caller actually received, and all there is when a stream
-        breaks before its terminal event."""
+        breaks before its terminal event. Tool-call ids ride along from that
+        last Response."""
         text = "".join(self.parts) or self.final.output_text
         return ResponseFields(
             model=self.final.model,
@@ -160,6 +163,7 @@ class _ResponsesStreamAbsorber(StreamAbsorber):
             completion_tokens=self.final.completion_tokens,
             total_tokens=self.final.total_tokens,
             cost_usd=self.final.cost_usd,
+            tool_call_ids=self.final.tool_call_ids,
         )
 
 
@@ -208,3 +212,16 @@ def _extract_output_text(response: Any) -> str | None:
             if getattr(block, "type", None) == "output_text" and isinstance(text, str):
                 parts.append(text)
     return "".join(parts) or None
+
+
+def _tool_call_ids(response: Any) -> tuple[str, ...]:
+    """Every ``call_id`` on the response's output items — the tool calls the
+    model asked the application to run (``function_call`` and the rest).
+    Message and reasoning items carry no call id, so they contribute nothing;
+    a malformed one costs the link, never the call."""
+    found = []
+    for item in getattr(response, "output", None) or ():
+        call_id = getattr(item, "call_id", None)
+        if isinstance(call_id, str) and call_id:
+            found.append(call_id)
+    return tuple(found)

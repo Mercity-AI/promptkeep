@@ -21,7 +21,7 @@ The public API is exactly this — everything else is internal, however it is re
 | `promptkeep` | every name in `promptkeep.__all__` |
 | `promptkeep.history` | every function and dataclass whose name has no leading underscore |
 | `promptkeep.integrations` | every name in `promptkeep.integrations.__all__` — including the `ProviderAdapter` interface a third-party adapter implements |
-| Public classes | their methods, properties and attributes without a leading underscore (`Prompt`, `RenderedText`, `RunHandle` as `response.promptkeep`, `CallResult`, `Verdict`, `CheckContext`, `Dataset`, `SpanInfo`, `TraceInfo`, and the other `history` dataclasses) |
+| Public classes | their methods, properties and attributes without a leading underscore (`Prompt`, `RenderedText`, `RunHandle` as `response.promptkeep`, `CallResult`, `Verdict`, `CheckContext`, `Dataset`, `Span` — the `agent()`/`tool()` handle — `SpanInfo`, `TraceInfo`, and the other `history` dataclasses) |
 | Call-site kwargs | `promptkeep_conversation=`, `promptkeep_parent=`, `promptkeep_pre=`, `promptkeep_post=` on a wrapped client |
 | Configuration | every `configure()` argument and every `PROMPTKEEP_*` environment variable |
 | The CLI | command names and flags. Output is for people: its layout may change in any release. For machines, use `promptkeep export` (JSONL) |
@@ -55,11 +55,12 @@ Some behaviour is API too. Changing any of these is a breaking change, treated a
   for a key with no surviving spans. A caught tool/provider failure is a child failure; it
   does not rewrite the root's exit status. `history.list_traces()` returns root metadata
   without payloads; `history.trace()` loads the payloads and children.
-- **Span payloads are bounded and redacted.** Agent/tool names, input, output, and error text
-  go through the configured `redact` hook before queueing. One serialized payload is capped
-  at 64 KiB before a visible truncation marker is appended; the cap bounds the serialized
-  value, not the cost of serializing an arbitrary object. Omitted output is distinct from
-  an explicitly recorded JSON `null`.
+- **Span payloads are bounded and redacted.** Agent/tool input, output, and error text
+  go through the configured `redact` hook before queueing; names do not (they are the
+  trace's labels, like prompt names). One serialized payload is capped at 64 KiB before a
+  visible truncation marker is appended; the cap bounds the serialized value, not the cost
+  of serializing an arbitrary object. Omitted output is distinct from an explicitly
+  recorded JSON `null`; `SpanInfo.has_input`/`has_output` answer which one it is.
 - **Sampling keeps traces coherent where it can.** A root's cohort is chosen once and shared
   by its normal model steps; errors, blocks, and non-ok known verdicts still force a
   problem-only trace. A call explicitly moved to another conversation follows that

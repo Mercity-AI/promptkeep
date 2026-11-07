@@ -64,7 +64,11 @@ class ResponseFields:
     error has no response, a stream may never report usage.
 
     cost_usd is the cost the provider itself reported for the call, in US
-    dollars — None when it reports none. Adapters must not estimate it."""
+    dollars — None when it reports none. Adapters must not estimate it.
+    tool_call_ids are the provider's ids for the tool calls the response asks
+    the application to run — empty when there are none; ``core`` makes them
+    resolvable to this call's model span so ``tool(call_id=...)`` can parent
+    under it."""
 
     model: str | None = None
     response_id: str | None = None
@@ -73,6 +77,7 @@ class ResponseFields:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     cost_usd: float | None = None
+    tool_call_ids: tuple[str, ...] = ()
 
 
 class StreamAbsorber(ABC):

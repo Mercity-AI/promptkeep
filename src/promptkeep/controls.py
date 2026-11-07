@@ -28,9 +28,10 @@ RUN_TEXT_FIELDS = (
     "original_input_text",
 )
 CHECK_TEXT_FIELDS = ("message", "rewritten")
-# Span names and payloads are user data too. The JSON columns are already
+# Span payloads and error text are user data too. The JSON columns are already
 # serialized strings, so the existing str -> str hook applies to them directly.
-SPAN_TEXT_FIELDS = ("name", "input_json", "output_json", "error")
+# Span names are structural labels, like prompt names, and are not redacted.
+SPAN_TEXT_FIELDS = ("input_json", "output_json", "error")
 
 
 def keep_run(
@@ -96,11 +97,12 @@ def redact_check(redact: Callable[[str], str], row: dict[str, Any]) -> dict[str,
 
 
 def redact_span(redact: Callable[[str], str], row: dict[str, Any]) -> dict[str, Any]:
-    """A span row with its name, payloads and error passed through the hook.
+    """A span row with its payloads and error passed through the hook.
 
     The payload columns are already serialized JSON strings, so the same
     ``str -> str`` contract applies; a hook that makes them unparsable is
-    still inspectable as redacted raw text in ``history``.
+    still inspectable as redacted raw text in ``history``. The name is left
+    alone, like a prompt's: it is the label the trace is read by.
     """
     return _redact_fields(redact, row, SPAN_TEXT_FIELDS)
 

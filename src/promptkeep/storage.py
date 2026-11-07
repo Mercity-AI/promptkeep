@@ -926,16 +926,20 @@ def write_batch(items: list[dict[str, Any]]) -> None:
     """Persist queued items in one transaction (called from the writer thread).
 
     Raises on failure — the writer shields and logs, keeping the whole batch
-    as the unit of loss rather than half-writing it. A queued retention sweep
-    is not part of that unit: it runs after the batch, in transactions of its
-    own (see ``prune``).
+    as the unit of loss rather than half-writing it. The transaction is
+    IMMEDIATE, not deferred: ``_insert_span`` and ``_insert_check`` read
+    before they write, and SQLite refuses a read→write lock upgrade outright
+    when another connection commits in between. A deferred batch would then
+    lose *every* item it carried, regular run rows included. A queued
+    retention sweep is not part of that unit: it runs after the batch, in
+    transactions of its own (see ``prune``).
     """
     if not items or get_db() is None:
         return
     sweeps = [item for item in items if item.get("_kind") == "prune"]
     rows = [item for item in items if item.get("_kind") != "prune"]
     if rows:
-        with db_proxy.atomic():
+        with db_proxy.atomic("IMMEDIATE"):
             for item in rows:
                 _persist(item)
     for sweep in sweeps:
@@ -1026,12 +1030,16 @@ def _insert_check(item: dict[str, Any]) -> None:
 
 
 def _insert_span(item: dict[str, Any]) -> None:
-    """Insert or update one span, never downgrading a terminal row to running.
+    """Insert or update one span, never downgrading a terminal row to running
+    or clearing a payload the start row already stored.
 
     A root's start row may be missing (the queue dropped it, or the span was
     sampled out until a problem occurred); the final row then creates it.
     If an out-of-order running row arrives after a terminal one, it is
-    ignored: a completed span must not start running again.
+    ignored: a completed span must not start running again. The final row of
+    a span deliberately omits its input when the start row already carried it
+    (one large payload is queued and redacted once), so a missing value here
+    never clears a stored one.
     """
     row = {key: value for key, value in item.items() if key != "_kind"}
     existing = SpanRecord.get_or_none(span_key=row["span_key"])
@@ -1041,6 +1049,8 @@ def _insert_span(item: dict[str, Any]) -> None:
     if existing.status != "running" and row.get("status") == "running":
         return
     fields = {key: value for key, value in row.items() if key != "span_key"}
+    if fields.get("input_json") is None:
+        fields.pop("input_json")
     SpanRecord.update(**fields).where(SpanRecord.span_key == row["span_key"]).execute()
 
 

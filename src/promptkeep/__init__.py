@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from . import history
-from .agents import agent, tool
+from .agents import Span, agent, tool
 from .checks import CheckContext, PromptBlocked, Verdict, check, suppress
 from .config import configure, get_settings
 from .conversation import conversation
@@ -38,6 +38,7 @@ __all__ = [
     "conversation",
     "agent",
     "tool",
+    "Span",
     "dataset",
     "Dataset",
     "flush",
