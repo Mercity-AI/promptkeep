@@ -32,6 +32,7 @@ class Target:
 
     owner: Any
     attribute: str
+    invocation_style: str = "call"
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class Request:
     input_text: str | None
     joined_text: str
     request_params: dict[str, Any]
+    asynchronous: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class ResponseFields:
     total_tokens: int | None = None
     cost_usd: float | None = None
     tool_call_ids: tuple[str, ...] = ()
+    usage_details: dict[str, Any] | None = None
 
 
 class StreamAbsorber(ABC):
@@ -110,6 +113,31 @@ class ProviderAdapter(ABC):
     def locate(self, client: Any) -> Target | None:
         """The call method to instrument on this client, or None if the client
         does not expose this provider's surface."""
+
+    def locate_targets(self, client: Any) -> list[Target]:
+        """All instrumentable surfaces; existing adapters need no changes."""
+        target = self.locate(client)
+        return [target] if target is not None else []
+
+    def wrap_manager(self, original: Any) -> Any:
+        """Wrap a provider-specific lazy stream-manager factory."""
+        raise NotImplementedError("This adapter has no stream-manager surface")
+
+    def is_deferred_response(self, response: Any) -> bool:
+        """Whether parsing a native response body must be observed lazily."""
+        return False
+
+    def defer_response(self, response: Any, call: Any, start: float, asynchronous: bool) -> Any:
+        """Preserve provider-specific raw response behavior."""
+        return response
+
+    def wrap_raw_call(self, original: Any) -> Any:
+        """Instrument a raw-response call surface when supported."""
+        raise NotImplementedError()
+
+    def wrap_raw_manager(self, original: Any) -> Any:
+        """Wrap a raw-response context-manager surface when supported."""
+        raise NotImplementedError()
 
     @abstractmethod
     def parse_request(self, kwargs: dict[str, Any]) -> Request:

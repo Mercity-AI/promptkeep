@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import promptkeep
+import promptkeep.importers
 import promptkeep.integrations
 
 SOURCE_ROOT = Path(promptkeep.__file__).parent
@@ -30,21 +31,21 @@ def test_all_names_resolve():
 # moved, and the CHANGELOG — adding is a feature, removing or renaming is a
 # breaking change that goes through a deprecation first.
 PUBLIC_TOP_LEVEL = {
-    "Prompt", "RenderedText", "prompt", "wrap", "configure", "get_settings", "history",
+    "setup", "Installation", "Prompt", "RenderedText", "prompt", "wrap", "configure", "get_settings", "history",
     "conversation", "agent", "tool", "Span", "dataset", "Dataset", "flush", "feedback", "check",
     "call", "acall", "Verdict", "CheckContext", "PromptBlocked", "suppress",
     "extract_placeholders", "MissingVariableError", "TemplateParseError", "__version__",
 }  # fmt: skip
 PUBLIC_HISTORY = {
     "CheckInfo", "ConversationInfo", "ConversationSummary", "PromptSummary", "RunInfo",
-    "SpanInfo", "TraceInfo", "VersionInfo", "VersionStats", "all_runs", "checks",
+    "ImportedSessionInfo", "imported_session", "SpanInfo", "TraceInfo", "VersionInfo", "VersionStats", "all_runs", "checks",
     "conversation", "diff", "format_cost", "labels", "list_conversations", "list_prompts",
     "list_traces", "runs", "stats", "trace", "verdict", "versions",
 }  # fmt: skip
 PUBLIC_INTEGRATIONS = {
     "wrap", "call", "acall", "CallResult", "is_wrapped", "adapters", "register_adapter",
     "ProviderAdapter", "Request", "ResponseFields", "StreamAbsorber", "Target",
-    "OpenAIChatAdapter", "OpenAIResponsesAdapter",
+    "OpenAIChatAdapter", "OpenAIResponsesAdapter", "AnthropicMessagesAdapter",
 }  # fmt: skip
 
 
@@ -59,6 +60,14 @@ def test_the_public_api_changes_only_on_purpose():
     assert set(promptkeep.__all__) == PUBLIC_TOP_LEVEL
     assert history_names == PUBLIC_HISTORY
     assert set(promptkeep.integrations.__all__) == PUBLIC_INTEGRATIONS
+    assert set(promptkeep.importers.__all__) == {
+        "import_codex",
+        "import_claude_code",
+        "import_dataset",
+        "DatasetImportReport",
+        "ImportReport",
+        "ImportDiagnostic",
+    }
 
 
 def test_no_function_level_intra_package_imports():

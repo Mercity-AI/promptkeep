@@ -21,7 +21,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -29,6 +31,8 @@ from typing import Any
 
 from . import history
 from .config import configure, get_settings
+from .importers import import_claude_code, import_codex, import_dataset
+from .watch import Watcher
 
 # ANSI colours for `diff`, used only when writing to a terminal.
 _RED, _GREEN, _CYAN, _RESET = "\033[31m", "\033[32m", "\033[36m", "\033[0m"
@@ -39,6 +43,51 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     if args.db:
         configure(db_path=args.db)
+    if args.command == "import":
+        try:
+            if args.source == "dataset":
+                if not args.dataset:
+                    raise ValueError("--dataset is required for dataset imports")
+                report = import_dataset(args.path, dataset=args.dataset, strict=args.strict)
+            else:
+                importer = import_codex if args.source == "codex" else import_claude_code
+                report = importer(args.path, strict=args.strict)
+        except Exception as exc:
+            raise SystemExit(f"promptkeep: import failed ({type(exc).__name__}): {exc}") from None
+        if args.json:
+            print(json.dumps(asdict(report)))
+        elif args.source == "dataset":
+            print(f"{len(report.sessions)} imported sessions; {len(report.failures)} failures")
+        else:
+            print(f"{report.outcome}: {report.trace_key}")
+            print(
+                f"{report.agent_spans} agents, {report.tool_spans} tools, "
+                f"{report.model_spans} model spans, {report.usage_records} usage records; "
+                f"{len(report.diagnostics)} diagnostics"
+            )
+        return
+    if args.command == "watch":
+        try:
+            watcher = Watcher(
+                args.source, args.path, interval=args.interval, strict=args.strict
+            ).start()
+        except (ValueError, OSError) as exc:
+            raise SystemExit(f"promptkeep: {exc}") from None
+        previous_signal = None
+        if threading.current_thread() is threading.main_thread():
+            previous_signal = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, lambda number, frame: watcher.stop())
+        try:
+            while not watcher.join(0.2):
+                pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            watcher.stop()
+            watcher.join()
+            if previous_signal is not None:
+                signal.signal(signal.SIGTERM, previous_signal)
+        return
     if args.command == "serve":
         _serve(args)
         return
@@ -63,6 +112,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser = argparse.ArgumentParser(prog="promptkeep", description="Inspect a promptkeep history.")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    importer = commands.add_parser("import", parents=[common], help="import a saved session")
+    importer.add_argument("source", choices=["codex", "claude-code", "dataset"])
+    importer.add_argument("path")
+    importer.add_argument("--dataset")
+    importer.add_argument("--strict", action="store_true")
+    importer.add_argument("--json", action="store_true")
+    watch = commands.add_parser(
+        "watch", parents=[common], help="watch explicit native session paths"
+    )
+    watch.add_argument("source", choices=["codex", "claude-code"])
+    watch.add_argument("path")
+    watch.add_argument("--interval", type=float, default=1.0)
+    watch.add_argument("--strict", action="store_true")
+    traces = commands.add_parser("traces", parents=[common], help="list recorded traces")
+    traces.add_argument("--limit", type=int, default=20)
+    trace = commands.add_parser("trace", parents=[common], help="inspect one trace")
+    trace.add_argument("trace_key")
+    trace.add_argument("--json", action="store_true")
 
     # The listings.
     commands.add_parser("list", parents=[common], help="every prompt, with version and run counts")
@@ -264,7 +332,60 @@ def _serve(args: argparse.Namespace) -> None:  # pragma: no cover - starts a ser
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
+def _traces(args: argparse.Namespace) -> None:
+    """List trace roots through the history API."""
+    rows = [(s.span_key, s.name, s.status, s.started_at) for s in history.list_traces(args.limit)]
+    _table(("TRACE", "NAME", "STATUS", "STARTED"), rows, empty="no traces recorded yet")
+
+
+def _trace(args: argparse.Namespace) -> None:
+    """Show trace structure and separately reported imported usage."""
+    trace = history.trace(args.trace_key)
+    try:
+        imported = history.imported_session(args.trace_key)
+    except ValueError:
+        imported = None
+    if args.json:
+        data = asdict(trace)
+        # Omitted payloads must remain distinguishable from explicit JSON null.
+        for value, span in zip(data["spans"], trace.spans):
+            if not span.has_input:
+                value.pop("input", None)
+            if not span.has_output:
+                value.pop("output", None)
+        if data["root"]:
+            if not trace.root.has_input:
+                data["root"].pop("input", None)
+            if not trace.root.has_output:
+                data["root"].pop("output", None)
+        data["imported_session"] = asdict(imported) if imported else None
+        print(json.dumps(data))
+        return
+    print(f"{trace.trace_key}: {trace.status}; {trace.model_calls} model spans")
+    rows = [
+        (
+            s.span_key,
+            s.parent_span_key or "—",
+            s.kind,
+            s.name,
+            s.status,
+            s.duration_ms if s.duration_ms is not None else "unknown",
+            (s.metadata or {}).get("timing_quality", "measured"),
+        )
+        for s in trace.spans
+    ]
+    _table(("SPAN", "PARENT", "KIND", "NAME", "STATUS", "MS", "TIMING"), rows, empty="no spans")
+    if imported:
+        print(
+            "Source usage summary (includes linked model usage): "
+            + json.dumps(imported.summary["total_usage"])
+        )
+        print("Usage completeness: " + imported.summary["usage_completeness"])
+
+
 _COMMANDS = {
+    "traces": _traces,
+    "trace": _trace,
     "list": _list,
     "versions": _versions,
     "diff": _diff,

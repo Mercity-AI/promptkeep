@@ -76,7 +76,7 @@ class TestSchema:
         assert "spans" in tables
         run_columns = {row[1] for row in database.execute_sql("PRAGMA table_info(runs)").fetchall()}
         assert "span_key" in run_columns
-        assert migrations.SCHEMA_VERSION == 9
+        assert migrations.SCHEMA_VERSION == 12
 
     def test_historical_runs_keep_a_null_span_link(self):
         key = storage.record_run(provider="openai")
@@ -104,7 +104,7 @@ class TestSchema:
 
         assert history.runs("V8")[0].output_text == "kept"
         conn = sqlite3.connect(str(isolated_db))
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
         columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
         assert "span_key" in columns
         assert conn.execute(

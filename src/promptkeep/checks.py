@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import storage
+from .config import get_settings
 
 logger = logging.getLogger("promptkeep")
 
@@ -55,13 +56,15 @@ _suppressed: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # thread (see _run_with_timeout), so a saturated pool can't make a fast check
 # look slow or cap how many requests can be in flight.
 _executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
 
 
 def _get_executor() -> ThreadPoolExecutor:
     """Lazily create the shared async-post-check pool (never at import time)."""
     global _executor
-    if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
     return _executor
 
 
@@ -81,9 +84,13 @@ def schedule_async(chk: Check, ctx: CheckContext, run_key: str | None) -> Future
     in background mode the verdict queues behind its own run row.
     """
 
+    destination = str(get_settings().db_path)
+
     def _work() -> CheckResult:
+        """A late verdict belongs to its original database, even after configure()."""
         result = chk.run_inline(ctx)
-        storage.record_check(run_key, result.to_row())
+        with storage.connection_context(destination):
+            storage.record_check(run_key, result.to_row())
         return result
 
     future = _get_executor().submit(_work)

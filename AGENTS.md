@@ -195,7 +195,7 @@ Load-bearing design decisions (breaking these breaks the library's contract):
 
 ## SQLite/peewee specifics
 
-- Models bind to a `DatabaseProxy`; `storage._get_db()` initializes it from config under a
+- Models bind to a thread-local `DatabaseProxy`; `storage.get_db()` initializes it from config under a
   lock (fresh-file WAL switch races otherwise — this was a real test failure, twice).
 - Registration uses `atomic("IMMEDIATE")` + retry on IntegrityError/OperationalError:
   peewee's default deferred transaction reads before writing, and SQLite refuses to wait on

@@ -18,6 +18,7 @@ from .decorator import prompt
 from .integrations import acall, call, wrap
 from .prompts import Prompt, RenderedText
 from .rendering import MissingVariableError, TemplateParseError, extract_placeholders
+from .setup import Installation, setup
 from .tracking import feedback, flush
 
 try:
@@ -28,6 +29,8 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an instal
     __version__ = "0.0.0+unknown"
 
 __all__ = [
+    "setup",
+    "Installation",
     "Prompt",
     "RenderedText",
     "prompt",

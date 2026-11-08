@@ -22,6 +22,8 @@ from . import storage
 from .models import (
     CheckRecord,
     ConversationRecord,
+    ImportedSessionRecord,
+    ImportedUsageRecord,
     PromptRecord,
     PromptVersionRecord,
     RunRecord,
@@ -98,6 +100,7 @@ class RunInfo:
     original_input_text: str | None = None
     cost_usd: float | None = None
     parent_run_key: str | None = None
+    usage_details: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -120,7 +123,7 @@ class SpanInfo:
     parent_span_key: str | None
     kind: str
     name: str | None
-    started_at: str
+    started_at: str | None
     ended_at: str | None
     duration_ms: int | None
     status: str
@@ -128,6 +131,9 @@ class SpanInfo:
     input: Any = _UNSET
     output: Any = _UNSET
     sampled: bool | None = None
+    metadata: dict[str, Any] | None = None
+    observed_at: str | None = None
+    links: list[str] = field(default_factory=list)
     runs: list[RunInfo] = field(default_factory=list)
     checks: list[CheckInfo] = field(default_factory=list)
 
@@ -527,6 +533,7 @@ class CheckInfo:
     rewritten: str | None = None
 
 
+@storage.connection_scope
 def checks(run_key: str) -> list[CheckInfo]:
     """Every label on a run (by its key), oldest first: its check verdicts
     and any ``promptkeep.feedback()`` given on it — told apart by ``phase``."""
@@ -549,6 +556,7 @@ def checks(run_key: str) -> list[CheckInfo]:
     return [CheckInfo(**row) for row in query]
 
 
+@storage.connection_scope
 def labels(run_keys: list[str]) -> dict[str, list[CheckInfo]]:
     """The labels on many runs at once — ``checks()`` for a batch, in one
     query per few hundred runs rather than one per run. Every key asked for
@@ -664,6 +672,7 @@ _RUN_COLUMNS = (
     RunRecord.input_text,
     RunRecord.original_input_text,
     RunRecord.cost_usd,
+    RunRecord.usage_details,
     RunRecord.parent_run_key,
 )
 # Run keys bound per query by batch reads — well under SQLite's parameter cap.
@@ -685,6 +694,7 @@ def _run_info(row: dict[str, Any]) -> RunInfo:
         **{
             **row,
             "variables": _load_json(row.get("variables")),
+            "usage_details": _load_json(row.get("usage_details")),
             "request_params": _load_json(row.get("request_params")),
         }
     )
@@ -703,6 +713,7 @@ def _span_info(
         kind=row["kind"],
         name=row.get("name"),
         started_at=row["started_at"],
+        observed_at=row.get("observed_at"),
         ended_at=row.get("ended_at"),
         duration_ms=row.get("duration_ms"),
         status=row["status"],
@@ -710,6 +721,7 @@ def _span_info(
         input=_decode_span_payload(row.get("input_json")),
         output=_decode_span_payload(row.get("output_json")),
         sampled=None if row.get("sampled") is None else bool(row["sampled"]),
+        metadata=_load_json(row.get("metadata_json")),
         runs=runs or [],
         checks=checks or [],
     )
@@ -728,12 +740,14 @@ def _decode_span_payload(value: str | None) -> Any:
 # --- reads -------------------------------------------------------------------------
 
 
+@storage.connection_scope
 def versions(name: str) -> list[VersionInfo]:
     """All versions of a prompt, oldest first."""
     rows = storage.version_rows(name)
     return [VersionInfo(**{k: v for k, v in row.items() if k != "id"}) for row in rows]
 
 
+@storage.connection_scope
 def diff(name: str, old: int, new: int) -> str:
     """Unified diff between two versions of a prompt's template."""
     # Load the lineage once and validate both requested versions exist.
@@ -752,6 +766,7 @@ def diff(name: str, old: int, new: int) -> str:
     return "\n".join(lines)
 
 
+@storage.connection_scope
 def runs(name: str, version: int | None = None, limit: int | None = 50) -> list[RunInfo]:
     """Recorded runs for a prompt (optionally one version), newest first.
     ``limit=None`` returns every one."""
@@ -772,6 +787,7 @@ def runs(name: str, version: int | None = None, limit: int | None = 50) -> list[
     return [_run_info(row) for row in query]
 
 
+@storage.connection_scope
 def all_runs(limit: int | None = 100) -> list[RunInfo]:
     """Every recorded run regardless of prompt (or with none), newest first
     (``limit=None``: all of them).
@@ -795,6 +811,7 @@ def all_runs(limit: int | None = 100) -> list[RunInfo]:
     return [_run_info(row) for row in query]
 
 
+@storage.connection_scope
 def list_traces(limit: int = 100) -> list[SpanInfo]:
     """The newest root agent spans, bounded by ``limit``.
 
@@ -829,6 +846,7 @@ def list_traces(limit: int = 100) -> list[SpanInfo]:
     return [_span_info(row) for row in query]
 
 
+@storage.connection_scope
 def trace(trace_key: str) -> TraceInfo:
     """One trace's ordered spans and linked model runs; ValueError if unknown.
 
@@ -873,11 +891,21 @@ def trace(trace_key: str) -> TraceInfo:
     # Every run's labels in batched queries, then only the primary run's
     # labels attach to its model span (checks stay filed under that run).
     labels_by_run = labels([run.run_key for runs in runs_by_span.values() for run in runs])
+    links_by_span = {}
+    for start in range(0, len(span_keys), _KEYS_PER_QUERY):
+        chunk = span_keys[start : start + _KEYS_PER_QUERY]
+        for origin, linked in storage.db_proxy.execute_sql(
+            f"SELECT span_key,linked_span_key FROM span_links WHERE span_key IN ({','.join('?' for _ in chunk)})",
+            chunk,
+        ):
+            links_by_span.setdefault(origin, []).append(linked)
     spans = []
     for row in span_rows:
         runs = runs_by_span.get(row["span_key"], [])
         primary_checks = labels_by_run.get(runs[0].run_key, []) if runs else []
-        spans.append(_span_info(row, runs=runs, checks=primary_checks))
+        info = _span_info(row, runs=runs, checks=primary_checks)
+        info.links.extend(links_by_span.get(row["span_key"], ()))
+        spans.append(info)
 
     # The root is an agent whose trace key is its own span key. Its absence
     # is shown as None, not invented from the oldest child.
@@ -888,6 +916,7 @@ def trace(trace_key: str) -> TraceInfo:
     return TraceInfo(trace_key=trace_key, root=root, spans=spans)
 
 
+@storage.connection_scope
 def stats(name: str) -> list[VersionStats]:
     """Every version of a prompt with how its runs went, oldest first — the
     table that answers "did the change actually help?".
@@ -976,6 +1005,7 @@ def stats(name: str) -> list[VersionStats]:
     return result
 
 
+@storage.connection_scope
 def list_prompts() -> list[PromptSummary]:
     """Every prompt with its version/run counts, for an overview listing.
 
@@ -1001,6 +1031,7 @@ def list_prompts() -> list[PromptSummary]:
     return [PromptSummary(**row) for row in query]
 
 
+@storage.connection_scope
 def list_conversations(
     limit: int = 100, prompt: str | None = None, version: int | None = None
 ) -> list[ConversationSummary]:
@@ -1044,6 +1075,7 @@ def list_conversations(
     return [ConversationSummary(**row) for row in query.dicts()]
 
 
+@storage.connection_scope
 def conversation(external_id: str) -> ConversationInfo:
     """A conversation's full transcript: its metadata plus every turn.
 
@@ -1080,4 +1112,48 @@ def conversation(external_id: str) -> ConversationInfo:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         turns=[_run_info(r) for r in turn_rows],
+    )
+
+
+@dataclass(frozen=True)
+class ImportedSessionInfo:
+    """Import provenance and usage which could not be assigned to model spans."""
+
+    source: str
+    session_id: str
+    trace_key: str
+    imported_at: str
+    parser_revision: int
+    summary: dict[str, Any]
+    usage: list[dict[str, Any]]
+
+
+@storage.connection_scope
+def imported_session(trace_key: str) -> ImportedSessionInfo:
+    """Read one imported session and its separately attributed usage records."""
+    if not _ready():
+        raise ValueError(f"no imported session found for trace_key {trace_key!r}")
+    row = ImportedSessionRecord.get_or_none(ImportedSessionRecord.trace_key == trace_key)
+    if row is None:
+        raise ValueError(f"no imported session found for trace_key {trace_key!r}")
+    usage = []
+    for record in ImportedUsageRecord.select().where(ImportedUsageRecord.session == row.id):
+        usage.append(
+            dict(
+                turn_id=record.turn_id,
+                response_id=record.response_id,
+                span_key=record.span_key,
+                scope=record.scope,
+                observed_at=record.observed_at,
+                usage=_load_json(record.usage_json),
+            )
+        )
+    return ImportedSessionInfo(
+        source=row.source,
+        session_id=row.external_session_id,
+        trace_key=row.trace_key,
+        imported_at=row.imported_at,
+        parser_revision=row.parser_revision,
+        summary=_load_json(row.summary_json),
+        usage=usage,
     )

@@ -10,13 +10,43 @@ time.
 
 from __future__ import annotations
 
+import threading
 import uuid
 
 import peewee as pw
 
+
 # Bound to the real SqliteDatabase by storage.get_db(); models reference it
 # so the file can be chosen at runtime (configure / PROMPTKEEP_DB).
-db_proxy = pw.DatabaseProxy()
+class _ThreadDatabaseProxy(pw.DatabaseProxy):
+    """Keep model bindings local to each thread, including database switches."""
+
+    __slots__ = ("_local",)
+
+    def __init__(self) -> None:
+        """Initialize callbacks once and a separate binding for each thread."""
+        object.__setattr__(self, "_local", threading.local())
+        super().__init__()
+
+    def __setattr__(self, name, value):
+        """Allow inherited proxy slots and the thread-local binding property."""
+        object.__setattr__(self, name, value)
+
+    @property
+    def obj(self):
+        """The database owned by the calling thread, if initialized."""
+        return getattr(self._local, "database", None)
+
+    @obj.setter
+    def obj(self, value):
+        """Retire a replaced database on the same thread that opened it."""
+        previous = self.obj
+        if previous is not None and previous is not value and not previous.is_closed():
+            previous.close()
+        self._local.database = value
+
+
+db_proxy = _ThreadDatabaseProxy()
 
 
 class BaseModel(pw.Model):
@@ -127,6 +157,7 @@ class RunRecord(BaseModel):
     total_tokens = pw.IntegerField(null=True)
     cost_usd = pw.FloatField(null=True)
     latency_ms = pw.IntegerField(null=True)
+    usage_details = pw.TextField(null=True)
     status = pw.TextField()
     error = pw.TextField(null=True)
     created_at = pw.TextField()
@@ -212,7 +243,9 @@ class SpanRecord(BaseModel):
     parent_span_key = pw.TextField(null=True)
     kind = pw.TextField()
     name = pw.TextField()
-    started_at = pw.TextField()
+    started_at = pw.TextField(null=True)
+    observed_at = pw.TextField(null=True)
+    content_parts_json = pw.TextField(null=True)
     ended_at = pw.TextField(null=True)
     duration_ms = pw.IntegerField(null=True)
     status = pw.TextField()
@@ -220,6 +253,7 @@ class SpanRecord(BaseModel):
     output_json = pw.TextField(null=True)
     error = pw.TextField(null=True)
     sampled = pw.BooleanField(null=True)
+    metadata_json = pw.TextField(null=True)
 
     class Meta:
         """Table name and the indexes the two trace reads need."""
@@ -233,6 +267,85 @@ class SpanRecord(BaseModel):
         )
 
 
+class ImportedSessionRecord(BaseModel):
+    """One atomically imported source session; its rows are replaced together."""
+
+    source = pw.TextField()
+    external_session_id = pw.TextField()
+    trace_key = pw.TextField(unique=True)
+    source_digest = pw.TextField()
+    parser_revision = pw.IntegerField()
+    imported_at = pw.TextField()
+    summary_json = pw.TextField()
+
+    class Meta:
+        """Session identity is independent of its filename."""
+
+        table_name = "imported_sessions"
+        indexes = ((("source", "external_session_id"), True),)
+
+
+class ImportedUsageRecord(BaseModel):
+    """Usage whose provider-call timing or attribution may be unavailable."""
+
+    usage_key = pw.TextField(unique=True)
+    session = pw.ForeignKeyField(ImportedSessionRecord, column_name="session_id")
+    turn_id = pw.TextField(null=True)
+    response_id = pw.TextField(null=True)
+    span_key = pw.TextField(null=True, index=True)
+    scope = pw.TextField()
+    observed_at = pw.TextField(null=True)
+    usage_json = pw.TextField()
+
+    class Meta:
+        """Import-owned usage, removed along with its trace."""
+
+        table_name = "imported_usage"
+
+
+class ExternalIdentityRecord(BaseModel):
+    """A source-scoped operation identity, stable across repeated delivery."""
+
+    source = pw.TextField()
+    external_trace_id = pw.TextField()
+    external_span_id = pw.TextField()
+    span_key = pw.TextField(index=True)
+
+    class Meta:
+        """Unique external identity is independent of event delivery order."""
+
+        table_name = "external_identities"
+        indexes = ((("source", "external_trace_id", "external_span_id"), True),)
+
+
+class SpanLinkRecord(BaseModel):
+    """An explicit non-parent relationship between operations."""
+
+    span_key = pw.TextField(index=True)
+    linked_span_key = pw.TextField()
+
+    class Meta:
+        """Links are idempotent even when their targets arrive later."""
+
+        table_name = "span_links"
+        indexes = ((("span_key", "linked_span_key"), True),)
+
+
+class WatchCheckpointRecord(BaseModel):
+    """Only committed complete source lines advance a watcher's checkpoint."""
+
+    source_key = pw.TextField(unique=True)
+    generation = pw.TextField()
+    byte_offset = pw.IntegerField()
+    parser_revision = pw.IntegerField()
+    state_json = pw.TextField()
+
+    class Meta:
+        """Paths are hashed; private paths never enter exported trace metadata."""
+
+        table_name = "watch_checkpoints"
+
+
 # Creation order: parents before children, so a fresh file can be built in
 # one pass.
 MODELS = [
@@ -242,6 +355,11 @@ MODELS = [
     RunRecord,
     CheckRecord,
     SpanRecord,
+    ImportedSessionRecord,
+    ImportedUsageRecord,
+    ExternalIdentityRecord,
+    SpanLinkRecord,
+    WatchCheckpointRecord,
 ]
 
 

@@ -30,12 +30,9 @@ uv run pytest -q --cov --cov-fail-under=85
 
 ## Provider adapters
 
-OpenAI `chat.completions` and the Responses API have adapters — which also
-covers OpenRouter and every other OpenAI-compatible endpoint. Each of these is
-one `ProviderAdapter` subclass plus one `Scenario` in `tests/test_adapters.py`:
+OpenAI Chat Completions, Responses, and Anthropic Messages have adapters.
+OpenAI-compatible endpoints such as OpenRouter use the OpenAI adapters. Remaining work:
 
-- **Anthropic** (`client.messages.create`): separate `system` field,
-  `content[0].text`, `input_tokens` / `output_tokens`, event-stream deltas.
 - **LiteLLM**: a module function, not a client — `wrap(litellm.completion)`
   returns a wrapped function the user rebinds.
 

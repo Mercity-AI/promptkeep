@@ -564,3 +564,132 @@ uv run ruff format src tests examples && uv run ruff check src tests examples
 ```
 
 Supported on Python 3.11–3.14. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+
+## Anthropic agents
+
+Install `pip install 'promptkeep[anthropic]'`. Stable SDK releases 1.17.0 and
+2.6.0 are tested with sync and async clients:
+
+```python
+from anthropic import Anthropic
+import promptkeep
+
+client = promptkeep.wrap(Anthropic())
+with promptkeep.agent("assistant"):
+    response = client.messages.create(
+        model="YOUR_MODEL", max_tokens=500,
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+promptkeep.flush()
+```
+
+`create(stream=True)`, `.stream()` text/final-message helpers, `.parse()`, and
+raw-response helpers are supported. Raw bodies are recorded when parsed; closing
+an unread body records incomplete output. Checks, redaction, cache accounting,
+and `tool(..., call_id=block.id)` work across these paths. Beta APIs, batch APIs,
+automatic tool runners, and cloud-specific clients remain outside the supported
+surface. Wrapping Anthropic does not instrument the separate Claude Code process.
+See [`examples/anthropic_trace.py`](examples/anthropic_trace.py).
+
+## Saved Codex and Claude Code sessions
+
+```bash
+pip install 'promptkeep[codex]'  # needed only for .jsonl.zst decompression
+promptkeep import codex rollout.jsonl --db history.db
+promptkeep import claude-code transcript.jsonl --db history.db
+promptkeep traces --db history.db
+promptkeep trace TRACE_KEY --db history.db --json
+```
+
+Python entry points are `promptkeep.importers.import_codex()` and
+`import_claude_code()`, accepting `path`, optional `db_path`, and `strict=False`.
+Imports are synchronous, redacted before staging, and atomic per session. Reimporting
+or renaming a file does not duplicate a session. A failed replacement preserves the
+previous snapshot. Imports bypass live sampling and reject disabled/off tracking.
+Retention uses original activity, so old imported sessions can expire normally.
+
+An explicitly identified model response becomes a model span even when its request
+start is absent. Unknown start/end/duration remain `None`; observation time is stored
+separately. No provider calls are invented from ordinary assistant text. Claude tool
+errors and message ancestry are preserved, including branches and compaction markers.
+Hidden reasoning, environment snapshots, and unrelated private metadata are excluded.
+
+`history.imported_session(trace_key)` exposes provenance, diagnostics, usage records,
+response totals, and unattributed usage. Cumulative snapshots are never added to
+response totals. The source summary may overlap linked model-span metrics; do not add
+those two views together. See [`examples/import_codex.py`](examples/import_codex.py).
+
+The two reviewed Hugging Face formats have explicit local-file adapters:
+
+```bash
+promptkeep import dataset downloaded.jsonl \
+  --dataset build-small-hackathon/hackathon-advisor-codex-traces --db history.db
+```
+
+`ultralazr/claude-code-traces` is supported too. `import_dataset(path, dataset=...)`
+never downloads data. It reports per-session outcomes and failures, orders Codex
+records by their source index, and reuses native session identities.
+
+## Framework integrations
+
+```bash
+pip install 'promptkeep[openai-agents,langchain]'
+```
+
+```python
+import promptkeep
+
+with promptkeep.setup(
+    integrations=("openai_agents", "langchain"),
+    clients=(openai_client, anthropic_client),
+) as installation:
+    result = runnable.invoke(
+        inputs, config={"callbacks": installation.langchain_callbacks}
+    )
+    installation.flush(timeout=5)
+```
+
+OpenAI Agents SDK uses a tracing processor; LangChain uses native callbacks, also
+verified with LangGraph parallel branches and interruption/resume. External IDs
+establish parentage. Provider wrappers enrich framework model spans with prompt
+versions and checks rather than creating duplicate model spans. Existing application
+processors and exporters remain installed. Missing framework sensitive content is
+never recovered through another API.
+
+Setup enables only named integrations. Equivalent calls share one installation and
+lifetime. `shutdown(timeout=...)` restores only methods the installation still owns.
+LangChain requires the explicit callback configuration shown above; this does not
+instrument unrelated applications or agent processes.
+
+## OpenTelemetry
+
+Install `promptkeep[otel]`. To ingest spans from an existing Python OTel SDK, attach
+`PromptKeepSpanExporter` from `promptkeep.integrations.opentelemetry` to the
+application's own span processor. PromptKeep does not replace its tracer provider.
+
+For outbound export, pass an explicit `otlp_endpoint` to `setup()`, with
+`otlp_protocol="http/protobuf"` (default) or `"grpc"`. Export uses a bounded worker
+queue and the official OTel SDK transports. Payload content is excluded by default;
+`OTLPExport(..., include_content=True)` enables already-redacted content explicitly.
+Historical imports are not automatically exported. Unknown execution intervals are
+skipped, and PromptKeep-origin spans cannot loop back through the inbound bridge.
+Call `installation.otlp_export.replay(trace_keys, timeout=...)` to explicitly export
+selected stored traces; replay reads the selected database without changing it.
+Inbound OpenTelemetry spans stay excluded during replay. Export counters and
+skipped-timing counts are available on `installation.otlp_export`.
+
+## Watch explicitly selected session logs
+
+```bash
+promptkeep watch codex /path/to/sessions --db history.db
+promptkeep watch claude-code /path/to/transcripts --db history.db
+```
+
+`promptkeep.watch.Watcher(source, path, interval=1.0)` offers `start()`, `stop()`,
+`join(timeout)`, and context-manager usage. It reads appended complete JSONL records,
+checkpoints committed offsets, and resumes without duplicating operations. Partial
+last lines wait for completion. Rotation and truncation retain previously observed
+history. Failed commits do not advance the cursor. Only the selected paths are
+watched; compressed files remain saved-import inputs. Watchers never launch or
+modify the agents. Stop CLI watching with Ctrl-C or SIGTERM.

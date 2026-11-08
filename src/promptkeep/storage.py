@@ -13,11 +13,15 @@ loses telemetry, never a completion.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,11 +29,13 @@ from typing import Any
 import peewee as pw
 
 from . import controls, writer
-from .config import Settings, get_settings
+from .config import Settings, _destination, get_settings
 from .migrations import migrate
 from .models import (
     CheckRecord,
     ConversationRecord,
+    ImportedSessionRecord,
+    ImportedUsageRecord,
     PromptRecord,
     PromptVersionRecord,
     RunRecord,
@@ -44,7 +50,7 @@ logger = logging.getLogger("promptkeep")
 
 # --- the database binding -------------------------------------------------------
 
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 _current_path: str | None = None
 
 # WAL for concurrent reader/writer access; busy_timeout so contending
@@ -54,6 +60,71 @@ _PRAGMAS = {
     "foreign_keys": 1,
     "busy_timeout": 5000,
 }
+
+
+class _Database(pw.SqliteDatabase):
+    """Close failed connection attempts and retry transient WAL initialization races."""
+
+    def _add_conn_hooks(self, connection):
+        """Peewee cannot close a connection whose initialization hook raised."""
+        try:
+            return super()._add_conn_hooks(connection)
+        except BaseException:
+            connection.close()
+            raise
+
+    def _connect(self):
+        """A fresh-file WAL switch may fail immediately despite busy_timeout."""
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                return super()._connect()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+
+
+def _open_database(path):
+    """Serialize initial WAL/schema setup for all package-owned connections."""
+    database = _Database(str(path), pragmas=_PRAGMAS, timeout=5)
+    with _db_lock:
+        try:
+            database.connect()
+            with database.atomic("IMMEDIATE"):
+                migrate(database)
+        except BaseException:
+            if not database.is_closed():
+                database.close()
+            raise
+    return database
+
+
+@contextmanager
+def connection_context(path: str | None = None):
+    """Pin one operation's destination and close only its own connection."""
+    token = _destination.set(path or _destination.get() or str(get_settings().db_path))
+    previous = db_proxy.obj
+    was_open = previous is not None and not previous.is_closed()
+    try:
+        yield
+    finally:
+        current = db_proxy.obj
+        if current is not None and (current is not previous or not was_open):
+            current.close()
+        _destination.reset(token)
+
+
+def connection_scope(function):
+    """Bound synchronous storage/read work without closing outer-owned resources."""
+
+    @functools.wraps(function)
+    def scoped(*args, **kwargs):
+        """Release connections on the same thread, including exception paths."""
+        with connection_context():
+            return function(*args, **kwargs)
+
+    return scoped
 
 
 def get_db() -> pw.DatabaseProxy | None:
@@ -71,16 +142,14 @@ def get_db() -> pw.DatabaseProxy | None:
 
     # Double-checked locking: the fast path skips the lock once bound.
     global _current_path
-    if _current_path != path:
+    if db_proxy.obj is None or db_proxy.obj.database != path:
         with _db_lock:
-            if _current_path != path:
+            if db_proxy.obj is None or db_proxy.obj.database != path:
                 parent = Path(path).parent
                 if parent and not parent.exists():
                     parent.mkdir(parents=True, exist_ok=True)
-                database = pw.SqliteDatabase(path, pragmas=_PRAGMAS, timeout=5)
+                database = _open_database(path)
                 db_proxy.initialize(database)
-                database.connect(reuse_if_open=True)
-                migrate(database)
                 _current_path = path
     return db_proxy
 
@@ -99,12 +168,12 @@ def reset_caches() -> None:
         _turn_counters.clear()
         _response_index.clear()
     with _db_lock:
-        if _current_path is not None:
+        if db_proxy.obj is not None:
             try:
                 db_proxy.close()
-            except Exception:
-                pass
-            _current_path = None
+            finally:
+                db_proxy.initialize(None)
+        _current_path = None
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -130,6 +199,7 @@ _registration_cache: dict[tuple[str, str, str], tuple[int, int]] = {}
 _reg_lock = threading.Lock()
 
 
+@connection_scope
 def register_version(
     name: str,
     template: str,
@@ -221,6 +291,7 @@ def _register(
     raise RuntimeError(f"could not register a version for prompt {name!r} after retries")
 
 
+@connection_scope
 def version_rows(name: str) -> list[dict[str, Any]]:
     """A prompt's stored versions, oldest first, as plain rows (id included).
 
@@ -263,6 +334,7 @@ _turn_counters: dict[tuple[str, int], int] = {}
 _convo_lock = threading.Lock()
 
 
+@connection_scope
 def get_or_create_conversation(
     external_id: str,
     title: str | None = None,
@@ -309,6 +381,7 @@ def get_or_create_conversation(
         return None
 
 
+@connection_scope
 def reserve_turn_index(conversation_id: int) -> int:
     """Claim this conversation's next turn number (0 for its first turn).
 
@@ -390,6 +463,7 @@ def _recording() -> bool:
     return settings.enabled and settings.write_mode != "off" and get_db() is not None
 
 
+@connection_scope
 def predecessor(previous_response_id: str) -> str | None:
     """The key of the run that produced ``previous_response_id`` — the parent
     of a call that continues it — or None when promptkeep never recorded that
@@ -401,6 +475,7 @@ def predecessor(previous_response_id: str) -> str | None:
     return None if found is None else found[1]
 
 
+@connection_scope
 def chain_conversation(previous_response_id: str) -> int | None:
     """The conversation a call continuing ``previous_response_id`` belongs in.
 
@@ -461,6 +536,7 @@ def chain_conversation(previous_response_id: str) -> int | None:
 # --- runs and verdicts ------------------------------------------------------------
 
 
+@connection_scope
 def record_run(
     *,
     run_key: str | None = None,
@@ -487,6 +563,7 @@ def record_run(
     span_key: str | None = None,
     cohort: bool | None = None,
     checks: list[dict[str, Any]] | None = None,
+    usage_details: dict[str, Any] | None = None,
 ) -> str | None:
     """Record one run row, honoring the configured write_mode. Never raises.
 
@@ -548,6 +625,7 @@ def record_run(
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "cost_usd": cost_usd,
+            "usage_details": _json_or_none(usage_details),
             "latency_ms": latency_ms,
             "status": status,
             "error": error,
@@ -595,6 +673,7 @@ def record_run(
         return None
 
 
+@connection_scope
 def record_check(run_key: str | None, check_row: dict[str, Any]) -> None:
     """Record one late verdict — an async post-check that finished after its
     run was recorded — honoring the configured write_mode. Never raises.
@@ -632,6 +711,7 @@ def record_check(run_key: str | None, check_row: dict[str, Any]) -> None:
         logger.warning("promptkeep: failed to record check", exc_info=True)
 
 
+@connection_scope
 def record_span(
     *,
     span_key: str,
@@ -745,6 +825,7 @@ def _sweep(retention_days: float) -> None:
         logger.warning("promptkeep: retention sweep failed", exc_info=True)
 
 
+@connection_scope
 def prune(retention_days: float) -> int:
     """Delete recorded history older than ``retention_days``; return how many
     runs went.
@@ -852,9 +933,11 @@ def _expire_traces(cutoff: str) -> int:
                 trace_key: timestamp
                 for trace_key, timestamp in SpanRecord.select(
                     SpanRecord.trace_key,
-                    pw.fn.MAX(pw.fn.COALESCE(SpanRecord.ended_at, SpanRecord.started_at)).alias(
-                        "last"
-                    ),
+                    pw.fn.MAX(
+                        pw.fn.COALESCE(
+                            SpanRecord.ended_at, SpanRecord.started_at, SpanRecord.observed_at
+                        )
+                    ).alias("last"),
                 )
                 .where(SpanRecord.trace_key.in_(trace_keys))
                 .group_by(SpanRecord.trace_key)
@@ -898,6 +981,21 @@ def _expire_traces(cutoff: str) -> int:
                 chunk = run_ids[start : start + _PRUNE_CHUNK]
                 CheckRecord.delete().where(CheckRecord.run.in_(chunk)).execute()
                 deleted += RunRecord.delete().where(RunRecord.id.in_(chunk)).execute()
+            imported_ids = ImportedSessionRecord.select(ImportedSessionRecord.id).where(
+                ImportedSessionRecord.trace_key.in_(expired)
+            )
+            ImportedUsageRecord.delete().where(
+                ImportedUsageRecord.session.in_(imported_ids)
+            ).execute()
+            ImportedSessionRecord.delete().where(
+                ImportedSessionRecord.trace_key.in_(expired)
+            ).execute()
+            for table, column in (("external_identities", "span_key"), ("span_links", "span_key")):
+                db_proxy.execute_sql(
+                    f"DELETE FROM {table} WHERE {column} IN "
+                    f"(SELECT span_key FROM spans WHERE trace_key IN ({','.join('?' for _ in expired)}))",
+                    expired,
+                )
             SpanRecord.delete().where(SpanRecord.trace_key.in_(expired)).execute()
     return deleted
 
@@ -934,12 +1032,29 @@ def write_batch(items: list[dict[str, Any]]) -> None:
     retention sweep is not part of that unit: it runs after the batch, in
     transactions of its own (see ``prune``).
     """
-    if not items or get_db() is None:
+    if not items:
+        return
+    groups = []
+    for item in items:
+        path = item.get("_db_path", str(get_settings().db_path))
+        row = {k: v for k, v in item.items() if k != "_db_path"}
+        if groups and groups[-1][0] == path:
+            groups[-1][1].append(row)
+        else:
+            groups.append((path, [row]))
+    for path, rows in groups:
+        with connection_context(path):
+            _write_destination_batch(rows)
+
+
+def _write_destination_batch(items: list[dict[str, Any]]) -> None:
+    """Persist one pinned destination, retaining IMMEDIATE batch semantics."""
+    if get_db() is None:
         return
     sweeps = [item for item in items if item.get("_kind") == "prune"]
     rows = [item for item in items if item.get("_kind") != "prune"]
     if rows:
-        with db_proxy.atomic("IMMEDIATE"):
+        with notification_transaction(db_proxy):
             for item in rows:
                 _persist(item)
     for sweep in sweeps:
@@ -955,7 +1070,9 @@ def _persist(item: dict[str, Any]) -> None:
     marker tells the shapes apart — everything else in the dict is column data.
     """
     kind = item.get("_kind")
-    if kind == "check":
+    if kind == "event":
+        _insert_event(item)
+    elif kind == "check":
         _insert_check(item)
     elif kind == "adopt":
         _adopt_run(item)
@@ -1045,13 +1162,22 @@ def _insert_span(item: dict[str, Any]) -> None:
     existing = SpanRecord.get_or_none(span_key=row["span_key"])
     if existing is None:
         SpanRecord.create(**row)
+        _notify_span(row)
         return
     if existing.status != "running" and row.get("status") == "running":
+        enrich = {
+            k: v
+            for k, v in row.items()
+            if k not in ("span_key", "status") and getattr(existing, k) is None and v is not None
+        }
+        if enrich:
+            SpanRecord.update(**enrich).where(SpanRecord.span_key == row["span_key"]).execute()
         return
     fields = {key: value for key, value in row.items() if key != "span_key"}
     if fields.get("input_json") is None:
-        fields.pop("input_json")
+        fields.pop("input_json", None)
     SpanRecord.update(**fields).where(SpanRecord.span_key == row["span_key"]).execute()
+    _notify_span(SpanRecord.get(SpanRecord.span_key == row["span_key"]).__data__)
 
 
 def _adopt_run(item: dict[str, Any]) -> None:
@@ -1077,3 +1203,456 @@ def _drain_to_db(items: list[dict[str, Any]]) -> None:
 # The writer is a generic queue that knows nothing about SQLite; this is the
 # one place that tells it where batches go. No I/O and no thread at import.
 writer.set_sink(_drain_to_db)
+
+
+class _ImportRedactionError(RuntimeError):
+    """Explicit import redaction failed; abort rather than storing plaintext."""
+
+
+class _ImportStage:
+    """Bounded-payload staging with redaction before any temporary disk write."""
+
+    def __init__(self, path: str, settings: Settings) -> None:
+        """Use a private temporary database, never the global model proxy."""
+        self.db = _Database(path)
+        self.db.connect()
+        self.settings = settings
+        self.dirty = {"spans": set(), "runs": set(), "usage": set()}
+        self.db.execute_sql("CREATE TABLE spans (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        self.db.execute_sql("CREATE TABLE usage (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        self.db.execute_sql("CREATE TABLE runs (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+
+    def close(self) -> None:
+        """Release the temporary database before its directory is removed."""
+        self.db.close()
+
+    def get(self, kind: str, key: str) -> dict | None:
+        """Read one staged operation; table names are internal constants."""
+        row = self.db.execute_sql(f"SELECT data FROM {kind} WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, kind: str, key: str, values: dict) -> None:
+        """Merge one normalized record, retaining previously observed payloads."""
+        existing = self.get(kind, key) or {}
+        # Payloads are serialized and redacted before they reach staging.
+        values = dict(values)
+        if kind == "spans":
+            for field in ("input_json", "output_json", "error"):
+                if field in values and values[field] is not None:
+                    value = values[field]
+                    if field != "error":
+                        value = json.dumps(value, ensure_ascii=False, default=str)
+                    if self.settings.redact is not None:
+                        try:
+                            value = self.settings.redact(value)
+                            if not isinstance(value, str):
+                                raise TypeError("redact must return a string")
+                        except Exception:
+                            raise _ImportRedactionError("Codex payload redaction failed") from None
+                    encoded = value.encode("utf-8")
+                    if len(encoded) > 64 * 1024:
+                        value = encoded[: 64 * 1024].decode("utf-8", errors="ignore")
+                        value += "\n[promptkeep truncated]"
+                    values[field] = value
+        merged = {**existing, **values}
+        if merged == existing:
+            return
+        existing = merged
+        self.dirty[kind].add(key)
+        self.db.execute_sql(
+            f"INSERT INTO {kind}(key,data) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+            (key, json.dumps(existing)),
+        )
+
+    def append_text(self, key: str, part_id: str, text: str) -> None:
+        """Assemble immutable transcript parts, redacting each part only once."""
+        row = self.get("spans", key)
+        parts = json.loads(row.get("content_parts_json") or "{}")
+        fingerprint = hashlib.sha256(text.encode()).hexdigest()
+        if part_id in parts and parts[part_id][0] == fingerprint:
+            return
+        value = text
+        if self.settings.redact:
+            try:
+                value = self.settings.redact(value)
+                if not isinstance(value, str):
+                    raise TypeError("redact must return a string")
+            except Exception:
+                raise _ImportRedactionError("Claude text redaction failed") from None
+        parts[part_id] = (fingerprint, value)
+        budget = 65536
+        truncated = False
+        for identity, (digest, content) in list(parts.items()):
+            encoded_part = content.encode("utf-8")
+            if len(encoded_part) > budget:
+                content = encoded_part[:budget].decode("utf-8", errors="ignore")
+                truncated = True
+            parts[identity] = (digest, content)
+            budget -= len(content.encode("utf-8"))
+        combined = "".join(part[1] for part in parts.values())
+        if truncated:
+            combined += "\n[promptkeep truncated]"
+        encoded = combined.encode("utf-8")
+        if len(encoded) > 65536:
+            combined = encoded[:65536].decode("utf-8", errors="ignore") + "\n[promptkeep truncated]"
+        row.update(content_parts_json=json.dumps(parts), output_json=json.dumps(combined))
+        self.db.execute_sql("UPDATE spans SET data=? WHERE key=?", (json.dumps(row), key))
+        self.dirty["spans"].add(key)
+
+    def rows(self, kind: str):
+        """Stream staged normalized rows without materializing their payloads."""
+        cursor = self.db.execute_sql(f"SELECT key,data FROM {kind} ORDER BY key")
+        for key, data in cursor:
+            yield key, json.loads(data)
+
+
+def persist_import(
+    stage: _ImportStage,
+    *,
+    db_path: str,
+    session_id: str,
+    trace_key: str,
+    digest: str,
+    revision: int,
+    summary: dict,
+    source: str = "codex",
+    checkpoint: dict | None = None,
+) -> str:
+    """Atomically replace one import on an independent, pinned connection.
+
+    Explicit archival writes raise and bypass the lossy live-telemetry queue.
+    Models remain bound to the application's database throughout the import.
+    """
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    database = _open_database(path)
+    try:
+        # Migration and import both use the same concrete destination.
+        with database.atomic("IMMEDIATE"):
+            migrate(database)
+            existing = database.execute_sql(
+                "SELECT id,source_digest,parser_revision,trace_key FROM imported_sessions "
+                "WHERE source=? AND external_session_id=?",
+                (source, session_id),
+            ).fetchone()
+            if existing and existing[1:3] == (digest, revision):
+                return "unchanged"
+            if existing:
+                database.execute_sql(
+                    "DELETE FROM imported_usage WHERE session_id=?", (existing[0],)
+                )
+                # Only imported rows with this reserved trace identity are owned here.
+                owned_trace = existing[3]
+                keys = "SELECT span_key FROM spans WHERE trace_key=?"
+                database.execute_sql(
+                    f"DELETE FROM checks WHERE run_id IN (SELECT id FROM runs WHERE span_key IN ({keys}))",
+                    (owned_trace,),
+                )
+                for table in ("span_links", "external_identities"):
+                    database.execute_sql(
+                        f"DELETE FROM {table} WHERE span_key IN ({keys})", (owned_trace,)
+                    )
+                database.execute_sql(f"DELETE FROM runs WHERE span_key IN ({keys})", (owned_trace,))
+                database.execute_sql("DELETE FROM spans WHERE trace_key=?", (owned_trace,))
+                database.execute_sql("DELETE FROM imported_sessions WHERE id=?", (existing[0],))
+            cursor = database.execute_sql(
+                "INSERT INTO imported_sessions(source,external_session_id,trace_key,source_digest,"
+                "parser_revision,imported_at,summary_json) VALUES (?,?,?,?,?,?,?)",
+                (source, session_id, trace_key, digest, revision, _utcnow(), json.dumps(summary)),
+            )
+            imported_id = cursor.lastrowid
+            for _, row in stage.rows("spans"):
+                links = row.get("_link_keys", ())
+                for linked in links:
+                    database.execute_sql(
+                        "INSERT INTO span_links(span_key,linked_span_key) VALUES (?,?) ON CONFLICT DO NOTHING",
+                        (row["span_key"], linked),
+                    )
+                row = {k: v for k, v in row.items() if not k.startswith("_")}
+                columns = list(row)
+                database.execute_sql(
+                    f"INSERT INTO spans ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    tuple(row.values()),
+                )
+            for _, row in stage.rows("runs"):
+                columns = list(row)
+                database.execute_sql(
+                    f"INSERT INTO runs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    tuple(row.values()),
+                )
+            if checkpoint is not None:
+                _save_checkpoint(database, checkpoint)
+            for key, row in stage.rows("usage"):
+                database.execute_sql(
+                    "INSERT INTO imported_usage(usage_key,session_id,turn_id,response_id,span_key,"
+                    "scope,observed_at,usage_json) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        f"{trace_key}:{key}",
+                        imported_id,
+                        row.get("turn_id"),
+                        row.get("response_id"),
+                        row.get("span_key"),
+                        row["scope"],
+                        row.get("observed_at"),
+                        json.dumps(row["usage"]),
+                    ),
+                )
+        return "replaced" if existing else "created"
+    finally:
+        if not database.is_closed():
+            database.close()
+
+
+_notifications = threading.local()
+_span_observers: list = []
+_observer_lock = threading.RLock()
+
+
+def observe_spans(callback):
+    """Subscribe to completed, redacted live spans; return an unsubscribe callback."""
+    with _observer_lock:
+        _span_observers.append(callback)
+
+    def unsubscribe():
+        """Remove only this installation's observer, idempotently."""
+        with _observer_lock:
+            if callback in _span_observers:
+                _span_observers.remove(callback)
+
+    return unsubscribe
+
+
+@contextmanager
+def notification_transaction(database):
+    """Publish committed observations only; rollback discards pending exports."""
+    outer = getattr(_notifications, "buffer", None)
+    if outer is not None:
+        start = len(outer)
+        try:
+            with database.atomic("IMMEDIATE"):
+                yield
+        except BaseException:
+            del outer[start:]
+            raise
+        return
+    _notifications.buffer = []
+    try:
+        with database.atomic("IMMEDIATE"):
+            yield
+        ready = _notifications.buffer
+    except BaseException:
+        raise
+    else:
+        _notifications.buffer = None
+        for row in ready:
+            _notify_span(row)
+    finally:
+        _notifications.buffer = None
+
+
+def _notify_span(row: dict) -> None:
+    """Observers enqueue exports only; their failures cannot break persistence."""
+    if row.get("status") == "running":
+        return
+    buffer = getattr(_notifications, "buffer", None)
+    if buffer is not None:
+        buffer.append(dict(row))
+        return
+    with _observer_lock:
+        callbacks = tuple(_span_observers)
+    for callback in callbacks:
+        try:
+            callback(dict(row))
+        except Exception:
+            logger.warning("promptkeep: span observer failed", exc_info=True)
+
+
+def _insert_event(item: dict) -> None:
+    """Upsert one source-scoped event and its model run exactly once."""
+    span = item["span"]
+    source, trace_id, external_id = item["identity"]
+    db_proxy.execute_sql(
+        "INSERT INTO external_identities(source,external_trace_id,external_span_id,span_key) "
+        "VALUES (?,?,?,?) ON CONFLICT(source,external_trace_id,external_span_id) DO NOTHING",
+        (source, trace_id, external_id, span["span_key"]),
+    )
+    for linked in item.get("links", ()):
+        db_proxy.execute_sql(
+            "INSERT INTO span_links(span_key,linked_span_key) VALUES (?,?) ON CONFLICT DO NOTHING",
+            (span["span_key"], linked),
+        )
+    run = item.get("run")
+    if run is not None:
+        # Provider wrappers queue their enriched rows before framework end events.
+        existing = RunRecord.select().where(RunRecord.span_key == span["span_key"]).exists()
+        if existing:
+            for column in (
+                "model",
+                "response_id",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "cost_usd",
+                "usage_details",
+            ):
+                if run.get(column) is not None:
+                    db_proxy.execute_sql(
+                        f"UPDATE runs SET {column}=? WHERE span_key=? AND {column} IS NULL",
+                        (run[column], span["span_key"]),
+                    )
+        else:
+            columns = list(run)
+            db_proxy.execute_sql(
+                f"INSERT INTO runs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+                "ON CONFLICT(run_key) DO NOTHING",
+                tuple(run.values()),
+            )
+    _insert_span(span)
+
+
+def _save_checkpoint(database, checkpoint: dict) -> None:
+    """Commit a watcher cursor in the same transaction as its ingested events."""
+    database.execute_sql(
+        "INSERT INTO watch_checkpoints(source_key,generation,byte_offset,parser_revision,state_json) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET generation=excluded.generation,"
+        "byte_offset=excluded.byte_offset,parser_revision=excluded.parser_revision,state_json=excluded.state_json",
+        (
+            checkpoint["source_key"],
+            checkpoint["generation"],
+            checkpoint["byte_offset"],
+            checkpoint["parser_revision"],
+            json.dumps(checkpoint["state"]),
+        ),
+    )
+
+
+def watch_snapshot(db_path: str, source_key: str) -> tuple[dict | None, dict]:
+    """Load committed parser state and redacted owned rows on a concrete connection."""
+    database = _open_database(db_path)
+    try:
+        with database.atomic("IMMEDIATE"):
+            migrate(database)
+        row = database.execute_sql(
+            "SELECT generation,byte_offset,parser_revision,state_json "
+            "FROM watch_checkpoints WHERE source_key=?",
+            (source_key,),
+        ).fetchone()
+        if row is None:
+            return None, {}
+        checkpoint = dict(
+            generation=row[0], byte_offset=row[1], parser_revision=row[2], state=json.loads(row[3])
+        )
+        trace = checkpoint["state"].get("trace")
+        data = {}
+        for table, sql, parameters in (
+            ("spans", "SELECT * FROM spans WHERE trace_key=?", (trace,)),
+            (
+                "runs",
+                "SELECT * FROM runs WHERE span_key IN (SELECT span_key FROM spans WHERE trace_key=?)",
+                (trace,),
+            ),
+        ):
+            cursor = database.execute_sql(sql, parameters)
+            names = [column[0] for column in cursor.description]
+            data[table] = [{k: v for k, v in zip(names, values) if k != "id"} for values in cursor]
+        cursor = database.execute_sql(
+            "SELECT usage_key,turn_id,response_id,span_key,scope,observed_at,usage_json "
+            "FROM imported_usage WHERE session_id IN (SELECT id FROM imported_sessions WHERE trace_key=?)",
+            (trace,),
+        )
+        data["usage"] = [
+            (
+                key.split(":", 1)[1],
+                dict(
+                    turn_id=turn,
+                    response_id=response,
+                    span_key=span,
+                    scope=scope,
+                    observed_at=observed,
+                    usage=json.loads(usage),
+                ),
+            )
+            for key, turn, response, span, scope, observed, usage in cursor
+        ]
+        return checkpoint, data
+    finally:
+        database.close()
+
+
+def persist_watch(
+    stage: _ImportStage,
+    *,
+    db_path: str,
+    source: str,
+    session_id: str,
+    trace_key: str,
+    summary: dict,
+    checkpoint: dict,
+) -> None:
+    """Upsert changed observations and their cursor atomically; never delete on rotation."""
+    database = _open_database(db_path)
+    try:
+        with database.atomic("IMMEDIATE"):
+            migrate(database)
+            database.execute_sql(
+                "INSERT INTO imported_sessions(source,external_session_id,trace_key,source_digest,"
+                "parser_revision,imported_at,summary_json) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(source,external_session_id) DO UPDATE SET summary_json=excluded.summary_json,"
+                "imported_at=excluded.imported_at,source_digest=excluded.source_digest",
+                (
+                    source,
+                    session_id,
+                    trace_key,
+                    "watch:" + str(checkpoint["byte_offset"]),
+                    checkpoint["parser_revision"],
+                    _utcnow(),
+                    json.dumps(summary),
+                ),
+            )
+            imported_id = database.execute_sql(
+                "SELECT id FROM imported_sessions WHERE source=? AND external_session_id=?",
+                (source, session_id),
+            ).fetchone()[0]
+            for kind, key_column in (("spans", "span_key"), ("runs", "run_key")):
+                for key in stage.dirty[kind]:
+                    staged = stage.get(kind, key)
+                    for linked in staged.get("_link_keys", ()):
+                        database.execute_sql(
+                            "INSERT INTO span_links(span_key,linked_span_key) VALUES (?,?) ON CONFLICT DO NOTHING",
+                            (key, linked),
+                        )
+                    row = {k: v for k, v in staged.items() if not k.startswith("_")}
+                    columns = list(row)
+                    assignments = ",".join(f"{k}=excluded.{k}" for k in columns if k != key_column)
+                    database.execute_sql(
+                        f"INSERT INTO {kind} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+                        f"ON CONFLICT({key_column}) DO UPDATE SET {assignments}",
+                        tuple(row.values()),
+                    )
+            for key in stage.dirty["usage"]:
+                row = stage.get("usage", key)
+                if row is None:
+                    database.execute_sql(
+                        "DELETE FROM imported_usage WHERE usage_key=?", (trace_key + ":" + key,)
+                    )
+                    continue
+                database.execute_sql(
+                    "INSERT INTO imported_usage(usage_key,session_id,turn_id,response_id,span_key,scope,observed_at,usage_json) "
+                    "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(usage_key) DO UPDATE SET usage_json=excluded.usage_json,observed_at=excluded.observed_at",
+                    (
+                        trace_key + ":" + key,
+                        imported_id,
+                        row.get("turn_id"),
+                        row.get("response_id"),
+                        row.get("span_key"),
+                        row["scope"],
+                        row.get("observed_at"),
+                        json.dumps(row["usage"]),
+                    ),
+                )
+            _save_checkpoint(database, checkpoint)
+        for keys in stage.dirty.values():
+            keys.clear()
+    finally:
+        database.close()

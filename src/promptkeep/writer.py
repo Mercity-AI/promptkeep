@@ -74,6 +74,7 @@ def submit(item: dict[str, Any]) -> None:
     """
     global _dropped_total, _last_drop_log
     try:
+        item = {"_db_path": str(get_settings().db_path), **item}
         q = _ensure_started()
         try:
             q.put_nowait(item)
@@ -144,6 +145,7 @@ def reset() -> None:
     global _queue, _thread, _dropped_total
     with _lock:
         q = _queue
+        retiring = _thread
         if q is None:
             return
         while True:
@@ -155,6 +157,8 @@ def reset() -> None:
         _queue = None
         _thread = None
         _dropped_total = 0
+    if retiring is not None and retiring is not threading.current_thread():
+        retiring.join(timeout=6)
 
 
 def _ensure_started() -> queue.Queue[dict]:
