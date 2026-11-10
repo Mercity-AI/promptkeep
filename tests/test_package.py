@@ -64,6 +64,7 @@ def test_the_public_api_changes_only_on_purpose():
         "AgentTrace",
         "CodexTrace",
         "ClaudeCodeTrace",
+        "OpenCodeTrace",
         "TraceEvent",
         "register_agent_trace",
         "import_trace",
