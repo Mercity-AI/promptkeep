@@ -29,12 +29,22 @@ import asyncio
 import functools
 import inspect
 import logging
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-from .. import storage
+from .. import controls, storage
+from ..agents import (
+    _ended_at,
+    attached,
+    finalize_model_span,
+    register_tool_calls,
+)
+from ..agents import (
+    current as current_agent,
+)
 from ..checks import (
     Check,
     CheckContext,
@@ -48,7 +58,12 @@ from ..checks import (
 )
 from ..config import get_settings
 from ..conversation import current as current_conversation
+from ..events import Event
+from ..events import current as external_current
+from ..events import key as event_key
+from ..ingestion import record as record_event
 from ..models import new_run_key
+from ..normalization import cohort_for
 from ..tracking import record_prompt_run
 from .base import ProviderAdapter, Request, ResponseFields, Target
 
@@ -75,17 +90,15 @@ def instrument(client: Any, adapters: Iterable[ProviderAdapter]) -> int:
     """
     found = 0
     for adapter in adapters:
-        target = adapter.locate(client)
-        if target is None:
-            continue
-        found += 1
-        _instrument_target(target, adapter)
+        for target in adapter.locate_targets(client):
+            found += 1
+            _instrument_target(target, adapter)
     return found
 
 
 def is_instrumented(target: Target) -> bool:
     """Whether a located surface already carries the tracking replacement."""
-    return bool(getattr(target.owner, "_pm_instrumented", False))
+    return bool(getattr(getattr(target.owner, target.attribute), "_pm_instrumented", False))
 
 
 def _instrument_target(target: Target, adapter: ProviderAdapter) -> None:
@@ -102,10 +115,17 @@ def _instrument_target(target: Target, adapter: ProviderAdapter) -> None:
     if is_instrumented(target):
         return
     original = getattr(target.owner, target.attribute)
-    if inspect.iscoroutinefunction(inspect.unwrap(original)):
+    if target.invocation_style == "raw_call":
+        setattr(target.owner, target.attribute, adapter.wrap_raw_call(original))
+    elif target.invocation_style == "raw_manager":
+        setattr(target.owner, target.attribute, adapter.wrap_raw_manager(original))
+    elif target.invocation_style == "manager":
+        setattr(target.owner, target.attribute, adapter.wrap_manager(original))
+    elif inspect.iscoroutinefunction(inspect.unwrap(original)):
         setattr(target.owner, target.attribute, _make_async_create(original, adapter))
     else:
         setattr(target.owner, target.attribute, _make_sync_create(original, adapter))
+    getattr(target.owner, target.attribute)._pm_instrumented = True
     target.owner._pm_instrumented = True
 
 
@@ -133,6 +153,7 @@ def _make_sync_create(original: Any, adapter: ProviderAdapter) -> Any:
                 return blocked
 
         # The real call. A provider error is recorded, then re-raised untouched.
+        call.begin_model_call()
         start = time.perf_counter()
         try:
             response = original(*args, **call.request.kwargs)
@@ -146,6 +167,9 @@ def _make_sync_create(original: Any, adapter: ProviderAdapter) -> Any:
         if inspect.isawaitable(response):
             return _settle(call, response, start)
 
+        # Raw SDK responses are observed when parsed, without forcing body reads.
+        if adapter.is_deferred_response(response):
+            return adapter.defer_response(response, call, start, False)
         # Streams are recorded when they end; everything else right now.
         if call.streaming:
             return _wrap_stream(call, response, start, _SyncStreamProxy)
@@ -167,6 +191,7 @@ def _make_async_create(original: Any, adapter: ProviderAdapter) -> Any:
             return await original(*args, **kwargs)
 
         call = _Call(adapter, kwargs)
+        call.request = replace(call.request, asynchronous=True)
         if call.checked:
             await asyncio.to_thread(call.run_pre)
             # PromptBlocked raises straight through to_thread when on_block="raise".
@@ -176,6 +201,7 @@ def _make_async_create(original: Any, adapter: ProviderAdapter) -> Any:
 
         # A provider error raised before there is anything to await (argument
         # validation) is recorded like one raised while awaiting.
+        call.begin_model_call()
         start = time.perf_counter()
         try:
             pending = original(*args, **call.request.kwargs)
@@ -193,10 +219,17 @@ async def _settle(call: _Call, pending: Any, start: float) -> Any:
     the completed call (post-checks included)."""
     try:
         response = await pending
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            asyncio.to_thread(call._write, ResponseFields(), _ms(start), "cancelled", None)
+        )
+        raise
     except Exception as exc:
         await asyncio.to_thread(call.record_error, repr(exc), _ms(start))
         raise
 
+    if call.adapter.is_deferred_response(response):
+        return call.adapter.defer_response(response, call, start, True)
     if call.streaming:
         return _wrap_stream(call, response, start, _AsyncStreamProxy)
     fields = _read_response(call.adapter, response)
@@ -232,6 +265,20 @@ class _Call:
 
     def __init__(self, adapter: ProviderAdapter, kwargs: dict[str, Any]) -> None:
         """Parse the call and reserve everything it needs. No provider I/O."""
+        # Snapshot the ambient trace before anything can change it. A frame
+        # from another database, or one inherited across a fork, is not a
+        # valid association for this call; ordinary recording follows the
+        # current configuration in that case.
+        context = current_agent()
+        if context is not None and not attached(context):
+            context = None
+        self.db_path = str(get_settings().db_path)
+        self.agent_context = context
+        self.external_context = external_current()
+        self.model_span_key: str | None = None
+        self.model_started_at: str | None = None
+        self.model_sampled: bool | None = None
+
         # promptkeep's kwargs never reach the provider; take them off first.
         external_id, title, metadata = _resolve_conversation(kwargs)
         explicit_parent = _parent_key(kwargs.pop("promptkeep_parent", None))
@@ -259,13 +306,56 @@ class _Call:
         )
         self.checked = bool(self.pre_checks or self.post_checks)
 
+        # One model span per physical call. Its successful-span decision is
+        # the trace cohort, except when this call explicitly moves to another
+        # conversation: then that conversation's existing cohort applies and
+        # a dropped model link stays honestly missing from the trace. Its
+        # start is stamped by begin_model_call, around the provider call
+        # itself, not around parsing or the writes that follow.
+        if self.agent_context is not None:
+            self.model_span_key = new_run_key()
+            cohort = None
+            if (
+                self.conversation_id is None
+                or self.agent_context.trace.conversation_id is None
+                or self.conversation_id == self.agent_context.trace.conversation_id
+            ):
+                cohort = self.agent_context.trace.sampled
+            self.model_sampled = controls.keep_run(
+                get_settings(), {"status": "ok"}, self.conversation_id, cohort=cohort
+            )
+
+        self.external_model_id = new_run_key()
+        if self.external_context is not None:
+            self.model_sampled = cohort_for(self.external_context, get_settings())
+            self.model_span_key = (
+                self.external_context.span_key
+                if self.external_context.kind == "llm"
+                else event_key(
+                    self.external_context.source,
+                    self.external_context.trace_id,
+                    self.external_model_id,
+                )
+            )
+
+        # All prompt-version rows for this physical call share one cohort,
+        # including calls outside an explicit agent or framework trace.
+        if self.model_sampled is None and self.records:
+            self.model_sampled = controls.keep_run(
+                get_settings(), {"status": "ok"}, self.conversation_id
+            )
+
         # A call that records gets its identity now, and the handle that will
         # carry it back on the response. When several prompts ride one call
         # both refer to the first — the row the verdicts are filed under.
         tracked = self.request.tracked
         self.version: int | None = tracked[0][0].version if tracked else None
         self.run_key: str | None = new_run_key() if self.records else None
-        self.handle: RunHandle | None = RunHandle(None, self.version, []) if self.records else None
+        self.handle: RunHandle | None = (
+            RunHandle(None, self.version, [], span_key=self.model_span_key)
+            if self.records
+            else None
+        )
 
         # Filled in by run_pre() for a checked call.
         self.outcome = PreOutcome()
@@ -276,8 +366,15 @@ class _Call:
     @property
     def records(self) -> bool:
         """Whether this call produces a run row at all: a tracked Prompt, a
-        conversation turn, or a checked call (whose row anchors its verdicts)."""
-        return bool(self.request.tracked) or self.conversation_id is not None or self.checked
+        conversation turn, a checked call (whose row anchors its verdicts), or
+        a call inside an active trace."""
+        return (
+            bool(self.request.tracked)
+            or self.conversation_id is not None
+            or self.checked
+            or self.agent_context is not None
+            or self.external_context is not None
+        )
 
     @property
     def streaming(self) -> bool:
@@ -330,6 +427,7 @@ class _Call:
         blocked = self.outcome.blocked
         if blocked is None:
             return None
+        self.begin_model_call()
         run_key = self._write(ResponseFields(), 0, "blocked", f"blocked by check {blocked.name!r}")
         if get_settings().on_block == "raise":
             raise PromptBlocked(blocked.name, blocked.message)
@@ -339,7 +437,18 @@ class _Call:
         _attach_handle(stub, self.handle)
         return stub
 
-    # --- phase 2: the outcome -----------------------------------------------
+    # --- phase 2: the provider call -----------------------------------------
+
+    def begin_model_call(self) -> None:
+        """Stamp the provider interaction's start, just before the real call.
+
+        Called from the interceptors — and from the blocked path, where the
+        span is still recorded — so a model span's interval is the provider
+        call, not the pre-checks that ran before it or the writes after.
+        """
+        self.model_started_at = storage._utcnow()
+
+    # --- phase 3: the outcome -----------------------------------------------
 
     def record_error(
         self, error_repr: str, latency_ms: int, fields: ResponseFields | None = None
@@ -394,6 +503,7 @@ class _Call:
 
     # --- the write -------------------------------------------------------------
 
+    @storage.connection_scope
     def _write(
         self,
         fields: ResponseFields,
@@ -416,6 +526,30 @@ class _Call:
             return None
         verdicts = self.outcome.results if results is None else results
         check_rows = [r.to_row() for r in verdicts] or None
+
+        # If the configured database changed during the call, the run rows
+        # follow the new database but must not carry a key from the old
+        # trace. The model span itself is skipped by finalize_model_span.
+        context = self.agent_context
+        span_key = self.model_span_key
+        if str(get_settings().db_path) != self.db_path:
+            # Numeric IDs from the old file are never valid associations in another file.
+            self.conversation_id, self.turn_index = None, None
+            span_key = None
+        if context is not None and not attached(context):
+            span_key = None
+
+        # The provider's tool-call ids become resolvable for tool(call_id=...)
+        # in this same trace, so a tool span can parent under the model call
+        # that requested it.
+        if context is not None and span_key is not None and fields.tool_call_ids:
+            register_tool_calls(
+                fields.tool_call_ids,
+                span_key=span_key,
+                trace_key=context.trace_key,
+                db_path=context.trace.db_path,
+            )
+
         common: dict[str, Any] = dict(
             provider=self.adapter.provider,
             latency_ms=latency_ms,
@@ -426,18 +560,91 @@ class _Call:
             input_text=self.request.input_text,
             original_input_text=self.original_input_text,
             parent_run_key=self.parent_run_key,
+            span_key=span_key,
+            cohort=self.model_sampled
+            or any(row.get("status") != "ok" for row in (check_rows or ())),
             **_row_fields(self.request, fields),
         )
         tracked = self.request.tracked
         if not tracked:
-            return _record_bare(run_key=self.run_key, checks=check_rows, **common)
+            run_key = _record_bare(run_key=self.run_key, checks=check_rows, **common)
+            self._finalize_model_span(fields, status, error, check_rows, latency_ms)
+            return run_key
         (prompt_obj, variables, rendered), *rest = tracked
         run_key = record_prompt_run(
             prompt_obj, variables, rendered, run_key=self.run_key, checks=check_rows, **common
         )
         for prompt_obj, variables, rendered in rest:
             record_prompt_run(prompt_obj, variables, rendered, **common)
+        self._finalize_model_span(fields, status, error, check_rows, latency_ms)
         return run_key
+
+    def _finalize_model_span(
+        self,
+        fields: ResponseFields,
+        status: str,
+        error: str | None,
+        check_rows: list[dict[str, Any]] | None,
+        latency_ms: int,
+    ) -> None:
+        """Record this call's one model span after its run rows are written.
+
+        All four call paths converge on ``_write`` (non-streaming, streaming,
+        provider error, and blocked), so this is the only model-span
+        finalization site. It uses the context snapshotted at call start, not
+        the ambient context at stream completion, and the same latency the run
+        row carries so the span describes the provider call, not the writes
+        that followed it. The span is named after the model the call used.
+        """
+        if self.external_context is not None:
+            if self.external_context.kind != "llm" and self.model_started_at is not None:
+                owner = self.external_context
+                record_event(
+                    Event(
+                        owner.source,
+                        owner.trace_id,
+                        self.external_model_id,
+                        fields.model or self.request.kwargs.get("model") or "model",
+                        kind="llm",
+                        parent_id=owner.span_id,
+                        started_at=self.model_started_at,
+                        ended_at=_ended_at(self.model_started_at, latency_ms),
+                        status=status,
+                        error=error,
+                        provider=self.adapter.provider,
+                        model=fields.model,
+                        response_id=fields.response_id,
+                        usage={
+                            k: v
+                            for k, v in dict(
+                                input_tokens=fields.prompt_tokens,
+                                output_tokens=fields.completion_tokens,
+                                total_tokens=fields.total_tokens,
+                            ).items()
+                            if v is not None
+                        },
+                        cost_usd=fields.cost_usd,
+                        link_keys=(self.agent_context.span_key,) if self.agent_context else (),
+                    )
+                )
+            return
+        if (
+            self.agent_context is None
+            or self.model_span_key is None
+            or self.model_started_at is None
+        ):
+            return
+        finalize_model_span(
+            self.agent_context,
+            span_key=self.model_span_key,
+            name=fields.model or self.request.kwargs.get("model") or "model",
+            started_at=self.model_started_at,
+            duration_ms=latency_ms,
+            status=status,
+            error=error,
+            sampled=bool(self.model_sampled),
+            checks=check_rows,
+        )
 
 
 # --- request-side helpers ------------------------------------------------------------
@@ -602,6 +809,7 @@ def _row_fields(request: Request, fields: ResponseFields) -> dict[str, Any]:
         completion_tokens=fields.completion_tokens,
         total_tokens=fields.total_tokens,
         cost_usd=fields.cost_usd,
+        usage_details=fields.usage_details,
     )
 
 
@@ -652,6 +860,7 @@ class _StreamRecorder:
         self.start = start
         self.absorber = call.adapter.stream_absorber()
         self.recorded = False
+        self._lock = threading.Lock()
 
     def absorb(self, chunk: Any) -> None:
         """Fold one chunk in. An absorber bug loses telemetry, never a chunk."""
@@ -680,14 +889,20 @@ class _StreamRecorder:
         """Record exactly once: a failed run if the stream broke, otherwise the
         completed call (post-checks included) with the accumulated summary
         standing in for the response."""
-        if self.recorded:
-            return
-        self.recorded = True
-        fields = self.summary()
-        if error is not None:
-            self.call.record_error(error, _ms(self.start), fields)
-            return
-        self.call.finish(fields, fields, _ms(self.start), attach=False)
+        with self._lock:
+            if self.recorded:
+                return
+            self.recorded = True
+        try:
+            fields = self.summary()
+            if status != "ok":
+                key = self.call._write(fields, _ms(self.start), status, error)
+                if self.call.handle is not None:
+                    self.call.handle.run_key = key
+            else:
+                self.call.finish(fields, fields, _ms(self.start), attach=False)
+        except Exception:
+            logger.warning("promptkeep: failed to finalize stream", exc_info=True)
 
 
 class _SyncStreamProxy:
@@ -727,14 +942,23 @@ class _SyncStreamProxy:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         """Record on context exit (even if the loop broke early), then delegate."""
-        self._recorder.finish(
-            status="error" if exc_type else "ok",
-            error=repr(exc) if exc_type else None,
-        )
-        exit_ = getattr(self._stream, "__exit__", None)
-        if exit_ is not None:
-            return bool(exit_(exc_type, exc, tb))
-        return False
+        result = False
+        try:
+            self._recorder.finish(
+                status="error" if exc_type else "ok", error=repr(exc) if exc_type else None
+            )
+        finally:
+            exit_ = getattr(self._stream, "__exit__", None)
+            if exit_ is not None:
+                result = bool(exit_(exc_type, exc, tb))
+        return result
+
+    def close(self) -> Any:
+        """Close the provider resource and record observed output exactly once."""
+        try:
+            return self._stream.close()
+        finally:
+            self._recorder.finish()
 
     def __getattr__(self, name: str) -> Any:
         """Everything else (close(), response, ...) delegates to the real stream."""
@@ -784,6 +1008,9 @@ class _AsyncStreamProxy:
         except StopAsyncIteration:
             await self._finish()
             raise
+        except asyncio.CancelledError:
+            await self._finish(status="cancelled")
+            raise
         except Exception as exc:
             await self._finish(status="error", error=repr(exc))
             raise
@@ -799,14 +1026,30 @@ class _AsyncStreamProxy:
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         """Record on context exit (even if the loop broke early), then delegate."""
-        await self._finish(
-            status="error" if exc_type else "ok",
-            error=repr(exc) if exc_type else None,
-        )
-        exit_ = getattr(self._stream, "__aexit__", None)
-        if exit_ is not None:
-            return bool(await exit_(exc_type, exc, tb))
-        return False
+        result = False
+        try:
+            await self._finish(
+                status=(
+                    "cancelled"
+                    if exc_type and issubclass(exc_type, asyncio.CancelledError)
+                    else "error"
+                    if exc_type
+                    else "ok"
+                ),
+                error=repr(exc) if exc_type else None,
+            )
+        finally:
+            exit_ = getattr(self._stream, "__aexit__", None)
+            if exit_ is not None:
+                result = bool(await exit_(exc_type, exc, tb))
+        return result
+
+    async def close(self) -> Any:
+        """Close the provider resource and finalize without blocking the loop."""
+        try:
+            return await self._stream.close()
+        finally:
+            await self._finish()
 
     def __getattr__(self, name: str) -> Any:
         """Everything else delegates to the real stream."""

@@ -18,6 +18,7 @@ import pytest
 
 from promptkeep import Prompt, RenderedText, integrations, wrap
 from promptkeep.integrations import (
+    AnthropicMessagesAdapter,
     OpenAIChatAdapter,
     OpenAIResponsesAdapter,
     ProviderAdapter,
@@ -107,7 +108,63 @@ def _responses_scenario() -> Scenario:
     )
 
 
-SCENARIOS = [_chat_scenario(), _responses_scenario()]
+def _anthropic_scenario() -> Scenario:
+    """The same adapter contract against native Messages shapes."""
+
+    def make_client():
+        """A Messages-only client for surface discovery."""
+        return SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: None))
+
+    def make_async_client():
+        """Async discovery must choose the async interceptor."""
+
+        async def create(**kwargs):
+            """Unused provider stub."""
+
+        return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+    def response(text):
+        """Provider fields required by the response contract."""
+        return SimpleNamespace(
+            id="msg-contract",
+            model="gpt-answered",
+            content=[SimpleNamespace(type="text", text=text)],
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+        )
+
+    def chunks(parts):
+        """Native SSE types with cumulative usage on the final delta."""
+        start = response("")
+        start.usage.output_tokens = 0
+        return (
+            [SimpleNamespace(type="message_start", message=start)]
+            + [
+                SimpleNamespace(
+                    type="content_block_delta", delta=SimpleNamespace(type="text_delta", text=p)
+                )
+                for p in parts
+            ]
+            + [SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=3))]
+        )
+
+    return Scenario(
+        adapter=AnthropicMessagesAdapter(),
+        make_client=make_client,
+        make_async_client=make_async_client,
+        request=lambda system, user: dict(
+            model="gpt-test",
+            temperature=0,
+            system=system,
+            messages=[dict(role="user", content=user)],
+        ),
+        system_only=lambda system: dict(system=system, messages=[]),
+        texts=lambda kw: [kw["system"]] + [m["content"] for m in kw["messages"]],
+        response=response,
+        chunks=chunks,
+    )
+
+
+SCENARIOS = [_chat_scenario(), _responses_scenario(), _anthropic_scenario()]
 
 
 @pytest.fixture(params=SCENARIOS, ids=lambda s: s.adapter.provider)

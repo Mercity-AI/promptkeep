@@ -14,10 +14,22 @@ from __future__ import annotations
 import peewee as pw
 import playhouse.migrate as pm
 
-from .models import MODELS, CheckRecord, ConversationRecord, PromptVersionRecord, new_run_key
+from .models import (
+    MODELS,
+    CheckRecord,
+    ConversationRecord,
+    ExternalIdentityRecord,
+    ImportedSessionRecord,
+    ImportedUsageRecord,
+    PromptVersionRecord,
+    SpanLinkRecord,
+    SpanRecord,
+    WatchCheckpointRecord,
+    new_run_key,
+)
 from .rendering import template_hash
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 12
 
 
 def migrate(database: pw.SqliteDatabase) -> None:
@@ -37,7 +49,7 @@ def migrate(database: pw.SqliteDatabase) -> None:
     # A fresh file: build every table at the current shape and stamp it.
     if user_version < 1:
         with database.atomic():
-            database.create_tables(MODELS, safe=True)
+            _create_tables(database, MODELS)
             database.execute_sql(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
 
@@ -46,13 +58,13 @@ def migrate(database: pw.SqliteDatabase) -> None:
     # correctly against new registrations.
     if user_version < 2:
         with database.atomic():
-            for row in PromptVersionRecord.select():
+            for row in PromptVersionRecord.select().bind(database):
                 new_hash = template_hash(row.template)
                 if new_hash != row.template_hash:
                     try:
                         PromptVersionRecord.update(template_hash=new_hash).where(
                             PromptVersionRecord.id == row.id
-                        ).execute()
+                        ).execute(database)
                     except pw.IntegrityError:
                         # Two old versions differing only in variable names now
                         # collide; keep the older row normalized, leave this one.
@@ -65,7 +77,7 @@ def migrate(database: pw.SqliteDatabase) -> None:
     # conversation and turn position.
     if user_version < 3:
         with database.atomic():
-            database.create_tables([ConversationRecord], safe=True)
+            _create_tables(database, [ConversationRecord])
             migrator = pm.SqliteMigrator(database)
             pm.migrate(
                 migrator.add_column("runs", "conversation_id", pw.IntegerField(null=True)),
@@ -79,7 +91,7 @@ def migrate(database: pw.SqliteDatabase) -> None:
     # v4: the checks table — one verdict per (run, check).
     if user_version < 4:
         with database.atomic():
-            database.create_tables([CheckRecord], safe=True)
+            _create_tables(database, [CheckRecord])
             database.execute_sql("PRAGMA user_version = 4")
 
     # v5: runs gain a caller-minted identity (run_key) so a run can be
@@ -142,8 +154,55 @@ def migrate(database: pw.SqliteDatabase) -> None:
             )
             database.execute_sql("PRAGMA user_version = 8")
 
+    # v9: agent traces. Spans are their own table; a nullable runs.span_key
+    # links every Prompt row from one physical model call to its model span.
+    # Historical runs stay NULL: they were never observed inside a trace.
+    if user_version < 9:
+        with database.atomic():
+            _create_tables(database, [SpanRecord])
+            migrator = pm.SqliteMigrator(database)
+            pm.migrate(
+                migrator.add_column("runs", "span_key", pw.TextField(null=True)),
+                migrator.add_index("runs", ("span_key",), False),
+            )
+            database.execute_sql("PRAGMA user_version = 9")
+
+    # v10: native session provenance and usage; existing telemetry stays NULL.
+    if user_version < 10:
+        with database.atomic("IMMEDIATE"):
+            migrator = pm.SqliteMigrator(database)
+            for table, column in (("runs", "usage_details"), ("spans", "metadata_json")):
+                if not _has_column(database, table, column):
+                    pm.migrate(migrator.add_column(table, column, pw.TextField(null=True)))
+            _create_tables(database, [ImportedSessionRecord, ImportedUsageRecord])
+            database.execute_sql("PRAGMA user_version = 10")
+
+    # v11: timestamps may be unknown; external identities and links are explicit.
+    if user_version < 11:
+        with database.atomic("IMMEDIATE"):
+            migrator = pm.SqliteMigrator(database)
+            for column in ("observed_at", "content_parts_json"):
+                if not _has_column(database, "spans", column):
+                    pm.migrate(migrator.add_column("spans", column, pw.TextField(null=True)))
+            if any(c.name == "started_at" and not c.null for c in database.get_columns("spans")):
+                pm.migrate(migrator.drop_not_null("spans", "started_at"))
+            _create_tables(database, [ExternalIdentityRecord, SpanLinkRecord])
+            database.execute_sql("PRAGMA user_version = 11")
+
+    # v12: crash-safe incremental import checkpoints.
+    if user_version < 12:
+        with database.atomic("IMMEDIATE"):
+            _create_tables(database, [WatchCheckpointRecord])
+            database.execute_sql("PRAGMA user_version = 12")
+
 
 def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:
     """Whether ``table`` already has ``column`` — for migration steps whose
     starting shape depends on which earlier steps ran in the same pass."""
     return any(col.name == column for col in database.get_columns(table))
+
+
+def _create_tables(database: pw.SqliteDatabase, models: list) -> None:
+    """Create tables on a concrete connection without changing global bindings."""
+    for model in models:
+        pw.SchemaManager(model, database).create_all(safe=True)

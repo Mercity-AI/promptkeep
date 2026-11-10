@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import storage
+from .config import get_settings
 
 logger = logging.getLogger("promptkeep")
 
@@ -55,13 +56,15 @@ _suppressed: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # thread (see _run_with_timeout), so a saturated pool can't make a fast check
 # look slow or cap how many requests can be in flight.
 _executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
 
 
 def _get_executor() -> ThreadPoolExecutor:
     """Lazily create the shared async-post-check pool (never at import time)."""
     global _executor
-    if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="promptkeep-post")
     return _executor
 
 
@@ -81,9 +84,13 @@ def schedule_async(chk: Check, ctx: CheckContext, run_key: str | None) -> Future
     in background mode the verdict queues behind its own run row.
     """
 
+    destination = str(get_settings().db_path)
+
     def _work() -> CheckResult:
+        """A late verdict belongs to its original database, even after configure()."""
         result = chk.run_inline(ctx)
-        storage.record_check(run_key, result.to_row())
+        with storage.connection_context(destination):
+            storage.record_check(run_key, result.to_row())
         return result
 
     future = _get_executor().submit(_work)
@@ -420,19 +427,22 @@ class RunHandle:
     """Attached to a response as ``response.promptkeep``.
 
     Carries the run's key (its identity — pass it to ``history.checks()``),
-    the prompt version that ran, and the check results. ``wait()`` blocks for
-    async post-checks if you need their verdicts. run_key is None when the
-    run was not recorded (tracking disabled, write_mode "off", or sampled out
-    by ``sample_rate``); the checks still ran and the verdicts are still here.
+    the prompt version that ran, the check results, and the model span key
+    when the call happened inside an agent trace. ``wait()`` blocks for async
+    post-checks if you need their verdicts. run_key is None when the run was
+    not recorded (tracking disabled, write_mode "off", or sampled out by
+    ``sample_rate``); the checks still ran and the verdicts are still here.
     """
 
-    def __init__(self, run_key, prompt_version, results, futures=None):
+    def __init__(self, run_key, prompt_version, results, futures=None, span_key=None):
         """Bind the run's key, the prompt version that ran, the verdicts known
-        so far, and the futures of any async post-checks still running."""
+        so far, the futures of any async post-checks still running, and the
+        model span this physical call belongs to (None outside a trace)."""
         self.run_key = run_key
         self.prompt_version = prompt_version
         self.checks = list(results)
         self._futures = futures or []
+        self.span_key = span_key
 
     @property
     def verification(self) -> str:

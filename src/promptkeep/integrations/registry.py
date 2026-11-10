@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .anthropic_messages import AnthropicMessagesAdapter
 from .base import ProviderAdapter, Target
 from .core import instrument, is_instrumented
 from .openai_responses import OpenAIResponsesAdapter
@@ -18,7 +19,11 @@ from .openai_wrapper import OpenAIChatAdapter
 
 # Registration order is also search order. Built-ins first; third parties
 # append with register_adapter().
-_ADAPTERS: list[ProviderAdapter] = [OpenAIChatAdapter(), OpenAIResponsesAdapter()]
+_ADAPTERS: list[ProviderAdapter] = [
+    OpenAIChatAdapter(),
+    OpenAIResponsesAdapter(),
+    AnthropicMessagesAdapter(),
+]
 
 
 def adapters() -> list[ProviderAdapter]:
@@ -79,7 +84,7 @@ def is_wrapped(client: Any) -> bool | None:
     """Whether a client's provider surfaces carry promptkeep's tracking:
     True/False when at least one adapter recognizes the client, None when
     none does (nothing to be wrapped or unwrapped)."""
-    targets = [t for t in (a.locate(client) for a in _ADAPTERS) if t is not None]
+    targets = [t for a in _ADAPTERS for t in a.locate_targets(client)]
     if not targets:
         return None
     return any(is_instrumented(t) for t in targets)

@@ -28,23 +28,49 @@ def make_response(
     prompt_tokens=10,
     completion_tokens=5,
     cost=None,
+    tool_calls=None,
 ):
     """Build a chat-completion response shaped like the real SDK's object."""
+    message = SimpleNamespace(content=content)
+    if tool_calls:
+        message.tool_calls = list(tool_calls)
     return SimpleNamespace(
         id=response_id,
         model=model,
         usage=make_usage(prompt_tokens, completion_tokens, cost),
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        choices=[SimpleNamespace(message=message)],
     )
 
 
-def make_chunk(content=None, model="gpt-test", response_id="resp_s", usage=None):
+def make_tool_call(call_id="call_1", name="search", arguments="{}"):
+    """One assistant tool call, as a chat completion reports it."""
+    return SimpleNamespace(
+        id=call_id,
+        type="function_call",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def make_tool_call_delta(call_id="call_1", index=0, name=None):
+    """One streamed tool-call delta: the id arrives once, keyed by index."""
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        type="function_call",
+        function=SimpleNamespace(name=name, arguments=None),
+    )
+
+
+def make_chunk(content=None, model="gpt-test", response_id="resp_s", usage=None, tool_calls=None):
     """Build one streaming chunk (delta content, optionally final usage)."""
+    delta = SimpleNamespace(content=content)
+    if tool_calls:
+        delta.tool_calls = list(tool_calls)
     return SimpleNamespace(
         id=response_id,
         model=model,
         usage=usage,
-        choices=[SimpleNamespace(delta=SimpleNamespace(content=content))],
+        choices=[SimpleNamespace(delta=delta)],
     )
 
 
@@ -178,11 +204,27 @@ def make_responses_usage(input_tokens=10, output_tokens=5, cost=None):
     return usage
 
 
+def make_tool_call_item(call_id="call_1", name="search", arguments="{}"):
+    """One ``function_call`` output item of a Responses API reply."""
+    return SimpleNamespace(
+        type="function_call",
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+    )
+
+
 def make_responses_response(
-    text="hello!", model="gpt-test", response_id="resp_1", usage=None, previous_response_id=None
+    text="hello!",
+    model="gpt-test",
+    response_id="resp_1",
+    usage=None,
+    previous_response_id=None,
+    tool_calls=None,
 ):
     """Build a Response shaped like the SDK's: the reply is an ``output_text``
-    block inside a ``message`` item, after a reasoning item that carries none."""
+    block inside a ``message`` item, after a reasoning item that carries none
+    (plus any requested tool calls, as ``function_call`` items)."""
     return SimpleNamespace(
         id=response_id,
         model=model,
@@ -195,6 +237,7 @@ def make_responses_response(
                 role="assistant",
                 content=[SimpleNamespace(type="output_text", text=text)],
             ),
+            *(tool_calls or ()),
         ],
     )
 

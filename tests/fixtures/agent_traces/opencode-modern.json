@@ -1,0 +1,109 @@
+{
+  "info": {
+    "id": "opencode-modern",
+    "parentID": "opencode-parent",
+    "time": {
+      "created": 1790856000000,
+      "updated": 1790856070000
+    },
+    "directory": "/excluded/private"
+  },
+  "messages": [
+    {
+      "id": "user",
+      "type": "user",
+      "text": "question",
+      "time": {
+        "created": 1790856001000
+      }
+    },
+    {
+      "id": "call-a",
+      "type": "assistant",
+      "model": {
+        "id": "model-a",
+        "providerID": "provider"
+      },
+      "time": {
+        "created": 1790856002000,
+        "streamed": 1790856003000,
+        "completed": 1790856004000
+      },
+      "cost": 0.01,
+      "tokens": {
+        "input": 10,
+        "output": 2,
+        "reasoning": 1,
+        "cache": {
+          "read": 3,
+          "write": 1
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "answer"
+        },
+        {
+          "type": "reasoning",
+          "text": "PRIVATE REASONING"
+        },
+        {
+          "id": "tool-call",
+          "type": "tool",
+          "name": "shell",
+          "state": {
+            "status": "error",
+            "input": {
+              "command": "false"
+            },
+            "error": {
+              "type": "UnknownError",
+              "message": "exit 1"
+            }
+          },
+          "time": {
+            "created": 1790856003000,
+            "ran": 1790856003000,
+            "completed": 1790856004000
+          }
+        }
+      ]
+    },
+    {
+      "id": "call-b",
+      "type": "assistant",
+      "model": {
+        "id": "model-b",
+        "providerID": "provider"
+      },
+      "time": {
+        "created": 1790856005000,
+        "completed": 1790856006000
+      },
+      "tokens": {
+        "input": 20,
+        "output": 4,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "recovered"
+        }
+      ]
+    },
+    {
+      "id": "idle",
+      "type": "idle",
+      "outcome": "succeeded",
+      "time": {
+        "created": 1790856007000
+      }
+    }
+  ]
+}

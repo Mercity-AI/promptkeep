@@ -10,13 +10,101 @@ how deprecations work, is in [docs/API.md](docs/API.md).
 
 ### Added
 
+- Public `AgentTrace`, `CodexTrace`, `ClaudeCodeTrace`, `OpenCodeTrace`, immutable
+  `TraceEvent`, `register_agent_trace()` and `import_trace()` APIs under `importers`.
+- Automatic `promptkeep import PATH [--source SOURCE]` and `watch PATH` selection,
+  including mixed-source directories and third-party registered adapters.
+- Modern and legacy OpenCode saved exports, including atomic snapshot watching,
+  session parent links, per-message models, tool failures and source cost provenance.
+
+### Fixed
+
+- Native Codex epoch units, explicit durations, model switches, `token_count` calls,
+  repeated usage notifications and accounting resets. Unknown call timing remains unknown.
+- Claude injected messages, command output, compaction and interruption classification;
+  explicit refusals complete without inflating user turns. Parser revisions rebuild old
+  archive imports and checkpoints when the original source files are available.
+- Reused immutable prepared input survives queue eviction without repeated redaction.
+  Sampled-out known model ancestors remain structural when retained tools reference them.
+- Outside-agent tool warnings are shared across names and limited to once per minute.
+- Nested thread-owned connections reuse trace/worker lifetimes and close on exit;
+  atomic span upserts avoid per-row read-back without changing IMMEDIATE locking.
+
+
+## [0.4.0] - 2026-11-08
+
+### Added
+
+- Native Claude Code imports, source-identified Codex model records with unknown
+  timing preserved, and explicit adapters for the two reviewed local dataset formats.
+- OpenAI Agents SDK and LangChain callbacks, verified with LangGraph parallel runs
+  and interruption/resume; framework/provider model identities avoid duplicate spans.
+- Explicit `setup()`/`Installation` lifecycle, OTel SDK ingestion, and opt-in outbound
+  OTLP HTTP/protobuf or gRPC with bounded queues and loop prevention.
+- Incremental saved-log watchers with atomic checkpoints, restart and rotation handling.
+- Stable Anthropic `.parse()` and raw-response helpers; SDK 1.17.0/2.6.0 compatibility.
+- Schemas v11/v12 for unknown execution starts, observation clocks, links and checkpoints.
+
+### Changed
+
+- External `SpanInfo.started_at` can be None. Observation timestamps remain separate;
+  identified model responses can have usage without invented provider-call timing.
+- Source usage summaries distinguish linked response totals from unattributed usage.
+
+### Fixed
+
+- Thread-owned connection cleanup, migration-retry binding, pinned queued destinations,
+  late-check destination capture, and notifications only after successful commit.
+
+
+### Added
+
+- Anthropic Messages support through `wrap()`: sync/async `create`, event streams,
+  and lazy `.stream()` helpers; native final messages, checks, cache-aware usage,
+  and tool-call links. Install `promptkeep[anthropic]` for SDK 2.6.x support.
+- Native Codex `.jsonl` / `.jsonl.zst` archival imports through
+  `promptkeep.importers.import_codex()` and `promptkeep import codex`. Imports are
+  synchronous, redacted, atomic, repeatable, and preserve original timestamps.
+  Missing provider-call boundaries remain unknown; separately reported usage is
+  exposed by `history.imported_session()` rather than fabricated model spans.
+- `promptkeep traces` / `promptkeep trace [--json]` inspection commands.
+- Schema v10: optional run usage details, span metadata, imported-session provenance,
+  and import-owned usage. Existing histories migrate forward without losing data.
+
+### Fixed
+
+- Explicit stream close now finalizes partial telemetry exactly once; asynchronous
+  cancellation is recorded and re-raised, with cleanup preserved. Instrumentation
+  markers are per method so multiple surfaces on one SDK resource are all wrapped.
+- Regression coverage for concurrent registration and 3,000 background tool spans,
+  regular model rows, and independent writer processes sharing a SQLite database.
+
+### Added
+
+- Agent traces: `promptkeep.agent(name, input=)` and `promptkeep.tool(name, input=, call_id=)`
+  are explicit sync/async scopes for one task and its application-executed steps. A
+  wrapped model call inside a scope records one `llm` span linked to every run row from
+  that physical call; `RunHandle.span_key` carries its identity and the handle is the
+  public `promptkeep.Span`. Nested agents/tools stay in one trace, a tool can pass the
+  provider's tool-call id to become a child of the model call that requested it, and
+  `handle.fail(message)` marks a normal return as a failed span. Caught child failures
+  stay visible without changing the root exit status, and existing check suppression still
+  keeps judge calls out. `history.list_traces()` and `history.trace(trace_key)` read the
+  result as `SpanInfo`/`TraceInfo`, counting tokens and cost once per model call and
+  tolerating missing roots, parents, and linked runs; `SpanInfo.has_input`/`has_output`
+  separate "never recorded" from an explicit JSON null. Span input/output is snapshotted,
+  redacted before queueing (names stay, like prompt names), and capped at 64 KiB with a
+  visible marker; traces reuse the existing sampling cohort and retention sweep. Schema v9
+  adds the `spans` table and nullable indexed `runs.span_key` (historical runs stay
+  unlinked). `examples/agent_trace_demo.py` is the offline walkthrough.
+
 - Provider adapter interface (`promptkeep.integrations.ProviderAdapter`): all
   provider-specific knowledge now lives in an adapter, and the tracking
   orchestration (conversations, checks, recording, streaming) is written once
   in `integrations/core.py`. `register_adapter()` lets a third party teach
   `wrap()` a new client shape; `tests/test_adapters.py` is the contract every
-  adapter must pass. OpenAI `chat.completions` is the first (and so far only)
-  adapter; its behavior is unchanged.
+  adapter must pass. Built-in adapters cover OpenAI Chat Completions, Responses, and Anthropic Messages;
+  existing OpenAI behavior is unchanged.
 
 - Conversation read model: `ConversationInfo.replay()` rebuilds a session as a
   chat `messages` list (pass `system=` to re-run it against another prompt),

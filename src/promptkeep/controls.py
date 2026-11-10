@@ -28,9 +28,19 @@ RUN_TEXT_FIELDS = (
     "original_input_text",
 )
 CHECK_TEXT_FIELDS = ("message", "rewritten")
+# Span payloads and error text are user data too. The JSON columns are already
+# serialized strings, so the existing str -> str hook applies to them directly.
+# Span names are structural labels, like prompt names, and are not redacted.
+SPAN_TEXT_FIELDS = ("input_json", "output_json", "error")
 
 
-def keep_run(settings: Settings, row: dict[str, Any], conversation_id: int | None) -> bool:
+def keep_run(
+    settings: Settings,
+    row: dict[str, Any],
+    conversation_id: int | None,
+    *,
+    cohort: bool | None = None,
+) -> bool:
     """The sampling decision for one run.
 
     Anything worth investigating is always kept: a call that failed or was
@@ -44,6 +54,11 @@ def keep_run(settings: Settings, row: dict[str, Any], conversation_id: int | Non
     the same call. Async post-check verdicts land after this decision and
     can't rescue a dropped run — use ``mode="blocking"`` for a check whose
     failures must always be kept.
+
+    ``cohort`` lets an enclosing trace pass down its one successful-span
+    decision, so normal model steps do not flip independent coins. The
+    always-keep rules still run first: a problem inside a dropped cohort is
+    recorded, producing a partial problem-only trace.
     """
     rate = settings.sample_rate
     if rate >= 1.0:
@@ -54,6 +69,10 @@ def keep_run(settings: Settings, row: dict[str, Any], conversation_id: int | Non
         return True
     if any(check.get("status") != "ok" for check in row.get("_checks", ())):
         return True
+
+    # An enclosing trace already made the successful-span decision.
+    if cohort is not None:
+        return cohort
 
     # Uneventful: a coin flip per run, or per conversation for a turn.
     if conversation_id is None:
@@ -75,6 +94,17 @@ def redact_run(redact: Callable[[str], str], row: dict[str, Any]) -> dict[str, A
 def redact_check(redact: Callable[[str], str], row: dict[str, Any]) -> dict[str, Any]:
     """A check verdict row with its message and rewrite passed through the hook."""
     return _redact_fields(redact, row, CHECK_TEXT_FIELDS)
+
+
+def redact_span(redact: Callable[[str], str], row: dict[str, Any]) -> dict[str, Any]:
+    """A span row with its payloads and error passed through the hook.
+
+    The payload columns are already serialized JSON strings, so the same
+    ``str -> str`` contract applies; a hook that makes them unparsable is
+    still inspectable as redacted raw text in ``history``. The name is left
+    alone, like a prompt's: it is the label the trace is read by.
+    """
+    return _redact_fields(redact, row, SPAN_TEXT_FIELDS)
 
 
 def _redact_fields(

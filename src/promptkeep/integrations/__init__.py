@@ -4,6 +4,7 @@ for the shared interceptor, ``registry`` for how clients are recognized."""
 
 from __future__ import annotations
 
+from .anthropic_messages import AnthropicMessagesAdapter
 from .base import ProviderAdapter, Request, ResponseFields, StreamAbsorber, Target
 from .call import CallResult, acall, call
 from .openai_responses import OpenAIResponsesAdapter
@@ -23,6 +24,7 @@ __all__ = [
     "ResponseFields",
     "StreamAbsorber",
     "Target",
+    "AnthropicMessagesAdapter",
     "OpenAIChatAdapter",
     "OpenAIResponsesAdapter",
 ]

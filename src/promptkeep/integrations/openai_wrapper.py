@@ -75,7 +75,8 @@ class OpenAIChatAdapter(ProviderAdapter):
         )
 
     def read_response(self, response: Any) -> ResponseFields:
-        """Reply text from ``choices[0].message.content``, counts from ``usage``."""
+        """Reply text from ``choices[0].message.content``, counts from ``usage``,
+        tool-call ids from ``choices[0].message.tool_calls``."""
         usage = getattr(response, "usage", None)
         return ResponseFields(
             model=getattr(response, "model", None),
@@ -85,6 +86,7 @@ class OpenAIChatAdapter(ProviderAdapter):
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
             cost_usd=_reported_cost(usage),
+            tool_call_ids=_tool_call_ids(response),
         )
 
     def stream_absorber(self) -> StreamAbsorber:
@@ -104,14 +106,16 @@ class OpenAIChatAdapter(ProviderAdapter):
 
 
 class _ChatStreamAbsorber(StreamAbsorber):
-    """Accumulates chat-completion chunks: ids and usage as they appear, and
-    every ``choices[0].delta.content`` piece as the reply text."""
+    """Accumulates chat-completion chunks: ids and usage as they appear, every
+    ``choices[0].delta.content`` piece as the reply text, and the id of every
+    streamed tool call (one delta usually carries it, keyed by call index)."""
 
     def __init__(self) -> None:
         self.parts: list[str] = []
         self.model: str | None = None
         self.response_id: str | None = None
         self.usage: Any = None
+        self.tool_call_ids: dict[int, str] = {}
 
     def absorb(self, chunk: Any) -> None:
         self.model = getattr(chunk, "model", None) or self.model
@@ -125,6 +129,11 @@ class _ChatStreamAbsorber(StreamAbsorber):
             content = getattr(delta, "content", None)
             if isinstance(content, str) and content:
                 self.parts.append(content)
+            for tool_call in getattr(delta, "tool_calls", None) or ():
+                call_id = getattr(tool_call, "id", None)
+                if isinstance(call_id, str) and call_id:
+                    index = getattr(tool_call, "index", len(self.tool_call_ids))
+                    self.tool_call_ids[index] = call_id
 
     def summary(self) -> ResponseFields:
         return ResponseFields(
@@ -135,6 +144,7 @@ class _ChatStreamAbsorber(StreamAbsorber):
             completion_tokens=getattr(self.usage, "completion_tokens", None),
             total_tokens=getattr(self.usage, "total_tokens", None),
             cost_usd=_reported_cost(self.usage),
+            tool_call_ids=tuple(self.tool_call_ids.values()),
         )
 
 
@@ -299,3 +309,21 @@ def _extract_output_text(response) -> str | None:
         if isinstance(content, str):
             return content
     return None
+
+
+def _tool_call_ids(response) -> tuple[str, ...]:
+    """The ids of tool calls the response asks the application to run.
+
+    A chat completion carries them on ``choices[0].message.tool_calls``. Only
+    string ids are kept — a malformed one should cost the link, not the call.
+    """
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return ()
+    message = getattr(choices[0], "message", None)
+    found = []
+    for tool_call in getattr(message, "tool_calls", None) or ():
+        call_id = getattr(tool_call, "id", None)
+        if isinstance(call_id, str) and call_id:
+            found.append(call_id)
+    return tuple(found)

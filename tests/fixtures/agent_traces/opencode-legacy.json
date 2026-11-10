@@ -1,0 +1,110 @@
+{
+  "info": {
+    "id": "opencode-legacy",
+    "parentID": "opencode-parent",
+    "time": {
+      "created": 1790856000000,
+      "updated": 1790856070000
+    },
+    "directory": "/excluded/private"
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "user",
+        "role": "user",
+        "time": {
+          "created": 1790856001000
+        }
+      },
+      "parts": [
+        {
+          "id": "p1",
+          "type": "text",
+          "text": "question"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "call-a",
+        "role": "assistant",
+        "parentID": "user",
+        "modelID": "model-a",
+        "providerID": "provider",
+        "time": {
+          "created": 1790856002000,
+          "completed": 1790856004000
+        },
+        "cost": 0.01,
+        "tokens": {
+          "input": 10,
+          "output": 2,
+          "reasoning": 1,
+          "cache": {
+            "read": 3,
+            "write": 1
+          }
+        }
+      },
+      "parts": [
+        {
+          "id": "text-a",
+          "type": "text",
+          "text": "answer"
+        },
+        {
+          "id": "hidden",
+          "type": "reasoning",
+          "text": "PRIVATE REASONING"
+        },
+        {
+          "id": "tool",
+          "callID": "tool-call",
+          "type": "tool",
+          "tool": "shell",
+          "state": {
+            "status": "error",
+            "input": {
+              "command": "false"
+            },
+            "error": "exit 1",
+            "time": {
+              "start": 1790856003000,
+              "end": 1790856004000
+            }
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "call-b",
+        "role": "assistant",
+        "parentID": "user",
+        "modelID": "model-b",
+        "providerID": "provider",
+        "time": {
+          "created": 1790856005000,
+          "completed": 1790856006000
+        },
+        "tokens": {
+          "input": 20,
+          "output": 4,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        }
+      },
+      "parts": [
+        {
+          "id": "text-b",
+          "type": "text",
+          "text": "recovered"
+        }
+      ]
+    }
+  ]
+}

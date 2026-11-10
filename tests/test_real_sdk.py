@@ -193,6 +193,18 @@ def async_client(endpoint):
     )
 
 
+def _mock_client(body):
+    """A wrapped real client whose only response is ``body``."""
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+    return wrap(
+        openai.OpenAI(
+            api_key="sk-test",
+            base_url="http://mock/v1",
+            http_client=httpx.Client(transport=transport),
+        )
+    )
+
+
 SYSTEM = Prompt("Answer in {n} words.", {"n": 3}, name="REAL_SDK")
 MESSAGES = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Capital of Peru?"}]
 
@@ -361,3 +373,132 @@ class TestWrappingTheClass:
         result = promptkeep.call(client, model="gpt-5.5", instructions=SYSTEM, input="hi")
         assert result.text == "answer resp_1"
         assert promptkeep.call(client, model="m", messages=MESSAGES).text == "Lima"
+
+
+class TestAgentSpans:
+    """Agent association against real OpenAI SDK objects and decorators."""
+
+    def test_real_sync_chat_call_is_linked_to_agent_trace(self, client):
+        with promptkeep.agent("real-chat") as task:
+            response = client.chat.completions.create(model="m", messages=MESSAGES)
+
+        trace = history.trace(task.trace_key)
+        (span,) = [item for item in trace.spans if item.kind == "llm"]
+        assert response.promptkeep.span_key == span.span_key
+        assert span.runs[0].provider == "openai"
+        assert span.runs[0].output_text == "Lima"
+
+    def test_real_async_responses_call_is_linked_to_agent_trace(self, async_client):
+        async def go():
+            async with promptkeep.agent("real-responses") as task:
+                response = await async_client.responses.create(
+                    model="gpt-5.5", instructions=SYSTEM, input="Peru?"
+                )
+            return task.trace_key, response
+
+        trace_key, response = asyncio.run(go())
+        trace = history.trace(trace_key)
+        (span,) = [item for item in trace.spans if item.kind == "llm"]
+        assert response.promptkeep.span_key == span.span_key
+        assert span.runs[0].provider == "openai-responses"
+        assert span.runs[0].output_text == "answer resp_1"
+
+    def test_a_real_chat_tool_call_links_to_its_model_span(self):
+        body = chat_body()
+        body["choices"][0]["message"]["tool_calls"] = [
+            {
+                "id": "call_chat",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }
+        ]
+        client = _mock_client(body)
+        with promptkeep.agent("real-chat-tool") as task:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            with promptkeep.tool("search", call_id="call_chat"):
+                pass
+
+        trace = history.trace(task.trace_key)
+        (llm,) = [item for item in trace.spans if item.kind == "llm"]
+        (tool_span,) = [item for item in trace.spans if item.kind == "tool"]
+        assert tool_span.parent_span_key == llm.span_key
+
+    def test_a_real_streamed_tool_call_links_too(self):
+        chunks = [
+            {
+                "id": "chatcmpl-t",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "openai/gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_stream",
+                                    "type": "function",
+                                    "function": {"name": "search", "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-t",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "openai/gpt-4o-mini",
+                "choices": [],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        ]
+        sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, text=sse, headers={"content-type": "text/event-stream"}
+            )
+        )
+        client = wrap(
+            openai.OpenAI(
+                api_key="sk-test",
+                base_url="http://mock/v1",
+                http_client=httpx.Client(transport=transport),
+            )
+        )
+        with promptkeep.agent("real-stream-tool") as task:
+            stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+            list(stream)
+            with promptkeep.tool("search", call_id="call_stream"):
+                pass
+
+        trace = history.trace(task.trace_key)
+        (llm,) = [item for item in trace.spans if item.kind == "llm"]
+        (tool_span,) = [item for item in trace.spans if item.kind == "tool"]
+        assert tool_span.parent_span_key == llm.span_key
+
+    def test_a_real_responses_function_call_links_too(self):
+        body = response_body("resp_tool", "answer")
+        body["output"].append(
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_resp",
+                "name": "search",
+                "arguments": "{}",
+                "status": "completed",
+            }
+        )
+        client = _mock_client(body)
+        with promptkeep.agent("real-responses-tool") as task:
+            client.responses.create(model="gpt-5.5", instructions=SYSTEM, input="Peru?")
+            with promptkeep.tool("search", call_id="call_resp"):
+                pass
+
+        trace = history.trace(task.trace_key)
+        (llm,) = [item for item in trace.spans if item.kind == "llm"]
+        (tool_span,) = [item for item in trace.spans if item.kind == "tool"]
+        assert tool_span.parent_span_key == llm.span_key

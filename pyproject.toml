@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "promptkeep"
-version = "0.3.0"
+version = "0.4.0"
 description = "Prompts as first-class objects: versioned templates, SQLite lineage tracking, and OpenAI run tracking."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,11 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = ["openai>=1.0"]
+anthropic = ["anthropic>=1.17,<3"]
+codex = ["zstandard>=0.25,<1"]
+openai-agents = ["openai-agents>=0.24,<1"]
+langchain = ["langchain-core>=1.7,<2"]
+otel = ["opentelemetry-sdk>=1.45,<2", "opentelemetry-exporter-otlp-proto-http>=1.45,<2", "opentelemetry-exporter-otlp-proto-grpc>=1.45,<2"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29", "jinja2>=3.1"]
 
 [project.scripts]
@@ -44,6 +49,14 @@ dev = [
     "jinja2>=3.1",
     "httpx>=0.27",
     "openai>=1.0",
+    "anthropic>=2.6,<3",
+    "zstandard>=0.25,<1",
+    "openai-agents>=0.24.0",
+    "langchain-core>=1.7.6",
+    "langgraph>=1.2.20",
+    "opentelemetry-sdk>=1.45.2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.45.2",
 ]
 
 [tool.hatch.build.targets.wheel]

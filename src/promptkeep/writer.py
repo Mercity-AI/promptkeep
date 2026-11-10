@@ -66,14 +66,15 @@ def set_sink(sink: Sink) -> None:
 
 
 def submit(item: dict[str, Any]) -> None:
-    """Enqueue one item (a run row or a late verdict) for the background
-    thread; never blocks, never raises.
+    """Enqueue one item (a run row, verdict, span, or prune marker) for the
+    background thread; never blocks, never raises.
 
     On overflow the oldest queued item is discarded (and counted) to make
     room — recent telemetry is worth more than old telemetry.
     """
     global _dropped_total, _last_drop_log
     try:
+        item = {"_db_path": str(get_settings().db_path), **item}
         q = _ensure_started()
         try:
             q.put_nowait(item)
@@ -144,6 +145,7 @@ def reset() -> None:
     global _queue, _thread, _dropped_total
     with _lock:
         q = _queue
+        retiring = _thread
         if q is None:
             return
         while True:
@@ -155,6 +157,8 @@ def reset() -> None:
         _queue = None
         _thread = None
         _dropped_total = 0
+    if retiring is not None and retiring is not threading.current_thread():
+        retiring.join(timeout=6)
 
 
 def _ensure_started() -> queue.Queue[dict]:
@@ -182,7 +186,7 @@ def _ensure_started() -> queue.Queue[dict]:
         return _queue
 
 
-def _worker() -> None:
+def _worker_loop() -> None:
     """Drain the queue: batch rows, write each batch in one transaction.
 
     Serves the queue it was started for; retires when reset() swaps it out.
@@ -227,7 +231,8 @@ def _worker() -> None:
 def _after_fork_in_child() -> None:
     """Forget inherited state: the thread didn't survive the fork, and the
     parent still owns (and will write) everything that was queued."""
-    global _queue, _thread, _dropped_total
+    global _queue, _thread, _dropped_total, _lock
+    _lock = threading.Lock()
     _queue = None
     _thread = None
     _dropped_total = 0
@@ -235,3 +240,21 @@ def _after_fork_in_child() -> None:
 
 if hasattr(os, "register_at_fork"):  # POSIX only; Windows cannot fork.
     os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _worker() -> None:
+    """Bound the writer thread's connection lifetime with injected storage hooks."""
+    scope = _worker_scope
+    if scope is None:
+        return _worker_loop()
+    with scope():
+        return _worker_loop()
+
+
+_worker_scope = None
+
+
+def register_worker_scope(factory):
+    """Inject connection ownership without reversing the storage dependency."""
+    global _worker_scope
+    _worker_scope = factory

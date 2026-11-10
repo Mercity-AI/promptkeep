@@ -10,12 +10,17 @@ explicit ``configure()`` overrides win, then environment variables
 
 from __future__ import annotations
 
+import contextvars
 import math
 import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+_destination: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "promptkeep_destination", default=None
+)
 
 DEFAULT_DB_FILENAME = ".promptkeep.db"
 
@@ -200,7 +205,7 @@ def get_settings() -> Settings:
             retention_days = _retention_from_env(os.environ.get("PROMPTKEEP_RETENTION_DAYS"))
 
         return Settings(
-            db_path=db_path,
+            db_path=Path(_destination.get()) if _destination.get() else db_path,
             enabled=enabled,
             strict=strict,
             write_mode=write_mode,

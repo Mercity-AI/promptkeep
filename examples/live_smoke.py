@@ -35,7 +35,8 @@ from promptkeep import Prompt, history, wrap  # noqa: E402
 # --- which endpoint: OpenRouter if its key is set, else OpenAI --------------------
 if os.environ.get("OPENROUTER_API_KEY"):
     client = OpenAI(
-        base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"]
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
     )
     model = os.environ.get("SMOKE_MODEL", "openai/gpt-4o-mini")
     endpoint = "OpenRouter"

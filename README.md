@@ -178,6 +178,58 @@ convo.replay(upto=run_key)       # any other branch
 `replay()` follows one branch, so a reply that was regenerated away is not replayed as if
 the model had seen it. A conversation nobody branched reads exactly as before.
 
+## Agent traces
+
+A conversation groups messages; an agent trace groups the work around one task.
+Wrap the task in `agent()` and each application-executed tool in `tool()`; a wrapped
+model call inside either one becomes a linked `llm` span. No provider tool protocol is
+parsed, and the scope never invokes your tool or decides whether to await it:
+
+```python
+with promptkeep.agent("research", input={"question": question}) as task:
+    with promptkeep.tool("web_search", input={"query": query}) as search:
+        results = web_search(query)
+        search.output(results)              # omitted output means "not recorded"
+
+    response = client.chat.completions.create(...)
+    task.output(response.choices[0].message.content)
+
+promptkeep.flush()                          # default background mode: drain the queue
+trace = history.trace(task.trace_key)
+trace.status                                # root exit; None if its row is missing
+trace.spans                                 # agent, tool and llm spans in start order
+trace.error_count                           # caught child failures/blocks, separate from root exit
+trace.total_tokens, trace.total_cost        # counted once per physical model call
+trace.cost_complete                         # False when some call reported no cost
+trace.versions_used                         # {"REVIEW_SYSTEM": [4]}
+```
+
+`async with promptkeep.agent(...)` / `async with promptkeep.tool(...)` work the same way.
+Entering a tool with no active agent records nothing and logs a warning rather than
+raising, so helper code (including one that runs in a forked worker) stays safe to call.
+Nested agents and tools stay in the same trace, and a model call inside a tool is that
+tool's child. Pass the provider's tool-call id to parent a tool under the model call that
+requested it: `tool("web_search", call_id=tool_call.id)`. Call `handle.fail(message)` when
+a tool returns normally but failed (a non-zero exit code, an `is_error` result) — the span
+becomes an error without an exception. The handle is a `promptkeep.Span`, exposing
+`span_key` immediately; `trace_key` is known after entry. Keys identify attempts, not rows:
+sampling, redaction, a full queue or `write_mode="off"` can drop the row.
+`history.list_traces(limit=100)` lists root agent spans only.
+
+A caught tool/provider error is a child failure, not a root failure. A trace can be
+partial by design: a missing root, parent, or linked run is reported as missing, never
+reconstructed. Agent/tool input, output and errors go through `redact` before queueing;
+each payload is capped at 64 KiB with a visible marker, and names stay readable, like
+prompt names. Sampling chooses one cohort for the trace's normal model steps and still
+keeps errors, blocks and non-ok verdicts, so a sampled-out task that hits a problem can
+appear as a problem-only trace. Retention expires spans in whole traces using their latest
+activity; prompt/version rows are never deleted.
+
+Context follows normal `contextvars` inheritance (including async tasks), not arbitrary
+threads or processes. Enter a new scope inside each thread. A child task or stream started
+inside a scope keeps the captured trace even if it finishes after the root; await/close it
+before leaving the root when you want the root's status and duration to cover it.
+
 ## Checks
 
 Run your own function before a call (a gate that can stop it) and after it (an
@@ -354,6 +406,8 @@ history.stats("REVIEW_SYSTEM")               # per version: runs, errors, pass r
 history.list_prompts()                       # every prompt + version/run counts
 history.list_conversations()                 # every session + turn counts
 history.list_conversations(prompt="REVIEW_SYSTEM", version=4)   # sessions v4 drove
+history.list_traces()                        # newest root agent spans, bounded (no payloads)
+history.trace(task.trace_key)                # one task's spans, payloads + linked runs
 history.all_runs()                           # everything, newest first
 ```
 
@@ -440,16 +494,22 @@ promptkeep.configure(
 whose checks returned something other than `ok` are always stored. Inside a conversation
 the decision is made once per session (derived from the session's id, so every worker
 process agrees), so a kept conversation is complete rather than full of holes. `0.0` means
-"store only problems". Version lineage is never sampled. Because the decision is made when
-the run is recorded, a verdict from an *async* post-check can't rescue a dropped run — use
-`mode="blocking"` for a check whose failures must always be kept. A sampled-out run's
-`response.promptkeep.run_key` is `None`; its verdicts are still on the handle.
+"store only problems". An agent trace uses one cohort for its root and normal model steps;
+errors, blocks and non-ok known verdicts can still leave a problem-only trace, without
+recovering earlier steps that were already dropped. A trace that runs inside a
+conversation follows that session's one keep-or-drop decision, so a session's traces
+survive or drop together — problems still keep their own problem-only traces. Version
+lineage is never sampled. Because the decision is made when the run is recorded, a verdict
+from an *async* post-check can't rescue a dropped run — use `mode="blocking"` for a check
+whose failures must always be kept. A sampled-out run's `response.promptkeep.run_key` is
+`None`; its verdicts are still on the handle.
 
 **Redaction** runs before anything is written, in every write mode — plaintext never even
 enters the background queue. The hook sees each stored text field of a run (rendered prompt,
-input and output, the JSON-encoded variables and request params, error text) and of a check
-verdict (message, rewritten text). Templates, prompt names and conversation metadata are not
-passed through it: templates are code, and the metadata is what you attached on purpose. If
+input and output, the JSON-encoded variables and request params, error text), of a check
+verdict (message, rewritten text), and of an agent span (input/output payload, error).
+Templates, prompt names, span names and conversation metadata are not passed through it:
+templates are code, and the names and metadata are what you attached on purpose. If
 the hook raises or returns a non-string, the row is dropped rather than stored unredacted.
 `redact=lambda text: ""` keeps metadata only — model, tokens, cost, latency, status and
 verdicts, with no prompt or response text at all.
@@ -457,8 +517,9 @@ verdicts, with no prompt or response text at all.
 **Retention** deletes recorded history once it is older than `retention_days`. A
 conversation is deleted whole, once its *last* turn is that old, so a session still in use
 never loses its opening turns; a run outside any conversation goes by its own age; verdicts
-and feedback go with their run. Prompts and versions are never deleted — they are your
-code's history, not your traffic's. The sweep rides the write path: at most once an hour per
+and feedback go with their run. Agent spans expire in whole traces based on the latest span
+or linked-run activity, so a running root does not live forever. Prompts and versions are
+never deleted — they are your code's history, not your traffic's. The sweep rides the write path: at most once an hour per
 process, starting with the first run recorded, on the writer thread in background mode. A
 failed sweep is logged and retried an hour later, and never costs a run. SQLite reuses the
 freed space; to shrink the file itself, run `VACUUM` on it.
@@ -503,3 +564,149 @@ uv run ruff format src tests examples && uv run ruff check src tests examples
 ```
 
 Supported on Python 3.11–3.14. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+
+## Anthropic agents
+
+Install `pip install 'promptkeep[anthropic]'`. Stable SDK releases 1.17.0 and
+2.6.0 are tested with sync and async clients:
+
+```python
+from anthropic import Anthropic
+import promptkeep
+
+client = promptkeep.wrap(Anthropic())
+with promptkeep.agent("assistant"):
+    response = client.messages.create(
+        model="YOUR_MODEL", max_tokens=500,
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+promptkeep.flush()
+```
+
+`create(stream=True)`, `.stream()` text/final-message helpers, `.parse()`, and
+raw-response helpers are supported. Raw bodies are recorded when parsed; closing
+an unread body records incomplete output. Checks, redaction, cache accounting,
+and `tool(..., call_id=block.id)` work across these paths. Beta APIs, batch APIs,
+automatic tool runners, and cloud-specific clients remain outside the supported
+surface. Wrapping Anthropic does not instrument the separate Claude Code process.
+See [`examples/anthropic_trace.py`](examples/anthropic_trace.py).
+
+## Saved Codex, Claude Code and OpenCode sessions
+
+```bash
+pip install 'promptkeep[codex]'  # needed only for .jsonl.zst decompression
+promptkeep import rollout.jsonl --db history.db
+promptkeep import transcript.jsonl --source claude-code --db history.db
+promptkeep import opencode-export.json --db history.db
+promptkeep traces --db history.db
+promptkeep trace TRACE_KEY --db history.db --json
+```
+
+Use `promptkeep.importers.import_trace(path, source="auto", db_path=None, strict=False)`.
+Content selects Codex, Claude Code, OpenCode or a registered third-party adapter.
+`import_codex()`, `import_claude_code()` and historical CLI forms remain supported.
+Imports are synchronous, redacted before staging, and atomic per session. Reimporting
+or renaming a file does not duplicate a session. A failed replacement preserves the
+previous snapshot. Imports bypass live sampling and reject disabled/off tracking.
+Retention uses original activity, so old imported sessions can expire normally.
+
+Codex native last-call usage observations and explicitly identified responses become
+model spans even when their request start is absent. Unknown call start/end/duration
+remain `None`; observation time is stored
+separately. No provider calls are invented from ordinary assistant text. Claude tool
+errors and message ancestry are preserved, including branches and compaction markers.
+Claude injected notes, command output and interruptions do not inflate user-turn counts;
+refusals are completed responses. Codex turn epochs use seconds and source durations are
+preserved, with invalid/disagreeing intervals diagnosed. Repeated usage snapshots do not
+inflate calls or tokens, and model switches remain attached to their original calls.
+
+OpenCode supports modern session-transfer and legacy message/parts saved JSON exports,
+including parent sessions, model switches and tool failures. Native database access is
+outside this release. Source cost retains its harness provenance in span metadata and
+is excluded from provider-billed cost totals. Hidden reasoning, environment snapshots
+and unrelated private metadata are excluded.
+
+`history.imported_session(trace_key)` exposes provenance, diagnostics, usage records,
+response totals, and unattributed usage. Cumulative snapshots are never added to
+response totals. The source summary may overlap linked model-span metrics; do not add
+those two views together. Parser revisions trigger reparsing, but repairing older imports
+requires the original files. See [`examples/import_trace.py`](examples/import_trace.py)
+and the [adapter contract](docs/API.md#third-party-source-adapters).
+
+The two reviewed Hugging Face formats have explicit local-file adapters:
+
+```bash
+promptkeep import dataset downloaded.jsonl \
+  --dataset build-small-hackathon/hackathon-advisor-codex-traces --db history.db
+```
+
+`ultralazr/claude-code-traces` is supported too. `import_dataset(path, dataset=...)`
+never downloads data. It reports per-session outcomes and failures, orders Codex
+records by their source index, and reuses native session identities.
+
+## Framework integrations
+
+```bash
+pip install 'promptkeep[openai-agents,langchain]'
+```
+
+```python
+import promptkeep
+
+with promptkeep.setup(
+    integrations=("openai_agents", "langchain"),
+    clients=(openai_client, anthropic_client),
+) as installation:
+    result = runnable.invoke(
+        inputs, config={"callbacks": installation.langchain_callbacks}
+    )
+    installation.flush(timeout=5)
+```
+
+OpenAI Agents SDK uses a tracing processor; LangChain uses native callbacks, also
+verified with LangGraph parallel branches and interruption/resume. External IDs
+establish parentage. Provider wrappers enrich framework model spans with prompt
+versions and checks rather than creating duplicate model spans. Existing application
+processors and exporters remain installed. Missing framework sensitive content is
+never recovered through another API.
+
+Setup enables only named integrations. Equivalent calls share one installation and
+lifetime. `shutdown(timeout=...)` restores only methods the installation still owns.
+LangChain requires the explicit callback configuration shown above; this does not
+instrument unrelated applications or agent processes.
+
+## OpenTelemetry
+
+Install `promptkeep[otel]`. To ingest spans from an existing Python OTel SDK, attach
+`PromptKeepSpanExporter` from `promptkeep.integrations.opentelemetry` to the
+application's own span processor. PromptKeep does not replace its tracer provider.
+
+For outbound export, pass an explicit `otlp_endpoint` to `setup()`, with
+`otlp_protocol="http/protobuf"` (default) or `"grpc"`. Export uses a bounded worker
+queue and the official OTel SDK transports. Payload content is excluded by default;
+`OTLPExport(..., include_content=True)` enables already-redacted content explicitly.
+Historical imports are not automatically exported. Unknown execution intervals are
+skipped, and PromptKeep-origin spans cannot loop back through the inbound bridge.
+Call `installation.otlp_export.replay(trace_keys, timeout=...)` to explicitly export
+selected stored traces; replay reads the selected database without changing it.
+Inbound OpenTelemetry spans stay excluded during replay. Export counters and
+skipped-timing counts are available on `installation.otlp_export`.
+
+## Watch explicitly selected session logs
+
+```bash
+promptkeep watch /path/to/mixed-sessions --db history.db
+promptkeep watch /path/to/opencode-export.json --db history.db
+```
+
+`promptkeep.watch.Watcher(path, source="auto", interval=1.0)` offers `start()`, `stop()`,
+`join(timeout)`, and context-manager usage. It reads appended complete JSONL records,
+checkpoints committed offsets, and resumes without duplicating operations. Partial
+last lines wait for completion. Rotation and truncation retain previously observed
+history. Failed commits do not advance the cursor. Only the selected paths are
+watched; compressed files remain saved-import inputs. Watchers never launch or
+modify the agents. Each file selects its own adapter. OpenCode exports commit as complete
+JSON snapshots; partial/invalid replacements keep the previous trace. Parser upgrades
+rebuild old checkpoints and reconcile obsolete owned spans. The previous
+`Watcher(source, path)` form still works. Stop CLI watching with Ctrl-C or SIGTERM.
