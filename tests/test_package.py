@@ -61,6 +61,12 @@ def test_the_public_api_changes_only_on_purpose():
     assert history_names == PUBLIC_HISTORY
     assert set(promptkeep.integrations.__all__) == PUBLIC_INTEGRATIONS
     assert set(promptkeep.importers.__all__) == {
+        "AgentTrace",
+        "CodexTrace",
+        "ClaudeCodeTrace",
+        "TraceEvent",
+        "register_agent_trace",
+        "import_trace",
         "import_codex",
         "import_claude_code",
         "import_dataset",

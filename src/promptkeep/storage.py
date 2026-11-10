@@ -43,6 +43,7 @@ from .models import (
     db_proxy,
     new_run_key,
 )
+from .normalization import merge, payload
 from .rendering import template_hash
 
 logger = logging.getLogger("promptkeep")
@@ -1234,27 +1235,18 @@ class _ImportStage:
     def put(self, kind: str, key: str, values: dict) -> None:
         """Merge one normalized record, retaining previously observed payloads."""
         existing = self.get(kind, key) or {}
-        # Payloads are serialized and redacted before they reach staging.
+        # All delivery modes prepare payloads through the same pure normalizer.
         values = dict(values)
         if kind == "spans":
             for field in ("input_json", "output_json", "error"):
                 if field in values and values[field] is not None:
-                    value = values[field]
-                    if field != "error":
-                        value = json.dumps(value, ensure_ascii=False, default=str)
-                    if self.settings.redact is not None:
-                        try:
-                            value = self.settings.redact(value)
-                            if not isinstance(value, str):
-                                raise TypeError("redact must return a string")
-                        except Exception:
-                            raise _ImportRedactionError("Codex payload redaction failed") from None
-                    encoded = value.encode("utf-8")
-                    if len(encoded) > 64 * 1024:
-                        value = encoded[: 64 * 1024].decode("utf-8", errors="ignore")
-                        value += "\n[promptkeep truncated]"
-                    values[field] = value
-        merged = {**existing, **values}
+                    try:
+                        values[field] = payload(
+                            values[field], self.settings, serialized=field == "error"
+                        )
+                    except Exception:
+                        raise _ImportRedactionError("Trace payload redaction failed") from None
+        merged = merge(existing, values)
         if merged == existing:
             return
         existing = merged
@@ -1300,6 +1292,21 @@ class _ImportStage:
         self.db.execute_sql("UPDATE spans SET data=? WHERE key=?", (json.dumps(row), key))
         self.dirty["spans"].add(key)
 
+    def delete_prefix(self, kind, prefix):
+        """Remove obsolete staged observations and mark deletions for checkpoint commits."""
+        for key, _ in self.rows(kind):
+            if key.startswith(prefix):
+                self.db.execute_sql(f"DELETE FROM {kind} WHERE key=?", (key,))
+                self.dirty[kind].add(key)
+
+    def event(self, item):
+        """Reduce an already prepared normalized event without repeating controls."""
+        if item.get("links"):
+            item["span"]["_link_keys"] = item["links"]
+        self.put("spans", item["span"]["span_key"], item["span"])
+        if item.get("run") is not None:
+            self.put("runs", item["run"]["run_key"], item["run"])
+
     def rows(self, kind: str):
         """Stream staged normalized rows without materializing their payloads."""
         cursor = self.db.execute_sql(f"SELECT key,data FROM {kind} ORDER BY key")
@@ -1336,7 +1343,13 @@ def persist_import(
                 "WHERE source=? AND external_session_id=?",
                 (source, session_id),
             ).fetchone()
-            if existing and existing[1:3] == (digest, revision):
+            if (
+                existing
+                and existing[1:3] == (digest, revision)
+                and not (checkpoint and checkpoint.get("reconcile"))
+            ):
+                if checkpoint is not None:
+                    _save_checkpoint(database, checkpoint)
                 return "unchanged"
             if existing:
                 database.execute_sql(
@@ -1591,6 +1604,22 @@ def persist_watch(
     checkpoint: dict,
 ) -> None:
     """Upsert changed observations and their cursor atomically; never delete on rotation."""
+    if checkpoint.get("reconcile"):
+        persist_import(
+            stage,
+            db_path=db_path,
+            source=source,
+            session_id=session_id,
+            trace_key=trace_key,
+            digest="watch:" + str(checkpoint["byte_offset"]),
+            revision=checkpoint["parser_revision"],
+            summary=summary,
+            checkpoint=checkpoint,
+        )
+        checkpoint.pop("reconcile", None)
+        for keys in stage.dirty.values():
+            keys.clear()
+        return
     database = _open_database(db_path)
     try:
         with database.atomic("IMMEDIATE"):
@@ -1599,7 +1628,7 @@ def persist_watch(
                 "INSERT INTO imported_sessions(source,external_session_id,trace_key,source_digest,"
                 "parser_revision,imported_at,summary_json) VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT(source,external_session_id) DO UPDATE SET summary_json=excluded.summary_json,"
-                "imported_at=excluded.imported_at,source_digest=excluded.source_digest",
+                "imported_at=excluded.imported_at,source_digest=excluded.source_digest,parser_revision=excluded.parser_revision",
                 (
                     source,
                     session_id,

@@ -1,242 +1,36 @@
-"""Native Codex rollout JSONL import, preserving gaps rather than inventing calls."""
+"""Native Codex rollout interpretation, independent of persistence and other agents."""
 
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import re
-import tempfile
-import uuid
-from collections import Counter
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
 
-from .. import storage
-from ..config import get_settings
+from .base import AgentTrace, ImportReport, _counts, _key, _timestamp, _visible
+from .engine import import_trace as _import_trace
 
-_REVISION = 2
-_NAMESPACE = uuid.UUID("e75b9474-b29a-4e2d-b39b-185cf8c9b424")
+_REVISION = 3
 
 
-@dataclass(frozen=True)
-class ImportDiagnostic:
-    """A payload-free parse diagnostic, safe to show in CLI output."""
-
-    severity: str
-    code: str
-    line: int
-
-
-@dataclass(frozen=True)
-class ImportReport:
-    """The committed import's identity, counts and source-quality diagnostics."""
-
-    session_id: str
-    trace_key: str
-    outcome: str
-    input_records: int
-    agent_spans: int
-    tool_spans: int
-    model_spans: int
-    usage_records: int
-    ignored_records: int
-    malformed_records: int
-    diagnostics: tuple[ImportDiagnostic, ...]
-
-
-@contextmanager
-def _source(path: Path):
-    """Open decompressed bytes; missing compression support has no DB effects."""
-    with path.open("rb") as raw:
-        if path.name.endswith(".jsonl.zst"):
-            try:
-                zstd = importlib.import_module("zstandard")
-            except ImportError:
-                raise ImportError(
-                    'Compressed Codex imports require pip install "promptkeep[codex]"'
-                ) from None
-            with zstd.ZstdDecompressor().stream_reader(raw) as reader:
-                # BufferedReader supports bounded line-by-line iteration.
-                import io
-
-                with io.BufferedReader(reader) as buffered:
-                    yield buffered
-        elif path.suffix == ".jsonl":
-            yield raw
-        else:
-            raise ValueError("Codex imports require .jsonl or .jsonl.zst")
-
-
-def _timestamp(value: Any) -> str | None:
-    """Accept aware ISO timestamps or documented epoch-millisecond values."""
-    try:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            parsed = datetime.fromtimestamp(value / 1000, UTC)
-        elif isinstance(value, str):
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                return None
-        else:
-            return None
-        return parsed.astimezone(UTC).isoformat()
-    except (ValueError, OverflowError, OSError):
-        return None
-
-
-def _key(session: str, category: str, identity: str, source: str = "codex") -> str:
-    """Deterministic IDs survive source-file renames and compression changes."""
-    return str(uuid.uuid5(_NAMESPACE, json.dumps([source, session, category, identity])))
-
-
-def _visible(content: Any) -> str | None:
-    """Only visible message text; never encrypted reasoning or binary content."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            b["text"]
-            for b in content
-            if isinstance(b, dict)
-            and b.get("type") in ("text", "input_text", "output_text")
-            and isinstance(b.get("text"), str)
-        ]
-        return "\n".join(parts) or None
-    return None
-
-
-def _counts(value: Any) -> dict[str, int]:
-    """Accept only nonnegative numeric usage counters, never rate limits."""
-    names = {
-        "input_tokens",
-        "cached_input_tokens",
-        "cache_write_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
-    }
-    return (
-        {k: v for k, v in value.items() if k in names and type(v) is int and v >= 0}
-        if isinstance(value, dict)
-        else {}
-    )
-
-
-class _Parser:
-    """One session's small correlation state; payloads live in redacted staging."""
+class CodexTrace(AgentTrace):
+    """Consume Codex rollout envelopes in their original source order."""
 
     source = "codex"
+    provider = "openai"
+    revision = _REVISION
 
-    def __init__(self, stage: storage._ImportStage, strict: bool) -> None:
-        """Track source identities without retaining full session payloads."""
-        self.stage, self.strict = stage, strict
-        self.session: str | None = None
-        self.trace: str | None = None
-        self.current: str | None = None
-        self.first: str | None = None
-        self.last: str | None = None
-        self.diagnostics: list[ImportDiagnostic] = []
-        self.counts = Counter()
-        self.turns: set[str] = set()
-        self.call_turns: dict[str, str] = {}
-        self.legacy_turn = 0
-        self.task_pending = False
-        self.models = {}
+    @classmethod
+    def detect(cls, record):
+        """Identify native rollout metadata and event envelopes."""
+        return (
+            isinstance(record, dict)
+            and record.get("type") == "session_meta"
+            and isinstance(record.get("payload"), dict)
+        )
 
-    def diagnose(self, code: str, line: int, malformed: bool = False) -> None:
-        """Never include user content in errors or stored diagnostics."""
-        if malformed:
-            self.counts["malformed"] += 1
-            if self.strict:
-                raise ValueError(f"Codex {code} at line {line}")
-        self.diagnostics.append(ImportDiagnostic("warning", code, line))
-
-    def span(
-        self,
-        identity: str,
-        kind: str,
-        name: str,
-        timestamp: str | None,
-        parent: str | None,
-        **values: Any,
-    ) -> str | None:
-        """Create a span only when a historical observation exists."""
-        key = _key(self.session, kind, identity, self.source)
-        existing = self.stage.get("spans", key)
-        if existing is None:
-            if timestamp is None:
-                self.diagnose("missing_span_timestamp", 0)
-                return None
-            self.stage.put(
-                "spans",
-                key,
-                dict(
-                    span_key=key,
-                    trace_key=self.trace,
-                    parent_span_key=parent,
-                    kind=kind,
-                    name=name,
-                    started_at=timestamp,
-                    status="incomplete",
-                    sampled=True,
-                    metadata_json=json.dumps({"source": self.source, "timing_quality": "observed"}),
-                ),
-            )
-        self.stage.put("spans", key, values)
-        return key
-
-    def turn(self, turn_id: str | None, timestamp: str | None) -> str | None:
-        """Ensure a turn container without duplicating mirrored user events."""
-        if turn_id:
-            self.current = str(turn_id)
-        if self.current is None:
-            self.legacy_turn += 1
-            self.current = f"legacy:{self.legacy_turn}"
-            self.diagnose("fallback_turn_identity", 0)
-        self.turns.add(self.current)
-        return self.span(self.current, "agent", f"{self.source}.turn", timestamp, self.trace)
-
-    def finish(
-        self,
-        key: str,
-        end: str | None,
-        status: str,
-        line: int,
-        start: str | None = None,
-        **values: Any,
-    ) -> None:
-        """Prefer explicit intervals; absence or invalid order stays visible."""
-        existing = self.stage.get("spans", key)
-        if existing is None:
-            return
-        if start:
-            values["started_at"] = start
-        begin = start or existing["started_at"]
-        if end:
-            duration = (
-                round(
-                    (datetime.fromisoformat(end) - datetime.fromisoformat(begin)).total_seconds()
-                    * 1000
-                )
-                if begin
-                else -1
-            )
-            values["ended_at"] = end
-            if duration >= 0:
-                values["duration_ms"] = duration
-            else:
-                values["duration_ms"] = None
-                if begin:
-                    self.diagnose("negative_interval", line)
-        values["status"] = status
-        if start and end:
-            values["metadata_json"] = json.dumps(
-                {"source": self.source, "timing_quality": "explicit"}
-            )
-        self.stage.put("spans", key, values)
+    def consume(self, event, line):
+        """Public ordered record consumption contract."""
+        return self.parse(event, line)
 
     def parse(self, event: dict, line: int) -> None:
         """Dispatch known native rollout families, ignoring unrelated records."""
@@ -268,6 +62,7 @@ class _Parser:
             self.task_pending = True
             if payload.get("model"):
                 self.models[self.current] = payload["model"]
+                self.effective_model = payload["model"]
         elif family == "response_item":
             self.item(payload, timestamp, line)
         elif family == "token_usage_record":
@@ -285,6 +80,8 @@ class _Parser:
                 key = self.turn(payload.get("turn_id"), timestamp)
                 if key:
                     values = {}
+                    if type(payload.get("duration_ms")) in (int, float):
+                        values["duration_ms"] = payload["duration_ms"]
                     if isinstance(payload.get("last_agent_message"), str):
                         values["output_json"] = payload["last_agent_message"]
                     self.finish(
@@ -303,20 +100,13 @@ class _Parser:
                         payload["item"],
                         timestamp,
                         line,
-                        _timestamp(payload.get("started_at_ms")),
-                        _timestamp(payload.get("completed_at_ms")),
+                        _timestamp(payload.get("started_at_ms"), unit="milliseconds"),
+                        _timestamp(payload.get("completed_at_ms"), unit="milliseconds"),
                     )
                 else:
                     self.diagnose("invalid_completed_item", line, True)
             elif kind == "token_count":
-                info = payload.get("info") or {}
-                usage = _counts(info.get("total_token_usage")) if isinstance(info, dict) else {}
-                if usage:
-                    self.stage.put(
-                        "usage",
-                        "legacy:thread",
-                        dict(scope="thread", observed_at=timestamp, usage=usage),
-                    )
+                self.native_usage(payload, timestamp, line)
             elif kind == "user_message":
                 # response_item messages are authoritative; legacy notifications are mirrors.
                 self.counts["ignored"] += 1
@@ -334,6 +124,11 @@ class _Parser:
         end: str | None = None,
     ) -> None:
         """Correlate messages and tool operations from old and modern records."""
+        response = item.get("response_id")
+        if response:
+            self.observe_response(response, timestamp, item.get("model"))
+        elif item.get("type") in ("function_call", "custom_tool_call", "toolCall"):
+            self.diagnose("ambiguous_tool_model_association", line)
         kind = item.get("type")
         if kind in ("message", "userMessage", "agentMessage", "UserMessage", "AgentMessage"):
             role = item.get("role") or (
@@ -351,6 +146,12 @@ class _Parser:
             if key and text:
                 field = "input_json" if role == "user" else "output_json"
                 self.stage.put("spans", key, {field: text})
+                if role == "assistant" and response:
+                    self.stage.append_text(
+                        _key(self.session, "llm", response, self.source),
+                        item.get("id") or f"line:{line}",
+                        text,
+                    )
             self.task_pending = True
             return
         if kind in ("CommandExecution", "McpToolCall"):
@@ -384,7 +185,7 @@ class _Parser:
         key = _key(self.session, "tool", call_id, self.source)
         existing = self.stage.get("spans", key)
         if kind in call_kinds:
-            name = item.get("name") or "codex.tool"
+            name = item.get("name") or f"{self.source}.tool"
             value = item.get("arguments", item.get("input"))
             definition = hashlib.sha256(
                 json.dumps([name, value], sort_keys=True).encode()
@@ -402,6 +203,8 @@ class _Parser:
             )
             if key:
                 patch = {"name": name}
+                if response:
+                    patch["parent_span_key"] = _key(self.session, "llm", response, self.source)
                 if existing and timestamp and timestamp < existing["started_at"]:
                     patch["started_at"] = start or timestamp
                 self.stage.put("spans", key, patch)
@@ -411,7 +214,7 @@ class _Parser:
                     )
         elif existing is None:
             self.diagnose("unmatched_tool_output", line)
-            key = self.span(call_id, "tool", "codex.tool", timestamp, parent)
+            key = self.span(call_id, "tool", f"{self.source}.tool", timestamp, parent)
         if key is None:
             self.diagnose("missing_operation_timestamp", line, True)
             return
@@ -467,7 +270,8 @@ class _Parser:
                 dict(
                     scope="response",
                     response_id=response,
-                    turn_id=payload.get("turn_id"),
+                    turn_id=payload.get("turn_id") or self.current,
+                    model=payload.get("model") or self.effective_model,
                     observed_at=timestamp,
                     usage=usage,
                 ),
@@ -487,189 +291,81 @@ class _Parser:
                     ),
                 )
 
-    def model_records(self) -> None:
-        """A response ID proves a call occurred, but does not invent its timing."""
-        for _, usage in self.stage.rows("usage"):
-            if usage["scope"] != "response" or not usage.get("response_id"):
-                continue
-            response = usage["response_id"]
-            span_key = _key(self.session, "llm", response, self.source)
-            observed = usage.get("observed_at")
-            values = usage["usage"]
-            model = usage.get("model") or self.models.get(usage.get("turn_id"))
-            parent = (
-                _key(self.session, "agent", usage["turn_id"], self.source)
-                if usage.get("turn_id")
-                else self.trace
-            )
-            if self.stage.get("spans", span_key) is None:
-                self.stage.put(
-                    "spans",
-                    span_key,
-                    dict(
-                        span_key=span_key,
-                        trace_key=self.trace,
-                        parent_span_key=parent,
-                        kind="llm",
-                        name=model or "model",
-                        started_at=None,
-                        observed_at=observed,
-                        status="ok",
-                        sampled=True,
-                        metadata_json=json.dumps(
-                            {"source": self.source, "timing_quality": "unknown"}
-                        ),
-                    ),
-                )
-            self.stage.put("usage", "response:" + response, {"span_key": span_key})
-            span = self.stage.get("spans", span_key)
-            output = span.get("output_json")
-            if output:
-                try:
-                    decoded = json.loads(output)
-                    output = decoded if isinstance(decoded, str) else output
-                except ValueError:
-                    pass
-            incoming, outgoing = values.get("input_tokens"), values.get("output_tokens")
+    def observe_response(self, response, timestamp, model=None):
+        """An explicit provider response identity proves a call, even without usage."""
+        span = _key(self.session, "llm", response, self.source)
+        if self.stage.get("spans", span) is None:
             self.stage.put(
-                "runs",
-                span_key,
+                "spans",
+                span,
                 dict(
-                    run_key=span_key,
-                    span_key=span_key,
-                    provider="anthropic" if self.source == "claude-code" else "openai",
-                    model=model,
-                    response_id=response,
-                    created_at=observed or span.get("observed_at") or self.first,
-                    status=span["status"],
-                    output_text=output,
-                    prompt_tokens=incoming,
-                    completion_tokens=outgoing,
-                    total_tokens=values.get("total_tokens"),
-                    usage_details=json.dumps(values),
+                    span_key=span,
+                    trace_key=self.trace,
+                    parent_span_key=_key(self.session, "agent", self.current, self.source)
+                    if self.current
+                    else self.trace,
+                    kind="llm",
+                    name=model or self.effective_model or "model",
+                    started_at=None,
+                    observed_at=timestamp,
+                    status="ok",
+                    sampled=True,
+                    metadata_json=json.dumps({"source": self.source, "timing_quality": "unknown"}),
                 ),
             )
 
-    def summary(self) -> dict:
-        """Compute counts and usage without mixing deltas with snapshots."""
-        if self.session is None:
-            raise ValueError("Codex missing_session_metadata")
-        self.finish(self.trace, self.last, "incomplete", 0)
-        self.model_records()
-        statuses = []
-        counts = Counter()
-        for key, row in self.stage.rows("spans"):
-            counts[row["kind"]] += 1
-            if row["kind"] == "agent" and key != self.trace:
-                statuses.append(row["status"])
-        if statuses and all(s != "incomplete" for s in statuses):
+    def native_usage(self, payload, timestamp, line):
+        """Separate last-call observations, repeated snapshots and accounting resets."""
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return
+        total = _counts(info.get("total_token_usage"))
+        last = _counts(info.get("last_token_usage"))
+        previous = self.usage_snapshot
+        reset = bool(
+            total and previous and any(total[k] < v for k, v in previous.items() if k in total)
+        )
+        if reset:
             self.stage.put(
-                "spans", self.trace, {"status": "cancelled" if "cancelled" in statuses else "ok"}
+                "usage",
+                f"epoch:{self.usage_epoch}",
+                dict(scope="accounting_epoch", observed_at=timestamp, usage=previous),
             )
-        usage_rows = list(self.stage.rows("usage"))
-        modern = [(k, v) for k, v in usage_rows if not k.startswith("legacy:")]
-        if modern:
-            self.stage.db.execute_sql("DELETE FROM usage WHERE key LIKE 'legacy:%'")
-            usage_rows = modern
-        total = Counter()
-        for _, row in usage_rows:
-            if row["scope"] == "response":
-                total.update(row["usage"])
-        response_total = dict(total)
-        snapshot = next((v["usage"] for _, v in usage_rows if v["scope"] == "thread"), None)
-        if snapshot:
-            total = Counter(snapshot)
-        required = ("input_tokens", "output_tokens", "total_tokens")
-        complete = bool(snapshot) and all(
-            k in snapshot and k in response_total and snapshot[k] == response_total[k]
-            for k in required
-        )
-        if self.source == "claude-code":
-            responses = [v for _, v in usage_rows if v["scope"] == "response"]
-            complete = (
-                bool(responses)
-                and len(responses) == counts["llm"]
-                and all(all(k in v["usage"] for k in required) for v in responses)
+            self.usage_epoch += 1
+            self.diagnose("usage_accounting_reset", line)
+        fingerprint = json.dumps([self.current, self.effective_model, total, last], sort_keys=True)
+        repeated = fingerprint == self.usage_notification or (bool(total) and total == previous)
+        if total:
+            self.stage.put(
+                "usage", "legacy:thread", dict(scope="thread", observed_at=timestamp, usage=total)
             )
-        completeness = (
-            "complete"
-            if complete and not self.counts["malformed"]
-            else "partial"
-            if any(v["usage"] for _, v in usage_rows)
-            else "unknown"
-        )
-        unattributed = {
-            k: v - response_total.get(k, 0)
-            for k, v in dict(total).items()
-            if v > response_total.get(k, 0)
-        }
-        return dict(
-            session_id=self.session,
-            trace_key=self.trace,
-            input_records=self.counts["records"],
-            agent_spans=counts["agent"],
-            tool_spans=counts["tool"],
-            model_spans=counts["llm"],
-            usage_records=len(usage_rows),
-            ignored_records=self.counts["ignored"],
-            malformed_records=self.counts["malformed"],
-            diagnostics=[asdict(d) for d in self.diagnostics],
-            total_usage=dict(total),
-            usage_completeness=completeness,
-            response_usage=response_total,
-            unattributed_usage=unattributed,
-            timing_quality="observed",
-            parser_revision=_REVISION,
-        )
+            self.usage_snapshot = total
+        if repeated:
+            return
+        self.usage_notification = fingerprint
+        if last:
+            operation = f"usage:{self.usage_epoch}:{line}"
+            self.stage.put(
+                "usage",
+                f"observation:{operation}",
+                dict(
+                    scope="response",
+                    operation_id=operation,
+                    response_id=None,
+                    turn_id=self.current,
+                    model=self.effective_model,
+                    observed_at=timestamp,
+                    usage=last,
+                ),
+            )
+            self.diagnose("usage_observation_without_response_id", line)
+        elif total:
+            self.diagnose("unattributed_usage_snapshot", line)
 
 
-def import_codex(
-    path: str | Path, *, db_path: str | Path | None = None, strict: bool = False
-) -> ImportReport:
-    """Import one saved session atomically; errors preserve the previous snapshot.
+_Parser = CodexTrace
 
-    Imports bypass live sampling and the telemetry queue. Redaction still applies,
-    and original activity timestamps determine eligibility for normal retention.
-    """
-    settings = get_settings()
-    if not settings.enabled or settings.write_mode == "off":
-        raise ValueError("Codex import requires enabled tracking and write_mode other than off")
-    destination = str(Path(db_path or settings.db_path).absolute())
-    digest = hashlib.sha256()
-    with (
-        _source(Path(path)) as source,
-        tempfile.TemporaryDirectory(prefix="promptkeep-import-") as temp,
-    ):
-        stage = storage._ImportStage(str(Path(temp) / "stage.db"), settings)
-        try:
-            parser = _Parser(stage, strict)
-            for number, raw in enumerate(source, 1):
-                digest.update(raw)
-                parser.counts["records"] += 1
-                try:
-                    event = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
-                    parser.diagnose("invalid_json", number, True)
-                    continue
-                try:
-                    parser.parse(event, number)
-                except (TypeError, AttributeError, KeyError):
-                    parser.diagnose("invalid_record_shape", number, True)
-            summary = parser.summary()
-            outcome = storage.persist_import(
-                stage,
-                db_path=destination,
-                session_id=parser.session,
-                trace_key=parser.trace,
-                digest=digest.hexdigest(),
-                revision=_REVISION,
-                summary=summary,
-            )
-            report = {
-                k: summary[k]
-                for k in ImportReport.__dataclass_fields__
-                if k not in ("outcome", "diagnostics")
-            }
-            return ImportReport(**report, outcome=outcome, diagnostics=tuple(parser.diagnostics))
-        finally:
-            stage.close()
+
+def import_codex(path, *, db_path=None, strict=False) -> ImportReport:
+    """Compatibility entry point for explicit Codex archives."""
+    return _import_trace(path, source="codex", db_path=db_path, strict=strict)

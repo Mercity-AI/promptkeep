@@ -2,24 +2,45 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import tempfile
-from pathlib import Path
+import re
 
-from .. import storage
-from ..config import get_settings
-from .codex import ImportReport, _key, _Parser, _source, _timestamp, _visible
+from .base import AgentTrace, ImportReport, _key, _timestamp, _visible
+from .engine import import_trace as _import_trace
 
-_REVISION = 2
+_REVISION = 3
 
 
-class _ClaudeParser(_Parser):
+def _classify(event, message):
+    """Use native flags and complete recognized envelopes, never substring matches."""
+    content = message.get("content", [])
+    blocks = content if isinstance(content, list) else []
+    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
+        return "tool_result"
+    if event.get("isCompactSummary"):
+        return "compaction"
+    if event.get("isMeta") or event.get("isVisibleInTranscriptOnly"):
+        return "injected_note"
+    text = _visible(content)
+    if text in ("[Request interrupted by user]", "[Request interrupted by user for tool use]"):
+        return "interruption"
+    if isinstance(text, str) and re.fullmatch(
+        r"\s*<(local-command-stdout|local-command-stderr|command-message|command-name|system-reminder)>[\s\S]*</\1>\s*",
+        text,
+    ):
+        return "command_output" if text.lstrip().startswith("<local-command-") else "injected_note"
+    return "prompt"
+
+
+class ClaudeCodeTrace(AgentTrace):
     """Preserve explicit message ancestry and response/tool identities."""
 
     source = "claude-code"
+    provider = "anthropic"
+    revision = _REVISION
+    per_call_complete = True
 
-    def __init__(self, stage, strict, session, native_session=None, agent_id=None):
+    def __init__(self, stage, strict=False, session=None, native_session=None, agent_id=None):
         """Session identity is discovered before payloads are staged."""
         super().__init__(stage, strict)
         self.session = session
@@ -92,8 +113,27 @@ class _ClaudeParser(_Parser):
         parent_turn = self.message_turns.get(event.get("parentUuid"))
         if parent_turn:
             self.current = parent_turn
-        is_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
-        if kind == "user" and not is_result:
+        classification = _classify(event, message) if kind == "user" else "assistant"
+        if kind == "user" and classification not in ("prompt", "tool_result"):
+            self.message_turns[identity] = self.current
+            parent = (
+                _key(self.session, "agent", self.current, self.source)
+                if self.current
+                else self.trace
+            )
+            self.span(
+                identity,
+                "operation",
+                classification,
+                timestamp,
+                parent,
+                status="ok",
+                output_json=_visible(content),
+            )
+            if classification == "interruption" and self.current:
+                self.finish(parent, timestamp, "cancelled", line)
+            return
+        if kind == "user" and classification == "prompt":
             self.current = identity
             turn = self.turn(identity, timestamp)
             if turn:
@@ -135,7 +175,17 @@ class _ClaudeParser(_Parser):
                         ),
                     ),
                 )
-            text = _visible(content)
+            text = (
+                _visible(content)
+                or "\n".join(
+                    b["refusal"]
+                    for b in blocks
+                    if isinstance(b, dict)
+                    and b.get("type") == "refusal"
+                    and isinstance(b.get("refusal"), str)
+                )
+                or None
+            )
             if text:
                 self.stage.append_text(model_key, identity, text)
                 if turn:
@@ -172,7 +222,7 @@ class _ClaudeParser(_Parser):
             for block in blocks:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
-                self.item(
+                self.tool_record(
                     dict(
                         type="function_call",
                         call_id=block.get("id"),
@@ -185,12 +235,22 @@ class _ClaudeParser(_Parser):
                 tool_key = _key(self.session, "tool", block.get("id"), self.source)
                 if self.stage.get("spans", tool_key):
                     self.stage.put("spans", tool_key, {"parent_span_key": model_key})
-            if turn and message.get("stop_reason") in ("end_turn", "stop_sequence", "max_tokens"):
+            refusal = message.get("stop_reason") == "refusal" or any(
+                isinstance(b, dict) and b.get("type") == "refusal" for b in blocks
+            )
+            if refusal:
+                metadata = json.loads(self.stage.get("spans", model_key)["metadata_json"])
+                self.stage.put(
+                    "spans", model_key, {"metadata_json": json.dumps(metadata | {"refusal": True})}
+                )
+            if turn and (
+                refusal or message.get("stop_reason") in ("end_turn", "stop_sequence", "max_tokens")
+            ):
                 self.finish(turn, timestamp, "ok", line)
         else:
             for block in blocks:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    self.item(
+                    self.tool_record(
                         dict(
                             type="function_call_output",
                             call_id=block.get("tool_use_id"),
@@ -201,77 +261,78 @@ class _ClaudeParser(_Parser):
                         line,
                     )
 
+    def tool_record(self, record, timestamp, line):
+        """Correlate explicit tool-use IDs using the common span lifecycle."""
+        identity = record.get("call_id")
+        if not isinstance(identity, str) or not identity:
+            self.diagnose("missing_tool_identity", line, True)
+            return
+        turn_id = self.call_turns.get(identity) or self.current
+        parent = _key(self.session, "agent", turn_id, self.source) if turn_id else self.trace
+        span = _key(self.session, "tool", identity, self.source)
+        if record["type"] == "function_call":
+            self.call_turns[identity] = self.current
+            self.span(
+                identity,
+                "tool",
+                record.get("name") or "tool",
+                timestamp,
+                parent,
+                input_json=record.get("arguments"),
+            )
+        else:
+            existing = self.stage.get("spans", span)
+            if existing is None:
+                self.diagnose("unmatched_tool_output", line)
+                span = self.span(identity, "tool", "tool", timestamp, parent)
+            if span:
+                self.finish(
+                    span,
+                    timestamp,
+                    "error" if record.get("is_error") else "ok" if existing else "incomplete",
+                    line,
+                    output_json=record.get("output"),
+                )
 
-def import_claude_code(
-    path: str | Path, *, db_path: str | Path | None = None, strict: bool = False
-) -> ImportReport:
-    """Import one explicit native transcript; never scan unrelated subagent files."""
-    settings = get_settings()
-    if not settings.enabled or settings.write_mode == "off":
-        raise ValueError("Claude import requires enabled tracking and write_mode other than off")
-    destination = str(Path(db_path or settings.db_path).absolute())
-    native_session = None
-    agent_id = None
-    # A subagent can share its parent's sessionId; agentId must namespace its archive.
-    with _source(Path(path)) as source:
-        for raw in source:
-            try:
-                event = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                continue
+    @classmethod
+    def detect(cls, record):
+        """Identify Claude transcript identity envelopes."""
+        return (
+            isinstance(record, dict)
+            and isinstance(record.get("sessionId"), str)
+            and record.get("type") in ("user", "assistant", "system")
+        )
+
+    def discover(self, records):
+        """Namespace independent subagent transcripts before consumption."""
+        native, agent = None, None
+        for _, event in records:
             if not isinstance(event, dict):
                 continue
             identity = event.get("sessionId")
             if isinstance(identity, str):
-                if native_session is not None and native_session != identity:
+                if native is not None and native != identity:
                     raise ValueError("Claude conflicting_session_identity")
-                native_session = identity
-            if event.get("type") in ("user", "assistant") and event.get("agentId"):
-                candidate = event["agentId"]
-                if not isinstance(candidate, str) or (
-                    agent_id is not None and agent_id != candidate
-                ):
+                native = identity
+            candidate = event.get("agentId") if event.get("type") in ("user", "assistant") else None
+            if candidate:
+                if not isinstance(candidate, str) or (agent is not None and agent != candidate):
                     raise ValueError("Claude conflicting_agent_identity")
-                agent_id = candidate
-    if not native_session:
-        raise ValueError("Claude missing_session_identity")
-    session = native_session + ":agent:" + agent_id if agent_id else native_session
-    digest = hashlib.sha256()
-    with (
-        _source(Path(path)) as source,
-        tempfile.TemporaryDirectory(prefix="promptkeep-import-") as temp,
-    ):
-        stage = storage._ImportStage(str(Path(temp) / "stage.db"), settings)
-        try:
-            parser = _ClaudeParser(stage, strict, session, native_session, agent_id)
-            for line, raw in enumerate(source, 1):
-                digest.update(raw)
-                parser.counts["records"] += 1
-                try:
-                    event = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
-                    parser.diagnose("invalid_json", line, True)
-                    continue
-                try:
-                    parser.parse(event, line)
-                except (TypeError, AttributeError, KeyError):
-                    parser.diagnose("invalid_record_shape", line, True)
-            summary = parser.summary()
-            outcome = storage.persist_import(
-                stage,
-                db_path=destination,
-                session_id=session,
-                trace_key=parser.trace,
-                digest=digest.hexdigest(),
-                revision=_REVISION,
-                summary=summary,
-                source="claude-code",
-            )
-            values = {
-                k: summary[k]
-                for k in ImportReport.__dataclass_fields__
-                if k not in ("outcome", "diagnostics")
-            }
-            return ImportReport(**values, outcome=outcome, diagnostics=tuple(parser.diagnostics))
-        finally:
-            stage.close()
+                agent = candidate
+        if not native:
+            raise ValueError("Claude missing_session_identity")
+        self.native_session, self.agent_id = native, agent
+        self.session = native + ":agent:" + agent if agent else native
+        self.trace = _key(self.session, "agent", "session", self.source)
+
+    def consume(self, event, line):
+        """Public ordered record consumption contract."""
+        return self.parse(event, line)
+
+
+_ClaudeParser = ClaudeCodeTrace
+
+
+def import_claude_code(path, *, db_path=None, strict=False) -> ImportReport:
+    """Compatibility entry point for explicit Claude Code archives."""
+    return _import_trace(path, source="claude-code", db_path=db_path, strict=strict)

@@ -8,14 +8,11 @@ import logging
 import tempfile
 import threading
 import uuid
-from collections import Counter
-from dataclasses import asdict
 from pathlib import Path
 
 from . import storage
 from .config import get_settings
-from .importers.claude_code import _ClaudeParser
-from .importers.codex import ImportDiagnostic, _Parser
+from .importers.engine import import_session, records, select_adapter
 
 logger = logging.getLogger("promptkeep")
 
@@ -23,17 +20,21 @@ logger = logging.getLogger("promptkeep")
 class Watcher:
     """Watch append-only files without launching or modifying agent processes."""
 
-    def __init__(self, source, path, *, db_path=None, interval=1.0, strict=False):
+    def __init__(self, *args, source="auto", db_path=None, interval=1.0, strict=False):
         """Capture configuration and validate the explicit watch target."""
-        if source not in ("codex", "claude-code"):
-            raise ValueError("watch source must be codex or claude-code")
+        if len(args) == 2:
+            source, path = args  # Historical Watcher(source, path).
+        elif len(args) == 1:
+            path = args[0]
+        else:
+            raise TypeError("Watcher requires a path")
         if interval <= 0:
             raise ValueError("watch interval must be positive")
         self.source, self.path = source, Path(path).absolute()
         if not self.path.exists():
             raise ValueError("watch path does not exist")
-        if self.path.is_file() and self.path.suffix != ".jsonl":
-            raise ValueError("incremental watching requires uncompressed .jsonl files")
+        if self.path.is_file() and self.path.suffix not in (".jsonl", ".json"):
+            raise ValueError("watching requires uncompressed .jsonl or .json files")
         self.settings = get_settings()
         if not self.settings.enabled or self.settings.write_mode == "off":
             raise ValueError("watching requires enabled tracking")
@@ -45,7 +46,7 @@ class Watcher:
         self._sessions = {}
         self._temporary = None
         self.failed_count = 0
-        self.revision = 2
+        self._snapshots = {}
 
     def start(self):
         """Start one explicitly owned worker, idempotently."""
@@ -81,7 +82,11 @@ class Watcher:
         """Poll complete lines and close staging connections on their owner thread."""
         try:
             while not self._stop.is_set():
-                files = [self.path] if self.path.is_file() else self.path.rglob("*.jsonl")
+                files = (
+                    [self.path]
+                    if self.path.is_file()
+                    else (p for p in self.path.rglob("*") if p.suffix in (".jsonl", ".json"))
+                )
                 for path in files:
                     if self._stop.is_set():
                         break
@@ -111,39 +116,6 @@ class Watcher:
             if self._temporary:
                 self._temporary.cleanup()
 
-    def _restore(self, stage, state):
-        """Restore only identifiers/counters; raw payloads are never checkpointed."""
-        parser = (
-            _ClaudeParser(
-                stage,
-                self.strict,
-                state["session"],
-                state.get("native_session"),
-                state.get("agent_id"),
-            )
-            if self.source == "claude-code"
-            else _Parser(stage, self.strict)
-        )
-        for name in (
-            "session",
-            "trace",
-            "current",
-            "first",
-            "last",
-            "legacy_turn",
-            "task_pending",
-            "call_turns",
-            "models",
-            "message_turns",
-            "native_session",
-            "agent_id",
-        ):
-            if name in state:
-                setattr(parser, name, state[name])
-        parser.counts = Counter(state.get("counts", {}))
-        parser.diagnostics = [ImportDiagnostic(**d) for d in state.get("diagnostics", [])]
-        return parser
-
     def _commit(self, stage, parser, checkpoint, finalize=False):
         """State and source offset advance only when all changed rows commit."""
         if parser.session is None:
@@ -154,30 +126,11 @@ class Watcher:
             for key, row in stage.rows("spans"):
                 if row["status"] == "incomplete" or key == parser.trace:
                     stage.put("spans", key, {"status": "running"})
-        names = (
-            "session",
-            "trace",
-            "current",
-            "first",
-            "last",
-            "legacy_turn",
-            "task_pending",
-            "call_turns",
-            "models",
-            "message_turns",
-            "native_session",
-            "agent_id",
-        )
-        checkpoint["state"] = {
-            name: getattr(parser, name) for name in names if hasattr(parser, name)
-        }
-        checkpoint["state"].update(
-            counts=dict(parser.counts), diagnostics=[asdict(d) for d in parser.diagnostics]
-        )
+        checkpoint["state"] = parser.checkpoint_state()
         storage.persist_watch(
             stage,
             db_path=self.db_path,
-            source=self.source,
+            source=parser.source,
             session_id=parser.session,
             trace_key=parser.trace,
             summary=summary,
@@ -187,7 +140,15 @@ class Watcher:
     def _poll(self, path):
         """Read appended complete records; generation changes never delete stored history."""
         path = path.absolute()
-        source_key = hashlib.sha256((self.source + ":" + str(path)).encode()).hexdigest()
+        if path.suffix == ".json":
+            try:
+                json.loads(path.read_bytes())
+            except (ValueError, UnicodeDecodeError):
+                return
+        adapter = select_adapter(path, self.source)
+        source_key = hashlib.sha256((adapter.source + ":" + str(path)).encode()).hexdigest()
+        if adapter.snapshot:
+            return self._poll_snapshot(path, source_key, adapter)
         stat = path.stat()
         generation = f"{stat.st_dev}:{stat.st_ino}"
         session = self._sessions.get(path)
@@ -208,14 +169,16 @@ class Watcher:
                         stage.db.execute_sql(
                             f"INSERT INTO {kind}(key,data) VALUES (?,?)", (key, json.dumps(row))
                         )
-                parser = self._restore(stage, checkpoint["state"])
+                parser = adapter(stage, self.strict)
+                parser.restore_state(checkpoint["state"])
             else:
-                parser = _Parser(stage, self.strict) if self.source == "codex" else None
+                parser = adapter(stage, self.strict)
+                parser.discover(records(path, complete_lines=True))
                 checkpoint = dict(
                     source_key=source_key,
                     generation=generation,
                     byte_offset=0,
-                    parser_revision=self.revision,
+                    parser_revision=adapter.revision,
                     state={},
                 )
             checkpoint["source_key"] = source_key
@@ -225,14 +188,18 @@ class Watcher:
         if (
             checkpoint["generation"] != generation
             or stat.st_size < checkpoint["byte_offset"]
-            or checkpoint["parser_revision"] != self.revision
+            or checkpoint["parser_revision"] != adapter.revision
         ):
-            # Reparse a replacement prefix using stable IDs; old observations are retained.
-            checkpoint.update(generation=generation, byte_offset=0, parser_revision=self.revision)
+            # A revision rebuild reconciles obsolete owned rows; rotation retains history.
+            checkpoint["reconcile"] = checkpoint["parser_revision"] != adapter.revision
+            checkpoint.update(
+                generation=generation, byte_offset=0, parser_revision=adapter.revision
+            )
             for kind in ("spans", "runs", "usage"):
                 stage.db.execute_sql(f"DELETE FROM {kind}")
                 stage.dirty[kind].clear()
-            parser = _Parser(stage, self.strict) if self.source == "codex" else None
+            parser = adapter(stage, self.strict)
+            parser.discover(records(path, complete_lines=True))
         offset = checkpoint["byte_offset"]
         changed = False
         with path.open("rb") as source:
@@ -248,17 +215,38 @@ class Watcher:
                     if self.strict:
                         raise ValueError("invalid watched JSON record") from None
                     continue
-                if parser is None:
-                    identity = event.get("sessionId") if isinstance(event, dict) else None
-                    if not identity or event.get("type") not in ("user", "assistant"):
-                        continue
-                    agent_id = event.get("agentId")
-                    logical = identity + ":agent:" + agent_id if agent_id else identity
-                    parser = _ClaudeParser(stage, self.strict, logical, identity, agent_id)
                 parser.counts["records"] += 1
-                parser.parse(event, parser.counts["records"])
+                parser.consume(event, parser.counts["records"])
                 changed = True
         if parser is not None and changed:
             checkpoint["byte_offset"] = offset
             self._commit(stage, parser, checkpoint)
         self._sessions[path] = (stage, parser, checkpoint)
+
+    def _poll_snapshot(self, path, source_key, adapter):
+        """Commit only complete valid JSON replacements with their checkpoints."""
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if self._snapshots.get(path) == digest:
+            return
+        try:
+            document = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return  # An editor may still be writing the replacement.
+        stat = path.stat()
+        checkpoint = dict(
+            source_key=source_key,
+            generation=f"{stat.st_dev}:{stat.st_ino}",
+            byte_offset=len(raw),
+            parser_revision=adapter.revision,
+            state={},
+        )
+        import_session(
+            lambda: iter(((1, document),)),
+            adapter=adapter,
+            digest=digest,
+            db_path=self.db_path,
+            strict=True,
+            checkpoint=checkpoint,
+        )
+        self._snapshots[path] = digest

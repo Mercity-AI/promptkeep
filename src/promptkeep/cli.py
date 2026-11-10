@@ -31,7 +31,7 @@ from typing import Any
 
 from . import history
 from .config import configure, get_settings
-from .importers import import_claude_code, import_codex, import_dataset
+from .importers import import_dataset, import_trace
 from .watch import Watcher
 
 # ANSI colours for `diff`, used only when writing to a terminal.
@@ -41,6 +41,9 @@ _RED, _GREEN, _CYAN, _RESET = "\033[31m", "\033[32m", "\033[36m", "\033[0m"
 def main(argv: Sequence[str] | None = None) -> None:
     """Parse args and dispatch to the requested subcommand."""
     args = _build_parser().parse_args(argv)
+    if args.command in ("import", "watch"):
+        if args.legacy_path is not None:
+            args.source, args.path = args.path, args.legacy_path
     if args.db:
         configure(db_path=args.db)
     if args.command == "import":
@@ -50,8 +53,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     raise ValueError("--dataset is required for dataset imports")
                 report = import_dataset(args.path, dataset=args.dataset, strict=args.strict)
             else:
-                importer = import_codex if args.source == "codex" else import_claude_code
-                report = importer(args.path, strict=args.strict)
+                report = import_trace(args.path, source=args.source, strict=args.strict)
         except Exception as exc:
             raise SystemExit(f"promptkeep: import failed ({type(exc).__name__}): {exc}") from None
         if args.json:
@@ -69,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "watch":
         try:
             watcher = Watcher(
-                args.source, args.path, interval=args.interval, strict=args.strict
+                args.path, source=args.source, interval=args.interval, strict=args.strict
             ).start()
         except (ValueError, OSError) as exc:
             raise SystemExit(f"promptkeep: {exc}") from None
@@ -114,16 +116,18 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     importer = commands.add_parser("import", parents=[common], help="import a saved session")
-    importer.add_argument("source", choices=["codex", "claude-code", "dataset"])
     importer.add_argument("path")
+    importer.add_argument("legacy_path", nargs="?")
+    importer.add_argument("--source", default="auto")
     importer.add_argument("--dataset")
     importer.add_argument("--strict", action="store_true")
     importer.add_argument("--json", action="store_true")
     watch = commands.add_parser(
         "watch", parents=[common], help="watch explicit native session paths"
     )
-    watch.add_argument("source", choices=["codex", "claude-code"])
     watch.add_argument("path")
+    watch.add_argument("legacy_path", nargs="?")
+    watch.add_argument("--source", default="auto")
     watch.add_argument("--interval", type=float, default=1.0)
     watch.add_argument("--strict", action="store_true")
     traces = commands.add_parser("traces", parents=[common], help="list recorded traces")

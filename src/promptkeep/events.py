@@ -17,6 +17,25 @@ def key(source: str, trace_id: str, span_id: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, repr((source, trace_id, span_id))))
 
 
+class _FrozenDict(dict):
+    """JSON-compatible immutable mapping for normalized event facts."""
+
+    def _immutable(self, *args, **kwargs):
+        """Reject changes after the event has snapshotted its source values."""
+        raise TypeError("TraceEvent values are immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+
+
+def _freeze(value):
+    """Detach nested JSON values from their caller and freeze every container."""
+    if isinstance(value, dict):
+        return _FrozenDict((k, _freeze(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
 @dataclass(frozen=True)
 class Event:
     """Observed operation data; missing timing and usage are never estimated."""
@@ -43,6 +62,15 @@ class Event:
     cost_usd: float | None = None
     link_keys: tuple[str, ...] = ()
     destination: str | None = None
+    duration_ms: int | float | None = None
+    input_present: bool = False
+    output_present: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Snapshot JSON fields so a queued observation cannot change underneath us."""
+        for name in ("input", "output", "usage", "metadata", "links", "link_keys"):
+            object.__setattr__(self, name, _freeze(getattr(self, name)))
 
     @property
     def span_key(self) -> str:
@@ -91,3 +119,6 @@ def current() -> Event | None:
         )
         else None
     )
+
+
+TraceEvent = Event
