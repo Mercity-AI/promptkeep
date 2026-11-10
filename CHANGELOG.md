@@ -8,6 +8,29 @@ how deprecations work, is in [docs/API.md](docs/API.md).
 
 ## [Unreleased]
 
+### Added
+
+- Public `AgentTrace`, `CodexTrace`, `ClaudeCodeTrace`, `OpenCodeTrace`, immutable
+  `TraceEvent`, `register_agent_trace()` and `import_trace()` APIs under `importers`.
+- Automatic `promptkeep import PATH [--source SOURCE]` and `watch PATH` selection,
+  including mixed-source directories and third-party registered adapters.
+- Modern and legacy OpenCode saved exports, including atomic snapshot watching,
+  session parent links, per-message models, tool failures and source cost provenance.
+
+### Fixed
+
+- Native Codex epoch units, explicit durations, model switches, `token_count` calls,
+  repeated usage notifications and accounting resets. Unknown call timing remains unknown.
+- Claude injected messages, command output, compaction and interruption classification;
+  explicit refusals complete without inflating user turns. Parser revisions rebuild old
+  archive imports and checkpoints when the original source files are available.
+- Reused immutable prepared input survives queue eviction without repeated redaction.
+  Sampled-out known model ancestors remain structural when retained tools reference them.
+- Outside-agent tool warnings are shared across names and limited to once per minute.
+- Nested thread-owned connections reuse trace/worker lifetimes and close on exit;
+  atomic span upserts avoid per-row read-back without changing IMMEDIATE locking.
+
+
 ## [0.4.0] - 2026-11-08
 
 ### Added

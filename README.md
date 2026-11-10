@@ -592,33 +592,47 @@ automatic tool runners, and cloud-specific clients remain outside the supported
 surface. Wrapping Anthropic does not instrument the separate Claude Code process.
 See [`examples/anthropic_trace.py`](examples/anthropic_trace.py).
 
-## Saved Codex and Claude Code sessions
+## Saved Codex, Claude Code and OpenCode sessions
 
 ```bash
 pip install 'promptkeep[codex]'  # needed only for .jsonl.zst decompression
-promptkeep import codex rollout.jsonl --db history.db
-promptkeep import claude-code transcript.jsonl --db history.db
+promptkeep import rollout.jsonl --db history.db
+promptkeep import transcript.jsonl --source claude-code --db history.db
+promptkeep import opencode-export.json --db history.db
 promptkeep traces --db history.db
 promptkeep trace TRACE_KEY --db history.db --json
 ```
 
-Python entry points are `promptkeep.importers.import_codex()` and
-`import_claude_code()`, accepting `path`, optional `db_path`, and `strict=False`.
+Use `promptkeep.importers.import_trace(path, source="auto", db_path=None, strict=False)`.
+Content selects Codex, Claude Code, OpenCode or a registered third-party adapter.
+`import_codex()`, `import_claude_code()` and historical CLI forms remain supported.
 Imports are synchronous, redacted before staging, and atomic per session. Reimporting
 or renaming a file does not duplicate a session. A failed replacement preserves the
 previous snapshot. Imports bypass live sampling and reject disabled/off tracking.
 Retention uses original activity, so old imported sessions can expire normally.
 
-An explicitly identified model response becomes a model span even when its request
-start is absent. Unknown start/end/duration remain `None`; observation time is stored
+Codex native last-call usage observations and explicitly identified responses become
+model spans even when their request start is absent. Unknown call start/end/duration
+remain `None`; observation time is stored
 separately. No provider calls are invented from ordinary assistant text. Claude tool
 errors and message ancestry are preserved, including branches and compaction markers.
-Hidden reasoning, environment snapshots, and unrelated private metadata are excluded.
+Claude injected notes, command output and interruptions do not inflate user-turn counts;
+refusals are completed responses. Codex turn epochs use seconds and source durations are
+preserved, with invalid/disagreeing intervals diagnosed. Repeated usage snapshots do not
+inflate calls or tokens, and model switches remain attached to their original calls.
+
+OpenCode supports modern session-transfer and legacy message/parts saved JSON exports,
+including parent sessions, model switches and tool failures. Native database access is
+outside this release. Source cost retains its harness provenance in span metadata and
+is excluded from provider-billed cost totals. Hidden reasoning, environment snapshots
+and unrelated private metadata are excluded.
 
 `history.imported_session(trace_key)` exposes provenance, diagnostics, usage records,
 response totals, and unattributed usage. Cumulative snapshots are never added to
 response totals. The source summary may overlap linked model-span metrics; do not add
-those two views together. See [`examples/import_codex.py`](examples/import_codex.py).
+those two views together. Parser revisions trigger reparsing, but repairing older imports
+requires the original files. See [`examples/import_trace.py`](examples/import_trace.py)
+and the [adapter contract](docs/API.md#third-party-source-adapters).
 
 The two reviewed Hugging Face formats have explicit local-file adapters:
 
@@ -682,14 +696,17 @@ skipped-timing counts are available on `installation.otlp_export`.
 ## Watch explicitly selected session logs
 
 ```bash
-promptkeep watch codex /path/to/sessions --db history.db
-promptkeep watch claude-code /path/to/transcripts --db history.db
+promptkeep watch /path/to/mixed-sessions --db history.db
+promptkeep watch /path/to/opencode-export.json --db history.db
 ```
 
-`promptkeep.watch.Watcher(source, path, interval=1.0)` offers `start()`, `stop()`,
+`promptkeep.watch.Watcher(path, source="auto", interval=1.0)` offers `start()`, `stop()`,
 `join(timeout)`, and context-manager usage. It reads appended complete JSONL records,
 checkpoints committed offsets, and resumes without duplicating operations. Partial
 last lines wait for completion. Rotation and truncation retain previously observed
 history. Failed commits do not advance the cursor. Only the selected paths are
 watched; compressed files remain saved-import inputs. Watchers never launch or
-modify the agents. Stop CLI watching with Ctrl-C or SIGTERM.
+modify the agents. Each file selects its own adapter. OpenCode exports commit as complete
+JSON snapshots; partial/invalid replacements keep the previous trace. Parser upgrades
+rebuild old checkpoints and reconcile obsolete owned spans. The previous
+`Watcher(source, path)` form still works. Stop CLI watching with Ctrl-C or SIGTERM.

@@ -20,7 +20,7 @@ The public API is exactly this — everything else is internal, however it is re
 |---|---|
 | `promptkeep` | every name in `promptkeep.__all__` |
 | `promptkeep.history` | every function and dataclass whose name has no leading underscore |
-| `promptkeep.importers` | every name in `promptkeep.importers.__all__`: `import_codex`, `import_claude_code`, `import_dataset`, `DatasetImportReport`, `ImportReport`, `ImportDiagnostic` |
+| `promptkeep.importers` | every name in `promptkeep.importers.__all__`: `AgentTrace`, `CodexTrace`, `ClaudeCodeTrace`, `OpenCodeTrace`, `TraceEvent`, `register_agent_trace`, `import_trace`, `import_codex`, `import_claude_code`, `import_dataset`, `DatasetImportReport`, `ImportReport`, `ImportDiagnostic` |
 | `promptkeep.integrations` | every name in `promptkeep.integrations.__all__` — including the `ProviderAdapter` interface a third-party adapter implements |
 | `promptkeep.watch` | `Watcher` and its documented lifecycle methods |
 | Optional integration modules | `PromptKeepTracingProcessor`, `PromptKeepCallbackHandler`, `PromptKeepSpanExporter`, and `OTLPExport`, documented below |
@@ -62,13 +62,16 @@ Some behaviour is API too. Changing any of these is a breaking change, treated a
   go through the configured `redact` hook before queueing; names do not (they are the
   trace's labels, like prompt names). One serialized payload is capped at 64 KiB before a
   visible truncation marker is appended; the cap bounds the serialized value, not the cost
-  of serializing an arbitrary object. Omitted output is distinct from an explicitly
+  of serializing an arbitrary object. Prepared inputs are reused by terminal updates
+  so an evicted start cannot lose the input. Omitted input/output is distinct from an explicitly
   recorded JSON `null`; `SpanInfo.has_input`/`has_output` answer which one it is.
 - **Sampling keeps traces coherent where it can.** A root's cohort is chosen once and shared
   by its normal model steps; errors, blocks, and non-ok known verdicts still force a
   problem-only trace. A call explicitly moved to another conversation follows that
-  conversation's cohort, and its model link may be missing. Earlier successful steps already
-  dropped are not recovered, and a late async verdict cannot restore them.
+  conversation's cohort. When a retained tool names an observed sampled-out model, a
+  minimal ancestor is retained with `sampled=False` and `metadata.sampled_out=True`;
+  discarded payloads and usage stay unavailable. Queue loss and late async verdicts
+  cannot recover discarded call details.
 - **Retention expires traces whole.** The scheduled sweep uses the latest span or linked-run
   activity, so a recent child keeps the trace alive and an abandoned running root eventually
   expires. Prompt/version rows survive; conversation pruning can remove a linked run before
@@ -148,11 +151,17 @@ run per model span even when several prompt versions share the physical call.
 ## Archive imports
 
 ```python
-from promptkeep.importers import import_codex, import_claude_code, import_dataset
-report = import_codex(path, db_path=None, strict=False)
+from promptkeep.importers import import_trace
+report = import_trace(path, source="auto", db_path=None, strict=False)
 ```
 
-Native importers accept one `.jsonl` or `.jsonl.zst` file. Zstandard requires
+Content detection selects an independent registered adapter. Explicit `source="codex"`,
+`"claude-code"`, or `"opencode"` overrides detection; unknown or ambiguous content is
+rejected with payload-free diagnostics. `import_codex()` and `import_claude_code()`
+remain compatibility entry points. The CLI supports `promptkeep import PATH [--source SOURCE]`
+and historical `promptkeep import SOURCE PATH` forms.
+
+Codex and Claude Code importers accept one `.jsonl` or `.jsonl.zst` file. Zstandard requires
 `promptkeep[codex]`. Claude files may contain unrelated leading snapshot records;
 identity is discovered from native session metadata. Separate subagent files must
 be supplied explicitly. Branches and compaction markers retain source relationships.
@@ -182,7 +191,54 @@ identity, trace key, import time, parser revision, summary and usage records. Su
 includes total source usage, response-level usage, unattributed remainder, diagnostics,
 and `complete`/`partial`/`unknown` usage completeness. Source totals may include usage
 already linked to model runs; the source and trace views are not additive. Cumulative
-turn/thread snapshots are never summed. Unknown provider timing remains unknown.
+turn/thread snapshots are never added to per-call usage. Accounting resets retain separate
+closed epochs, without summing repeated notifications. Unknown provider timing remains unknown.
+
+Codex native turn epochs use seconds; explicitly named `*_ms` fields use milliseconds.
+Aware ISO timestamps normalize to UTC. Source `duration_ms` is preserved and disagreements
+with timestamps are diagnosed. Native `token_count` last-call observations create stable
+source-derived operations with unknown `response_id`; repeated cumulative snapshots do
+not create calls. Models are captured in source order. Source IDs establish associations;
+ambiguous tool-to-model relationships remain unlinked and diagnosed.
+
+Claude Code classifies native flags and complete recognized message envelopes before
+creating user turns. Tool results, injected notes, command output, compaction records
+and interruption markers do not add user turns. Quoted marker text remains visible.
+Refusals complete the response with refusal metadata; cancellations and unfinished turns
+stay distinct. Branches, subagent identities, cache accounting and tool links survive.
+
+OpenCode accepts complete `.json` exports: current session-transfer objects (`info` plus
+ordered typed `messages`) and legacy `info` plus `messages[].info/parts`. Native database
+access is outside this API. Session parents, message order, models, tools, failures and
+recorded times are preserved. Reasoning text and environment/account metadata are omitted.
+OpenCode source cost is stored in model-span metadata as `source_cost_usd` with
+`cost_provenance="harness_reported"`; it does not populate provider-billed run cost.
+
+Parser upgrades reparse unchanged archives. Repairing previously imported dates, counts
+and missing model calls requires the original source files; the database alone cannot
+reconstruct those facts.
+
+### Third-party source adapters
+
+Subclass `AgentTrace` independently, set a unique `source` and integer `revision`, then
+call `register_agent_trace(MyTrace)`. The engine constructs `MyTrace(stage, strict=False)`.
+The stage is an opaque delivery sink; adapters need no SQL or other agent parser.
+
+- `detect(record)` is a class method recognizing a native envelope from content.
+- `discover(records)` optionally reads a replayable iterator of `(line, record)` pairs
+  for session identity discovery before consumption.
+- `consume(record, line)` interprets each ordered source record. Set `session`, `trace`,
+  `first` and `last`; use `span()`/`finish()` or `stage_event(TraceEvent(...))` to emit data.
+- `finalize()` defaults to common span/run reduction and summary reporting.
+- `checkpoint_state()` and `restore_state(state)` serialize identifiers and counters.
+  Overrides must not include raw payloads. Increment `revision` after interpretation changes.
+
+Set `snapshot=True` for complete JSON replacements; the default is append-only JSONL.
+Registered adapters work with `import_trace()` and `Watcher()` without dispatcher edits.
+`TraceEvent` is frozen and snapshots nested JSON containers. It supports partial payload
+updates, `input_present=True`/`output_present=True` for explicit null, source `duration_ms`,
+usage, model identity, parentage and links. Archive and framework events share preparation
+and payload controls; archives bypass live sampling and commit atomically.
 
 Default parsing diagnoses malformed known records; `strict=True` rejects them.
 Unknown types remain ignorable. Invalid identities, conflicts, corrupt compression,
@@ -245,23 +301,33 @@ prevent loops.
 
 ## Watching saved files
 
-`Watcher(source, path, db_path=None, interval=1.0, strict=False)` accepts source
-`codex` or `claude-code` and an explicit file/directory. It provides `start`, `stop`,
-`join(timeout)`, context-manager support and `failed_count`. Only uncompressed JSONL
-is watched. Start is idempotent while running; stop never terminates an agent.
+`Watcher(path, source="auto", db_path=None, interval=1.0, strict=False)` accepts an
+explicit file or directory. `Watcher(source, path, ...)` remains supported. Content is
+detected independently for each file in a mixed-source directory. The watcher exposes
+`start`, `stop`, `join(timeout)`, context-manager support and `failed_count`.
 
-Only complete lines advance the persisted cursor. Normalized updates and checkpoint
-state commit together; restart resumes from the committed offset. Rotation/truncation
-retain old observations rather than running archive replacement. Active observations
-are running; shutdown without completion preserves incomplete state. Cursor paths are
-hashed and payload staging is redacted. Reimporting a final saved snapshot reconciles
-through the same source identities.
+For JSONL, only complete lines advance the persisted cursor. Normalized updates and
+checkpoint state commit together; restart resumes from the committed offset. Rotation
+and truncation retain prior observations. Outdated parser checkpoints rebuild from full
+records and reconcile obsolete importer-owned rows atomically, preserving independent
+traces. Active traces are running; shutdown preserves unfinished operations as incomplete.
+
+OpenCode `.json` exports are complete snapshots. Changed bytes are parsed and validated
+before committing; an invalid/partial replacement preserves the last trace and cursor.
+Compressed files remain archive inputs. Watchers never launch or modify agent processes.
 
 ## Storage and migrations
 
 Schema v11 adds nullable external starts, observation time, external identities and
 links; v12 adds durable watch checkpoints. Existing v9/v10 files migrate forward.
-Connection ownership is thread-local. Operation scopes close only connections they
-opened, queued items retain their original destination, retired writers are joined,
+Connection ownership is thread-local and nested. Synchronous trace lifetimes and grouped
+provider finalization writes reuse connections; async worker operations own bounded scopes.
+Connections are never transferred across threads, and no write transaction spans a provider
+call. Owned resources close on normal exit, exceptions, destination switches and shutdown.
+Queued items retain their original destination, retired writers are joined,
 and late checks retain their originating database. Export observers run after commit;
 rollback cannot publish a span. Existing IMMEDIATE locking remains load-bearing.
+
+Outside-agent tools remain harmless handles. Their warning is shared across names: one
+initial warning, then at most one per minute with the suppressed-call count. Disabled
+tracing does not warn; a fork starts a fresh warning and connection lifetime.
