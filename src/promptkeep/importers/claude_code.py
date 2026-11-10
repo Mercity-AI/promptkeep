@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 
+from ..normalization import PreparedPayload
 from .base import AgentTrace, ImportReport, _key, _timestamp, _visible
 from .engine import import_trace as _import_trace
 
@@ -189,7 +190,15 @@ class ClaudeCodeTrace(AgentTrace):
             if text:
                 self.stage.append_text(model_key, identity, text)
                 if turn:
-                    self.stage.put("spans", turn, {"output_json": text})
+                    self.stage.put(
+                        "spans",
+                        turn,
+                        {
+                            "output_json": PreparedPayload(
+                                self.stage.get("spans", model_key)["output_json"]
+                            )
+                        },
+                    )
             raw_usage = message.get("usage")
             if isinstance(raw_usage, dict):
                 usage = {k: v for k, v in raw_usage.items() if type(v) is int and v >= 0}

@@ -550,6 +550,8 @@ def test_claude_watching_and_text_parts_are_idempotent(tmp_path):
         if s.primary_run and s.primary_run.response_id == "response-2"
     )
     assert model.primary_run.output_text == "answer continued"
+    turn = next(s for s in history.trace(report.trace_key).spans if s.name == "claude-code.turn")
+    assert turn.output == "answer continued"
     with Watcher("claude-code", path, interval=0.02) as watcher:
         settle(lambda: history.trace(report.trace_key).root.status == "running")
         time.sleep(0.08)
