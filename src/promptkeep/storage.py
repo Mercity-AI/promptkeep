@@ -1188,36 +1188,39 @@ def _insert_check(item: dict[str, Any]) -> None:
 
 def _insert_span(item: dict[str, Any]) -> None:
     """Insert or update one span, never downgrading a terminal row to running
-    or clearing a payload the start row already stored.
+    or clearing a previously observed payload.
 
     A root's start row may be missing (the queue dropped it, or the span was
     sampled out until a problem occurred); the final row then creates it.
-    If an out-of-order running row arrives after a terminal one, it is
-    ignored: a completed span must not start running again. The final row of
-    a span deliberately omits its input when the start row already carried it
-    (one large payload is queued and redacted once), so a missing value here
-    never clears a stored one.
+    Out-of-order starts may fill missing fields but cannot restart a terminal
+    span. Terminal rows reuse prepared inputs so an evicted start loses no
+    supplied input; omitted fields never clear stored payloads.
     """
     row = {key: value for key, value in item.items() if key != "_kind"}
-    existing = SpanRecord.get_or_none(span_key=row["span_key"])
-    if existing is None:
-        SpanRecord.create(**row)
-        _notify_span(row)
-        return
-    if existing.status != "running" and row.get("status") == "running":
-        enrich = {
-            k: v
-            for k, v in row.items()
-            if k not in ("span_key", "status") and getattr(existing, k) is None and v is not None
-        }
-        if enrich:
-            SpanRecord.update(**enrich).where(SpanRecord.span_key == row["span_key"]).execute()
-        return
-    fields = {key: value for key, value in row.items() if key != "span_key"}
-    if fields.get("input_json") is None:
-        fields.pop("input_json", None)
-    SpanRecord.update(**fields).where(SpanRecord.span_key == row["span_key"]).execute()
-    _notify_span(SpanRecord.get(SpanRecord.span_key == row["span_key"]).__data__)
+    columns = list(row)
+    assignments = []
+    for column in columns:
+        if column == "span_key":
+            continue
+        incoming = f"excluded.{column}"
+        old = f"spans.{column}"
+        normal = (
+            f"COALESCE({incoming},{old})"
+            if column in ("input_json", "output_json", "error", "metadata_json")
+            else incoming
+        )
+        assignments.append(
+            f"{column}=CASE WHEN spans.status<>'running' AND excluded.status='running' "
+            f"THEN COALESCE({old},{incoming}) ELSE {normal} END"
+        )
+    db_proxy.execute_sql(
+        f"INSERT INTO spans ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+        f"ON CONFLICT(span_key) DO UPDATE SET {','.join(assignments)}",
+        tuple(row.values()),
+    )
+    # Export callbacks need the reduced row, but ordinary writes require no read-back.
+    if _span_observers and row.get("status") != "running":
+        _notify_span(SpanRecord.get(SpanRecord.span_key == row["span_key"]).__data__)
 
 
 def _adopt_run(item: dict[str, Any]) -> None:

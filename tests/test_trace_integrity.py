@@ -4,12 +4,15 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 import promptkeep
 from promptkeep import Prompt, history, storage, writer
 from tests.fakes import FakeClient
 
 
-def test_registration_and_3000_background_tool_spans(caplog):
+@pytest.mark.parametrize("repetition", range(3))
+def test_registration_and_3000_background_tool_spans(caplog, repetition):
     promptkeep.configure(write_mode="background", queue_size=20000, batch_size=100)
 
     def register():
@@ -62,12 +65,12 @@ assert promptkeep.flush(timeout=20)
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _ in range(2)
+        for _ in range(4)
     ]
     for process in processes:
         out, err = process.communicate(timeout=40)
         assert process.returncode == 0, out + err
         assert "database is locked" not in err
     traces = history.list_traces()
-    assert len(traces) == 2
+    assert len(traces) == 4
     assert all(len(history.trace(root.span_key).spans) == 1501 for root in traces)
