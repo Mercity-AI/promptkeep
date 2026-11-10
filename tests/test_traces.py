@@ -598,7 +598,7 @@ class TestSamplingPolicy:
 
     def test_span_redaction_failure_never_stores_original(self):
         promptkeep.configure(redact=lambda text: (_ for _ in ()).throw(RuntimeError("boom")))
-        with promptkeep.agent("secret") as task:
+        with promptkeep.agent("secret", input="secret") as task:
             task.output("secret")
         assert history.list_traces() == []
         assert SpanRecord.select().count() == 0

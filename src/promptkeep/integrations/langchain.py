@@ -60,7 +60,7 @@ class PromptKeepCallbackHandler(Bridge, BaseCallbackHandler):
             input=input,
             model=model,
         )
-        self.start(event)
+        event = self.start(event) or event
         with self._lock:
             self._runs[str(run_id)] = event
             if len(self._runs) > 10000:

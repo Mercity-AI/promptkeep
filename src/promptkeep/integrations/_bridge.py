@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from .. import events, ingestion
 from ..config import get_settings
+from ..normalization import payload
 from ..tracking import flush
 
 logger = logging.getLogger("promptkeep")
@@ -65,6 +66,8 @@ class Bridge:
                 )
                 if event.span_key in self._states:
                     return
+                if event.input is not None or event.input_present:
+                    event = replace(event, input=payload(event.input, get_settings()))
                 previous = events.enter(event)
                 self._states[event.span_key] = (event, previous)
                 if len(self._states) > 10000:
@@ -72,6 +75,7 @@ class Bridge:
                     events.leave(old, parent)
                     logger.warning("promptkeep: callback state capacity exceeded")
             ingestion.record(event)
+            return event
         except Exception:
             logger.warning("promptkeep: callback start failed", exc_info=True)
 
@@ -87,7 +91,12 @@ class Bridge:
                 event = replace(
                     event,
                     started_at=event.started_at or original.started_at,
-                    input=event.input if event.input is not None else original.input,
+                    input=event.input
+                    if event.input_present
+                    else original.input
+                    if original.input is not None or original.input_present
+                    else event.input,
+                    input_present=original.input_present or event.input_present,
                     model=event.model or original.model,
                     destination=original.destination,
                 )

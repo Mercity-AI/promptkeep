@@ -186,7 +186,7 @@ def _ensure_started() -> queue.Queue[dict]:
         return _queue
 
 
-def _worker() -> None:
+def _worker_loop() -> None:
     """Drain the queue: batch rows, write each batch in one transaction.
 
     Serves the queue it was started for; retires when reset() swaps it out.
@@ -231,7 +231,8 @@ def _worker() -> None:
 def _after_fork_in_child() -> None:
     """Forget inherited state: the thread didn't survive the fork, and the
     parent still owns (and will write) everything that was queued."""
-    global _queue, _thread, _dropped_total
+    global _queue, _thread, _dropped_total, _lock
+    _lock = threading.Lock()
     _queue = None
     _thread = None
     _dropped_total = 0
@@ -239,3 +240,21 @@ def _after_fork_in_child() -> None:
 
 if hasattr(os, "register_at_fork"):  # POSIX only; Windows cannot fork.
     os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _worker() -> None:
+    """Bound the writer thread's connection lifetime with injected storage hooks."""
+    scope = _worker_scope
+    if scope is None:
+        return _worker_loop()
+    with scope():
+        return _worker_loop()
+
+
+_worker_scope = None
+
+
+def register_worker_scope(factory):
+    """Inject connection ownership without reversing the storage dependency."""
+    global _worker_scope
+    _worker_scope = factory

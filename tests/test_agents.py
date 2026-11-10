@@ -748,7 +748,7 @@ class TestSamplingAndPayloads:
 
     def test_redaction_failure_drops_the_span(self):
         promptkeep.configure(redact=lambda text: (_ for _ in ()).throw(RuntimeError("boom")))
-        with promptkeep.agent("dropped") as task:
+        with promptkeep.agent("dropped", input="secret") as task:
             task.output("secret")
         assert history.list_traces() == []
         assert task.trace_key
@@ -781,7 +781,7 @@ class TestSamplingAndPayloads:
         assert root.has_input is False
         assert root.status == "ok"
 
-    def test_a_span_input_is_queued_once(self, monkeypatch):
+    def test_terminal_row_reuses_the_prepared_input(self, monkeypatch):
         from promptkeep import writer
 
         promptkeep.configure(write_mode="background")
@@ -792,8 +792,9 @@ class TestSamplingAndPayloads:
 
         span_items = [item for item in seen if item.get("_kind") == "span"]
         carried = [item for item in span_items if item.get("input_json") is not None]
-        assert len(carried) == 1
+        assert len(carried) == 2
         assert carried[0]["status"] == "running"
+        assert carried[0]["input_json"] is carried[1]["input_json"]
 
 
 def test_inherited_scope_is_ignored_after_process_change(monkeypatch, caplog):

@@ -63,6 +63,7 @@ from ..events import current as external_current
 from ..events import key as event_key
 from ..ingestion import record as record_event
 from ..models import new_run_key
+from ..normalization import cohort_for
 from ..tracking import record_prompt_run
 from .base import ProviderAdapter, Request, ResponseFields, Target
 
@@ -326,6 +327,7 @@ class _Call:
 
         self.external_model_id = new_run_key()
         if self.external_context is not None:
+            self.model_sampled = cohort_for(self.external_context, get_settings())
             self.model_span_key = (
                 self.external_context.span_key
                 if self.external_context.kind == "llm"
@@ -334,6 +336,13 @@ class _Call:
                     self.external_context.trace_id,
                     self.external_model_id,
                 )
+            )
+
+        # All prompt-version rows for this physical call share one cohort,
+        # including calls outside an explicit agent or framework trace.
+        if self.model_sampled is None and self.records:
+            self.model_sampled = controls.keep_run(
+                get_settings(), {"status": "ok"}, self.conversation_id
             )
 
         # A call that records gets its identity now, and the handle that will
@@ -494,6 +503,7 @@ class _Call:
 
     # --- the write -------------------------------------------------------------
 
+    @storage.connection_scope
     def _write(
         self,
         fields: ResponseFields,
@@ -551,7 +561,8 @@ class _Call:
             original_input_text=self.original_input_text,
             parent_run_key=self.parent_run_key,
             span_key=span_key,
-            cohort=self.model_sampled,
+            cohort=self.model_sampled
+            or any(row.get("status") != "ok" for row in (check_rows or ())),
             **_row_fields(self.request, fields),
         )
         tracked = self.request.tracked

@@ -28,7 +28,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -36,6 +36,7 @@ from . import checks, controls, storage
 from .config import Settings, get_settings
 from .conversation import current as current_conversation
 from .models import new_run_key
+from .normalization import payload
 
 logger = logging.getLogger("promptkeep")
 
@@ -51,6 +52,44 @@ _SPAN_PAYLOAD_LIMIT = 64 * 1024
 _tool_call_index: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
 _tool_call_lock = threading.Lock()
 _TOOL_CALL_INDEX_LIMIT = 2048
+_UNSET = object()
+_warning_lock = threading.Lock()
+_warning_pid = os.getpid()
+_warning_last = None
+_warning_suppressed = 0
+
+
+def _warn_outside():
+    """Warn once across tool names, then at most once per minute with a count."""
+    global _warning_pid, _warning_last, _warning_suppressed
+    settings = get_settings()
+    if not settings.enabled or settings.write_mode == "off" or checks.suppressed():
+        return
+    with _warning_lock:
+        if _warning_pid != os.getpid():
+            _warning_pid, _warning_last, _warning_suppressed = os.getpid(), None, 0
+        now = time.monotonic()
+        if _warning_last is not None and now - _warning_last < 60:
+            _warning_suppressed += 1
+            return
+        suppressed = _warning_suppressed
+        _warning_last, _warning_suppressed = now, 0
+    logger.warning(
+        "promptkeep: tool entered outside an agent scope; span not recorded (%d suppressed calls)",
+        suppressed,
+    )
+
+
+def _after_fork():
+    """A child owns fresh warning/index locks and no parent correlation state."""
+    global _warning_lock, _warning_pid, _warning_last, _warning_suppressed, _tool_call_lock
+    _warning_lock, _tool_call_lock = threading.Lock(), threading.Lock()
+    _warning_pid, _warning_last, _warning_suppressed = os.getpid(), None, 0
+    _tool_call_index.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork)
 
 
 @dataclass
@@ -69,6 +108,7 @@ class _Trace:
     pid: int
     problem: bool = False
     recorded: bool = False
+    models: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -109,7 +149,7 @@ def current() -> _Frame | None:
     return frame
 
 
-def agent(name: str, *, input: Any = None) -> Span:
+def agent(name: str, *, input: Any = _UNSET) -> Span:
     """Start an agent scope: the root of a trace, or a child of the active one.
 
     Use it as ``with`` or ``async with``. The returned handle exposes
@@ -120,7 +160,7 @@ def agent(name: str, *, input: Any = None) -> Span:
     return Span("agent", name, input)
 
 
-def tool(name: str, *, input: Any = None, call_id: str | None = None) -> Span:
+def tool(name: str, *, input: Any = _UNSET, call_id: str | None = None) -> Span:
     """Start an application tool scope inside an active agent.
 
     A tool records what the application explicitly did around it; it never
@@ -172,16 +212,28 @@ def finalize_model_span(
         problem = status != "ok" or any(check.get("status") != "ok" for check in (checks or ()))
         if problem:
             context.trace.problem = True
-        # A kept trace keeps its shape even when this call was explicitly
-        # moved to a sampled-out conversation: the span is structural, while
-        # its run row follows that conversation's sampling decision.
-        if not (
-            sampled
-            or context.trace.sampled
-            or problem
-            or context.trace.problem
-            or context.trace.recorded
-        ):
+        # Retain only the same physical call decision as its run. Remember
+        # structural facts so a later retained tool can recover its known parent.
+        retained = sampled or problem
+        observation = dict(
+            span_key=span_key,
+            trace_key=context.trace_key,
+            parent_span_key=context.span_key,
+            kind="llm",
+            name=name,
+            started_at=started_at,
+            ended_at=_ended_at(started_at, duration_ms),
+            duration_ms=duration_ms,
+            status=status,
+            sampled=False,
+            metadata_json=json.dumps({"sampled_out": True}),
+        )
+        if not retained:
+            context.trace.models[span_key] = observation
+            while len(context.trace.models) > _TOOL_CALL_INDEX_LIMIT:
+                context.trace.models.pop(next(iter(context.trace.models)))
+            if context.trace.sampled:
+                storage.record_span(**observation)
             return
 
         storage.record_span(
@@ -226,6 +278,8 @@ class Span:
         self._entered = False
         self._closed = False
         self._start_recorded = False
+        self._payload_failed = False
+        self._connection_scope = None
         self._failure: str | None = None
         self._output_set = False
         self._output_json: str | None = None
@@ -253,8 +307,12 @@ class Span:
         """
         if not self._entered or self._closed:
             raise RuntimeError("output() must be called on an open agent/tool scope")
-        self._output_json = _encode_payload(value)
-        self._output_set = True
+        try:
+            self._output_json = _encode_payload(value)
+            self._output_set = True
+        except Exception:
+            self._payload_failed = True
+            logger.warning("promptkeep: output redaction failed; span dropped", exc_info=True)
 
     def fail(self, message: str) -> None:
         """Mark the scope failed while still exiting normally.
@@ -275,12 +333,20 @@ class Span:
             raise RuntimeError("agent/tool scopes cannot be re-entered; create a new scope")
         self._entered = True
         try:
+            # Sync scopes own a connection for their entire lifetime. Async scopes
+            # use bounded worker operations rather than sharing thread connections.
+            if not getattr(self, "_async", False):
+                self._connection_scope = storage.connection_context(pin=False)
+                self._connection_scope.__enter__()
             self._start()
         except BaseException:
             if self._token is not None:
                 self._restore()
             else:
                 self._entered = False
+                if self._connection_scope is not None:
+                    self._connection_scope.__exit__(None, None, None)
+                    self._connection_scope = None
             raise
         return self
 
@@ -296,6 +362,7 @@ class Span:
 
     async def __aenter__(self) -> Span:
         """Async twin of ``__enter__``."""
+        self._async = True
         return self.__enter__()
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
@@ -311,10 +378,7 @@ class Span:
         # shared helper can call it, so this warns rather than raising. The
         # handle still works as a context manager and output() is a no-op.
         if self._kind == "tool" and parent is None:
-            logger.warning(
-                "promptkeep: tool(%r) entered outside an agent scope; the span is not recorded",
-                self._name,
-            )
+            _warn_outside()
             return
 
         started_at = storage._utcnow()
@@ -351,7 +415,12 @@ class Span:
 
         # Snapshot the input now; a caller mutating it later must not rewrite
         # history. Serialization failures lose the payload, never the scope.
-        input_json = _encode_payload(self._input) if tracked else None
+        try:
+            input_json = _encode_payload(self._input) if tracked else None
+        except Exception:
+            input_json, tracked = None, False
+            self._payload_failed = True
+            logger.warning("promptkeep: input redaction failed; span dropped", exc_info=True)
         frame = _Frame(
             kind=self._kind,
             name=self._name,
@@ -369,8 +438,8 @@ class Span:
 
         # A sampled-in scope gets a running row immediately; a sampled-out one
         # waits for its final row, which can restore a missing start if a
-        # problem turns up later. Only this row carries the input: the final
-        # row omits it, so one large payload is queued and redacted once.
+        # problem turns up later. Both updates carry the same immutable prepared
+        # input, preserving it even when the writer evicts the initial row.
         if tracked and trace.sampled:
             self._start_recorded = True
             storage.record_span(
@@ -388,7 +457,7 @@ class Span:
     def _finish(self, exc_type: Any, exc: Any) -> None:
         """Write the final row when the trace's sampling and problem state allow it."""
         frame = self._frame
-        if frame is None:
+        if frame is None or self._payload_failed:
             return
         status, error = _outcome(exc_type, exc)
 
@@ -405,6 +474,9 @@ class Span:
         keep = frame.trace.sampled or frame.trace.problem or frame.trace.recorded or status != "ok"
         if not keep or not still_attached:
             return
+        ancestor = frame.trace.models.get(frame.parent_span_key)
+        if ancestor is not None:
+            storage.record_span(**ancestor)
         storage.record_span(
             span_key=frame.span_key,
             trace_key=frame.trace_key,
@@ -415,7 +487,7 @@ class Span:
             ended_at=storage._utcnow(),
             duration_ms=int(round((time.perf_counter() - frame.started) * 1000)),
             status=status,
-            input_json=None if self._start_recorded else frame.input_json,
+            input_json=frame.input_json,
             output_json=self._output_json if self._output_set else None,
             error=error,
             sampled=frame.trace.sampled,
@@ -424,6 +496,9 @@ class Span:
 
     def _restore(self) -> None:
         """Pop the frame and close the handle, even if finalization failed."""
+        if self._connection_scope is not None:
+            self._connection_scope.__exit__(None, None, None)
+            self._connection_scope = None
         token = self._token
         self._token = None
         self._entered = False
@@ -543,15 +618,19 @@ def _encode_payload(value: Any) -> str | None:
     only the payload. The cap is applied after serialization, so it bounds
     stored bytes rather than the cost of serializing an arbitrary object.
     """
+    if value is _UNSET:
+        return None
     try:
         encoded = json.dumps(value, ensure_ascii=False, default=repr).encode("utf-8")
     except Exception:
         logger.warning("promptkeep: failed to serialize span payload", exc_info=True)
         return None
     if len(encoded) <= _SPAN_PAYLOAD_LIMIT:
-        return encoded.decode("utf-8")
+        return payload(encoded.decode("utf-8"), get_settings(), serialized=True)
     preview = encoded[:_SPAN_PAYLOAD_LIMIT].decode("utf-8", errors="ignore")
-    return f"{preview}\n…[promptkeep truncated: {len(encoded)} bytes]"
+    return payload(
+        f"{preview}\n…[promptkeep truncated: {len(encoded)} bytes]", get_settings(), serialized=True
+    )
 
 
 def _outcome(exc_type: Any, exc: Any) -> tuple[str, str | None]:

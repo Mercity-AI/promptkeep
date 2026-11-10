@@ -17,6 +17,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -101,19 +102,43 @@ def _open_database(path):
     return database
 
 
+_connection_owners = threading.local()
+
+
 @contextmanager
-def connection_context(path: str | None = None):
-    """Pin one operation's destination and close only its own connection."""
-    token = _destination.set(path or _destination.get() or str(get_settings().db_path))
-    previous = db_proxy.obj
-    was_open = previous is not None and not previous.is_closed()
+def connection_context(path: str | None = None, *, pin: bool = True):
+    """Pin a destination with nested ownership on this thread, without a transaction."""
+    destination = path or _destination.get() or str(get_settings().db_path)
+    token = _destination.set(destination) if pin else None
+    scopes = getattr(_connection_owners, "scopes", None)
+    if scopes is None:
+        scopes = _connection_owners.scopes = []
+    owner = next((scope for scope in scopes if scope["path"] == destination), None)
+    if owner is None:
+        previous = db_proxy.obj
+        owner = dict(
+            path=destination,
+            database=None,
+            borrowed=previous if previous is not None and not previous.is_closed() else None,
+            depth=0,
+        )
+    owner["depth"] += 1
+    scopes.append(owner)
     try:
         yield
     finally:
-        current = db_proxy.obj
-        if current is not None and (current is not previous or not was_open):
-            current.close()
-        _destination.reset(token)
+        scopes.pop()
+        owner["depth"] -= 1
+        if owner["depth"] == 0:
+            database = owner["database"]
+            if (
+                database is not None
+                and database is not owner["borrowed"]
+                and not database.is_closed()
+            ):
+                database.close()
+        if token is not None:
+            _destination.reset(token)
 
 
 def connection_scope(function):
@@ -152,6 +177,11 @@ def get_db() -> pw.DatabaseProxy | None:
                 database = _open_database(path)
                 db_proxy.initialize(database)
                 _current_path = path
+    # The outermost owner adopts even a lazily opened inner connection.
+    scopes = getattr(_connection_owners, "scopes", ())
+    owner = next((scope for scope in scopes if scope["path"] == path), None)
+    if owner is not None:
+        owner["database"] = db_proxy.obj
     return db_proxy
 
 
@@ -728,6 +758,7 @@ def record_span(
     output_json: str | None = None,
     error: str | None = None,
     sampled: bool | None = None,
+    metadata_json: str | None = None,
 ) -> None:
     """Record one span, honoring the configured write_mode. Never raises.
 
@@ -757,12 +788,20 @@ def record_span(
             "output_json": output_json,
             "error": error,
             "sampled": sampled,
+            "metadata_json": metadata_json,
         }
 
         # The production redaction hook, before the span can be queued.
         if settings.redact is not None:
             try:
-                item = controls.redact_span(settings.redact, item)
+                item = {
+                    **item,
+                    **{
+                        field: payload(item[field], settings, serialized=True)
+                        for field in controls.SPAN_TEXT_FIELDS
+                        if item.get(field) is not None
+                    },
+                }
             except Exception:
                 logger.warning(
                     "promptkeep: redact hook failed — span dropped rather than stored unredacted",
@@ -1685,3 +1724,19 @@ def persist_watch(
             keys.clear()
     finally:
         database.close()
+
+
+writer.register_worker_scope(functools.partial(connection_context, pin=False))
+
+
+def _after_fork_connections():
+    """The child owns fresh locks/scopes and must bind its own SQLite connection."""
+    global _connection_owners, _db_lock, _reg_lock, _prune_lock, _convo_lock, _observer_lock
+    _connection_owners = threading.local()
+    _db_lock, _reg_lock = threading.RLock(), threading.Lock()
+    _prune_lock, _convo_lock, _observer_lock = threading.Lock(), threading.Lock(), threading.RLock()
+    db_proxy.initialize(None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_connections)
